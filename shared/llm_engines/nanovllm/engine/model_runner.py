@@ -42,7 +42,7 @@ def find_available_port(start_port: int = 2333, max_attempts: int = 100) -> int:
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event], model_object=None):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], model_object=None, graph_pool_handle=None):
         # Enable capturing scalar outputs to avoid graph breaks from Tensor.item() calls
         torch._dynamo.config.capture_scalar_outputs = True
         
@@ -94,6 +94,8 @@ class ModelRunner:
         self._graph_cache_order = []
         self._logits_bias_cache = {}
         self._sampling_generator = None
+        self._runtime_signature = None
+        self._graph_pool_seed = graph_pool_handle
         self._guard_counts = {}
         self._guard_seen_details = set()
         torch.set_default_dtype(config_dtype)
@@ -123,7 +125,16 @@ class ModelRunner:
 
     def ensure_runtime_ready(self):
         if self._runtime_ready:
-            return
+            # In eager mode MMGP may move parameter storage between CPU/GPU after prefill.
+            # That changes data_ptr() without invalidating the live KV cache or sequence state.
+            # Resetting here drops the prompt context and makes legacy decode drift off-topic.
+            if self.enforce_eager:
+                return
+            current_sig = self._get_graph_capture_signature()
+            if current_sig == self._runtime_signature:
+                return
+            self._note_guard("runtime_reprepare_signature_change")
+            self.reset_runtime_state()
         if self.model is None:
             raise RuntimeError("LLM model object is not available.")
         self._tie_word_embeddings_if_needed()
@@ -132,6 +143,25 @@ class ModelRunner:
         if not self.enforce_eager:
             self.capture_cudagraph()
         self._runtime_ready = True
+        self._runtime_signature = self._get_graph_capture_signature()
+
+    def reset_generation_state(self):
+        if self.model is None:
+            return
+        try:
+            for module in self.model.modules():
+                reset_sequence_state = getattr(module, "reset_sequence_state", None)
+                if callable(reset_sequence_state):
+                    reset_sequence_state()
+                    continue
+                if hasattr(module, "conv_state"):
+                    module.conv_state = None
+                if hasattr(module, "recurrent_state"):
+                    module.recurrent_state = None
+        except Exception:
+            pass
+        self._logits_bias_cache.clear()
+        reset_context()
 
     def _prepare_model_sequence_state(self):
         if self.model is None:
@@ -222,6 +252,7 @@ class ModelRunner:
             pass
         self._logits_bias_cache.clear()
         self._sampling_generator = None
+        self._runtime_signature = None
         self._runtime_ready = False
         gc.collect()
 
@@ -316,6 +347,7 @@ class ModelRunner:
         self._cpu_cfg_scales = torch.zeros(max_bs, dtype=torch.float32, device="cpu", pin_memory=True)
         self._cpu_top_ks = torch.zeros(max_bs, dtype=torch.int32, device="cpu", pin_memory=True)
         self._cpu_top_ps = torch.zeros(max_bs, dtype=torch.float32, device="cpu", pin_memory=True)
+        self._cpu_min_ps = torch.zeros(max_bs, dtype=torch.float32, device="cpu", pin_memory=True)
         self._cpu_repetition_penalties = torch.zeros(max_bs, dtype=torch.float32, device="cpu", pin_memory=True)
         
         # Pre-allocate decode buffers on CPU with pinned memory
@@ -343,6 +375,7 @@ class ModelRunner:
             "_cpu_cfg_scales",
             "_cpu_top_ks",
             "_cpu_top_ps",
+            "_cpu_min_ps",
             "_cpu_repetition_penalties",
             "_cpu_input_ids",
             "_cpu_positions",
@@ -434,12 +467,19 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
+    def _get_kv_cache_modules(self):
+        if self.model is None:
+            return []
+        return [module for module in self.model.modules() if hasattr(module, "k_cache") and hasattr(module, "v_cache")]
+
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
+        kv_cache_modules = self._get_kv_cache_modules()
+        kv_cache_layer_count = len(kv_cache_modules)
+        block_bytes = 2 * kv_cache_layer_count * self.block_size * num_kv_heads * head_dim * self.dtype.itemsize
 
         # Strict policy: allocate exactly the blocks required by requested runtime limits.
         required_blocks_per_seq = (config.max_model_len + self.block_size - 1) // self.block_size
@@ -462,7 +502,7 @@ class ModelRunner:
         try:
             self.kv_cache = torch.empty(
                 2,
-                hf_config.num_hidden_layers,
+                kv_cache_layer_count,
                 config.num_kvcache_blocks,
                 self.block_size,
                 num_kv_heads,
@@ -479,18 +519,20 @@ class ModelRunner:
                     f"Current free VRAM: {free_now / 1024**3:.2f} GB / {total_now / 1024**3:.2f} GB total."
                 ) from exc
             raise
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        for layer_id, module in enumerate(kv_cache_modules):
+            module.k_cache = self.kv_cache[0, layer_id]
+            module.v_cache = self.kv_cache[1, layer_id]
 
     def prepare_block_tables(self, seqs: list[Sequence]):
+        bs = len(seqs)
         max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        return block_tables
+        block_tables = self._cpu_block_tables[:bs, :max_len]
+        block_tables.fill_(-1)
+        for row, seq in enumerate(seqs):
+            if not seq.block_table:
+                continue
+            block_tables[row, :len(seq.block_table)] = torch.tensor(seq.block_table, dtype=torch.int32, device="cpu")
+        return block_tables.cuda(non_blocking=True)
 
     def prepare_prefill(self, seqs: list[Sequence]):
         use_prompt_embeds = any(getattr(seq, "prompt_embeds", None) is not None for seq in seqs)
@@ -506,6 +548,7 @@ class ModelRunner:
         max_seqlen_k = 0
         slot_mapping = []
         block_tables = None
+        has_previous_state = any(int(getattr(seq, "num_cached_tokens", 0) or 0) > 0 for seq in seqs)
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
@@ -537,13 +580,18 @@ class ModelRunner:
             if not seq.block_table:    # warmup: no blocks allocated yet
                 slot_mapping.extend([-1] * seqlen_q)
                 continue
+            cached_tokens = max(0, int(seq.num_cached_tokens or 0))
+            cached_partial_tokens = cached_tokens % self.block_size
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
+                if i == seq.num_cached_blocks and cached_partial_tokens > 0:
+                    start += cached_partial_tokens
                 if i != seq.num_blocks - 1:
-                    end = start + self.block_size
+                    end = seq.block_table[i] * self.block_size + self.block_size
                 else:
-                    end = start + seq.last_block_num_tokens
-                slot_mapping.extend(list(range(start, end)))
+                    end = seq.block_table[i] * self.block_size + seq.last_block_num_tokens
+                if end > start:
+                    slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         if use_prompt_embeds:
@@ -557,8 +605,17 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, has_previous_state=has_previous_state)
         return input_ids, positions, inputs_embeds
+
+    @torch.inference_mode()
+    def prefill_only(self, seqs: list[Sequence]) -> None:
+        self.ensure_runtime_ready()
+        input_ids, positions, inputs_embeds = self.prepare_prefill(seqs)
+        self.run_model(input_ids, positions, True, inputs_embeds=inputs_embeds)
+        for seq in seqs:
+            seq.clear_prompt_data()
+        reset_context()
 
     def prepare_decode(self, seqs: list[Sequence]):
         """Optimized decode preparation using pre-allocated buffers."""
@@ -592,6 +649,7 @@ class ModelRunner:
         # Fill pre-allocated CPU buffers
         top_ks_is_zero = True
         top_ps_is_one = True
+        min_ps_is_zero = True
         repetition_penalties_is_one = True
         for i, seq in enumerate(target_seqs):
             self._cpu_temperatures[i] = seq.temperature
@@ -602,6 +660,9 @@ class ModelRunner:
             self._cpu_top_ps[i] = seq.top_p if seq.top_p is not None else 1.0
             if seq.top_p is not None and seq.top_p != 1.0:
                 top_ps_is_one = False
+            self._cpu_min_ps[i] = seq.min_p if seq.min_p is not None else 0.0
+            if seq.min_p is not None and seq.min_p > 0.0:
+                min_ps_is_zero = False
             self._cpu_repetition_penalties[i] = seq.repetition_penalty if seq.repetition_penalty is not None else 1.0
             if seq.repetition_penalty is not None and seq.repetition_penalty != 1.0:
                 repetition_penalties_is_one = False
@@ -611,9 +672,10 @@ class ModelRunner:
         cfg_scales = self._cpu_cfg_scales[:num_seqs].cuda(non_blocking=True)
         top_ks = self._cpu_top_ks[:num_seqs].cuda(non_blocking=True) if not top_ks_is_zero else None
         top_ps = self._cpu_top_ps[:num_seqs].cuda(non_blocking=True) if not top_ps_is_one else None
+        min_ps = self._cpu_min_ps[:num_seqs].cuda(non_blocking=True) if not min_ps_is_zero else None
         repetition_penalties = self._cpu_repetition_penalties[:num_seqs].cuda(non_blocking=True) if not repetition_penalties_is_one else None
         
-        return temperatures, cfg_scales, top_ks, top_ps, repetition_penalties
+        return temperatures, cfg_scales, top_ks, top_ps, min_ps, repetition_penalties
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor | None, positions: torch.Tensor, is_prefill: bool, inputs_embeds: torch.Tensor | None = None):
@@ -693,9 +755,9 @@ class ModelRunner:
                 inputs_embeds = None
             sample_params = self.prepare_sample(seqs, is_cfg_batch=True) if self.rank == 0 else None
             if sample_params is not None:
-                temperatures, cfg_scales, top_ks, top_ps, repetition_penalties = sample_params
+                temperatures, cfg_scales, top_ks, top_ps, min_ps, repetition_penalties = sample_params
             else:
-                temperatures = cfg_scales = top_ks = top_ps = repetition_penalties = None
+                temperatures = cfg_scales = top_ks = top_ps = min_ps = repetition_penalties = None
             
             # Run model forward (processes entire batch: cond + uncond)
             logits_all = self.run_model(input_ids, positions, is_prefill, inputs_embeds=inputs_embeds)
@@ -758,6 +820,7 @@ class ModelRunner:
                     temperatures,
                     top_ks=top_ks if top_ks is not None else None,
                     top_ps=top_ps if top_ps is not None else None,
+                    min_ps=min_ps if min_ps is not None else None,
                     repetition_penalties=None,  # Already applied above
                     generator=self._sampling_generator,
                     # input_ids=cond_input_ids,
@@ -782,9 +845,9 @@ class ModelRunner:
                 inputs_embeds = None
             sample_params = self.prepare_sample(seqs, is_cfg_batch=False) if self.rank == 0 else None
             if sample_params is not None:
-                temperatures, cfg_scales, top_ks, top_ps, repetition_penalties = sample_params
+                temperatures, cfg_scales, top_ks, top_ps, min_ps, repetition_penalties = sample_params
             else:
-                temperatures = cfg_scales = top_ks = top_ps = repetition_penalties = None
+                temperatures = cfg_scales = top_ks = top_ps = min_ps = repetition_penalties = None
             logits = self.run_model(input_ids, positions, is_prefill, inputs_embeds=inputs_embeds)
             if is_prefill:
                 for seq in seqs:
@@ -837,6 +900,7 @@ class ModelRunner:
                     temperatures,
                     top_ks=top_ks if top_ks is not None else None,
                     top_ps=top_ps if top_ps is not None else None,
+                    min_ps=min_ps if min_ps is not None else None,
                     repetition_penalties=None,  # Already applied above
                     generator=self._sampling_generator,
                     # input_ids=seq_input_ids,
@@ -887,7 +951,7 @@ class ModelRunner:
         if not self.graph_bs:
             self.graph_bs = [max_bs]
         self.graphs = {}
-        self.graph_pool = None
+        self.graph_pool = self._graph_pool_seed
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()

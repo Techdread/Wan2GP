@@ -114,11 +114,118 @@ def _build_mrope_freq_cache(
     return cached
 
 
-def _interleave_last_dim_halves(tensor: torch.Tensor) -> torch.Tensor:
-    if tensor.shape[-1] % 2 != 0:
+def _interleave_axis_halves(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    dim = dim if dim >= 0 else tensor.ndim + dim
+    if dim < 0 or dim >= tensor.ndim or tensor.shape[dim] % 2 != 0:
         return tensor
-    first_half, second_half = tensor.chunk(2, dim=-1)
-    return torch.stack((first_half, second_half), dim=-1).flatten(-2, -1)
+    first_half, second_half = tensor.chunk(2, dim=dim)
+    return torch.stack((first_half, second_half), dim=dim + 1).flatten(dim, dim + 1)
+
+
+def _inverse_interleave_axis_halves(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+    dim = dim if dim >= 0 else tensor.ndim + dim
+    if dim < 0 or dim >= tensor.ndim or tensor.shape[dim] % 2 != 0:
+        return tensor
+    half = tensor.shape[dim] // 2
+    tensor = tensor.reshape(*tensor.shape[:dim], half, 2, *tensor.shape[dim + 1 :])
+    return torch.cat((tensor.select(dim + 1, 0), tensor.select(dim + 1, 1)), dim=dim)
+
+
+def _reorder_v_heads_grouped_to_tiled(
+    tensor: torch.Tensor,
+    dim: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    dim = dim if dim >= 0 else tensor.ndim + dim
+    if dim < 0 or dim >= tensor.ndim or num_k_heads <= 0 or num_v_heads <= 0 or num_v_heads % num_k_heads != 0:
+        return tensor
+    if tensor.shape[dim] != num_v_heads * head_dim:
+        return tensor
+    num_v_per_k = num_v_heads // num_k_heads
+    shape = list(tensor.shape)
+    new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1 :]
+    tensor = tensor.reshape(*new_shape)
+    perm = list(range(len(new_shape)))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return tensor.permute(*perm).reshape(*shape)
+
+
+def _reorder_v_heads_tiled_to_grouped(
+    tensor: torch.Tensor,
+    dim: int,
+    num_k_heads: int,
+    num_v_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    dim = dim if dim >= 0 else tensor.ndim + dim
+    if dim < 0 or dim >= tensor.ndim or num_k_heads <= 0 or num_v_heads <= 0 or num_v_heads % num_k_heads != 0:
+        return tensor
+    if tensor.shape[dim] != num_v_heads * head_dim:
+        return tensor
+    num_v_per_k = num_v_heads // num_k_heads
+    shape = list(tensor.shape)
+    new_shape = shape[:dim] + [num_v_per_k, num_k_heads, head_dim] + shape[dim + 1 :]
+    tensor = tensor.reshape(*new_shape)
+    perm = list(range(len(new_shape)))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return tensor.permute(*perm).reshape(*shape)
+
+
+def _reorder_v_head_axis_grouped_to_tiled(
+    tensor: torch.Tensor,
+    dim: int,
+    num_k_heads: int,
+    num_v_heads: int,
+) -> torch.Tensor:
+    dim = dim if dim >= 0 else tensor.ndim + dim
+    if dim < 0 or dim >= tensor.ndim or num_k_heads <= 0 or num_v_heads <= 0 or num_v_heads % num_k_heads != 0:
+        return tensor
+    if tensor.shape[dim] != num_v_heads:
+        return tensor
+    num_v_per_k = num_v_heads // num_k_heads
+    shape = list(tensor.shape)
+    new_shape = shape[:dim] + [num_k_heads, num_v_per_k] + shape[dim + 1 :]
+    tensor = tensor.reshape(*new_shape)
+    perm = list(range(len(new_shape)))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return tensor.permute(*perm).reshape(*shape)
+
+
+def _reorder_v_head_axis_tiled_to_grouped(
+    tensor: torch.Tensor,
+    dim: int,
+    num_k_heads: int,
+    num_v_heads: int,
+) -> torch.Tensor:
+    dim = dim if dim >= 0 else tensor.ndim + dim
+    if dim < 0 or dim >= tensor.ndim or num_k_heads <= 0 or num_v_heads <= 0 or num_v_heads % num_k_heads != 0:
+        return tensor
+    if tensor.shape[dim] != num_v_heads:
+        return tensor
+    num_v_per_k = num_v_heads // num_k_heads
+    shape = list(tensor.shape)
+    new_shape = shape[:dim] + [num_v_per_k, num_k_heads] + shape[dim + 1 :]
+    tensor = tensor.reshape(*new_shape)
+    perm = list(range(len(new_shape)))
+    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
+    return tensor.permute(*perm).reshape(*shape)
+
+
+def _maybe_reorder_gguf_ssm_param(
+    tensor: torch.Tensor,
+    *,
+    interleave_halves: bool,
+    tiled_to_grouped: bool,
+    num_k_heads: int,
+    num_v_heads: int,
+) -> torch.Tensor:
+    if tiled_to_grouped:
+        return _reorder_v_heads_tiled_to_grouped(tensor, dim=0, num_k_heads=num_k_heads, num_v_heads=num_v_heads, head_dim=1)
+    if interleave_halves:
+        return _interleave_axis_halves(tensor, dim=0)
+    return tensor
 
 
 def clear_qwen35_runtime_caches(device: torch.device | None = None) -> None:
@@ -188,9 +295,9 @@ def torch_chunk_gated_delta_rule(
     initial_dtype = query.dtype
     query = l2norm(query, dim=-1)
     key = l2norm(key, dim=-1)
-    query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
-    ]
+    query, key = [x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key)]
+    value, beta = [x.transpose(1, 2).contiguous() for x in (value, beta)]
+    g = g.transpose(1, 2).contiguous().to(torch.float32)
 
     batch_size, num_heads, sequence_length, k_head_dim = key.shape
     v_head_dim = value.shape[-1]
@@ -201,53 +308,53 @@ def torch_chunk_gated_delta_rule(
     beta = F.pad(beta, (0, pad_size))
     g = F.pad(g, (0, pad_size))
     total_sequence_length = sequence_length + pad_size
-    query = query * (query.shape[-1] ** -0.5)
-
-    v_beta = value * beta.unsqueeze(-1)
-    k_beta = key * beta.unsqueeze(-1)
-    query, key, value, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, k_beta, v_beta)
-    ]
-    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    num_chunks = total_sequence_length // chunk_size
+    query = (query * (query.shape[-1] ** -0.5)).reshape(query.shape[0], query.shape[1], -1, chunk_size, query.shape[-1])
+    key = key.reshape(key.shape[0], key.shape[1], -1, chunk_size, key.shape[-1])
+    value = value.reshape(value.shape[0], value.shape[1], -1, chunk_size, value.shape[-1])
+    beta = beta.reshape(beta.shape[0], beta.shape[1], -1, chunk_size)
+    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size).cumsum(dim=-1)
     lower_mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
-
-    g = g.cumsum(dim=-1)
-    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
-    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(lower_mask, 0)
-    for idx in range(1, chunk_size):
-        row = attn[..., idx, :idx].clone()
-        sub = attn[..., :idx, :idx].clone()
-        attn[..., idx, :idx] = row + (row.unsqueeze(-1) * sub).sum(-2)
-    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
-    value = attn @ v_beta
-    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
-    recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, device=value.device, dtype=value.dtype)
-        if initial_state is None
-        else initial_state.to(value)
-    )
-    outputs = torch.zeros_like(value)
     upper_mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
+    recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, device=value.device, dtype=torch.float32)
+        if initial_state is None
+        else initial_state.to(torch.float32)
+    )
+    outputs = torch.empty(batch_size, num_heads, num_chunks, chunk_size, v_head_dim, device=value.device, dtype=initial_dtype)
+    eye = torch.eye(chunk_size, dtype=torch.float32, device=query.device)
 
-    for idx in range(0, total_sequence_length // chunk_size):
+    for idx in range(num_chunks):
         q_i = query[:, :, idx]
         k_i = key[:, :, idx]
-        v_i = value[:, :, idx]
-        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, idx]).masked_fill_(upper_mask, 0)
-        v_prime = k_cumdecay[:, :, idx] @ recurrent_state
-        v_new = v_i - v_prime
-        attn_inter = (q_i * g[:, :, idx, :, None].exp()) @ recurrent_state
-        outputs[:, :, idx] = attn_inter + attn @ v_new
-        recurrent_state = (
-            recurrent_state * g[:, :, idx, -1, None, None].exp()
-            + (k_i * (g[:, :, idx, -1, None] - g[:, :, idx]).exp()[..., None]).transpose(-1, -2) @ v_new
-        )
+        value_i = value[:, :, idx].to(torch.float32)
+        beta_i = beta[:, :, idx].to(torch.float32)
+        g_i = g[:, :, idx]
+        beta_i_unsqueezed = beta_i.unsqueeze(-1)
+        g_exp_i = g_i.exp().unsqueeze(-1)
+        k_beta_i = k_i * beta_i_unsqueezed
+        decay_mask_i = ((g_i.unsqueeze(-1) - g_i.unsqueeze(-2)).tril().exp()).tril()
+        lower = k_beta_i @ k_i.transpose(-1, -2)
+        lower.mul_(decay_mask_i)
+        lower.masked_fill_(lower_mask, 0)
+        lower.add_(eye)
+        value_i.mul_(beta_i_unsqueezed)
+        value_i = torch.linalg.solve_triangular(lower, value_i, upper=False, left=True)
+        k_beta_i.mul_(g_exp_i)
+        k_cumdecay_i = torch.linalg.solve_triangular(lower, k_beta_i, upper=False, left=True)
+        attn_i = q_i @ k_i.transpose(-1, -2)
+        attn_i.mul_(decay_mask_i)
+        attn_i.masked_fill_(upper_mask, 0)
+        value_i.sub_(k_cumdecay_i @ recurrent_state)
+        outputs[:, :, idx] = (((q_i * g_exp_i) @ recurrent_state) + attn_i @ value_i).to(initial_dtype)
+        recurrent_state.mul_(g_i[:, :, -1, None, None].exp())
+        recurrent_state.add_((k_i * (g_i[:, :, -1, None] - g_i).exp().unsqueeze(-1)).transpose(-1, -2) @ value_i)
 
     outputs = outputs.reshape(outputs.shape[0], outputs.shape[1], -1, outputs.shape[-1])
     outputs = outputs[:, :, :sequence_length]
     if not output_final_state:
         recurrent_state = None
-    return outputs.transpose(1, 2).contiguous().to(initial_dtype), recurrent_state
+    return outputs.transpose(1, 2).contiguous(), recurrent_state
 
 
 def torch_recurrent_gated_delta_rule(
@@ -262,35 +369,37 @@ def torch_recurrent_gated_delta_rule(
     initial_dtype = query.dtype
     query = l2norm(query, dim=-1)
     key = l2norm(key, dim=-1)
-    query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
-    ]
+    query, key, value, beta = [x.transpose(1, 2).contiguous() for x in (query, key, value, beta)]
+    g = g.transpose(1, 2).contiguous().to(torch.float32)
 
     batch_size, num_heads, sequence_length, k_head_dim = key.shape
     v_head_dim = value.shape[-1]
-    query = query * (query.shape[-1] ** -0.5)
-    outputs = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim, device=value.device, dtype=value.dtype)
+    scale = query.shape[-1] ** -0.5
+    outputs = torch.empty(batch_size, num_heads, sequence_length, v_head_dim, device=value.device, dtype=initial_dtype)
     recurrent_state = (
-        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, device=value.device, dtype=value.dtype)
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, device=value.device, dtype=torch.float32)
         if initial_state is None
-        else initial_state.to(value)
+        else initial_state.to(torch.float32)
     )
 
     for idx in range(sequence_length):
-        q_t = query[:, :, idx]
-        k_t = key[:, :, idx]
-        v_t = value[:, :, idx]
-        g_t = g[:, :, idx].exp().unsqueeze(-1).unsqueeze(-1)
-        beta_t = beta[:, :, idx].unsqueeze(-1)
+        q_t = query[:, :, idx].to(torch.float32)
+        k_t = key[:, :, idx].to(torch.float32)
+        v_t = value[:, :, idx].to(torch.float32)
+        g_t = g[:, :, idx]
+        beta_t = beta[:, :, idx].to(torch.float32)
+        q_t = q_t * scale
+        g_t = g_t.exp().unsqueeze(-1).unsqueeze(-1)
+        beta_t = beta_t.unsqueeze(-1)
         recurrent_state = recurrent_state * g_t
         kv_mem = (recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
         delta = (v_t - kv_mem) * beta_t
         recurrent_state = recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-        outputs[:, :, idx] = (recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
+        outputs[:, :, idx] = (recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2).to(initial_dtype)
 
     if not output_final_state:
         recurrent_state = None
-    return outputs.transpose(1, 2).contiguous().to(initial_dtype), recurrent_state
+    return outputs.transpose(1, 2).contiguous(), recurrent_state
 
 
 class Qwen3_5DynamicCache:
@@ -466,6 +575,7 @@ class Qwen3_5Block(nn.Module):
         self.post_attention_norm.use_triton_rmsnorm = not safe_legacy_kernels
         self.ffn_gate = ColumnParallelLinear(int(config.hidden_size), int(config.intermediate_size), bias=False)
         self.ffn_up = ColumnParallelLinear(int(config.hidden_size), int(config.intermediate_size), bias=False)
+        self.ffn_gate_up = None
         self.ffn_down = RowParallelLinear(int(config.intermediate_size), int(config.hidden_size), bias=False)
         self.mlp_act_fn = SiluAndMul()
 
@@ -496,6 +606,7 @@ class Qwen3_5Block(nn.Module):
                 total_num_kv_heads * self.head_dim,
                 bias=bool(config.attention_bias),
             )
+            self.attn_kv = None
             self.attn_output = RowParallelLinear(
                 total_num_heads * self.head_dim,
                 hidden_size,
@@ -527,6 +638,7 @@ class Qwen3_5Block(nn.Module):
             self.attn_gate = ColumnParallelLinear(hidden_size, self.value_dim, bias=False)
             self.ssm_alpha = ColumnParallelLinear(hidden_size, self.num_v_heads, bias=False)
             self.ssm_beta = ColumnParallelLinear(hidden_size, self.num_v_heads, bias=False)
+            self.attn_gate_ab = None
             self.ssm_dt = nn.Parameter(torch.zeros(self.num_v_heads))
             self.ssm_a = nn.Parameter(-torch.ones(self.num_v_heads))
             if self._short_convolution_cls is not None:
@@ -557,6 +669,8 @@ class Qwen3_5Block(nn.Module):
             self.conv_state_buffer = torch.empty(0)
             self.recurrent_state_buffer = torch.empty(0)
             self._gguf_interleave_ssm_ab = False
+            self._gguf_v_head_reordered = False
+            self._gguf_ssm_param_reordered = False
 
     def prepare_sequence_state(self, max_batch_size: int, device: torch.device, dtype: torch.dtype):
         if self.layer_type != "linear_attention":
@@ -632,8 +746,15 @@ class Qwen3_5Block(nn.Module):
         gate = gate.reshape(batch_size, seq_len, -1)
 
         query_states = self.attn_q_norm(query_states)
-        key_states = self.attn_k_norm(self.attn_k(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim))
-        value_states = self.attn_v(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        if self.attn_kv is None:
+            key_states = self.attn_k(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+            value_states = self.attn_v(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        else:
+            key_value_states = self.attn_kv(hidden_states).view(batch_size, seq_len, self.num_kv_heads, self.head_dim * 2)
+            key_states, value_states = torch.chunk(key_value_states, 2, dim=-1)
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+        key_states = self.attn_k_norm(key_states)
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
@@ -683,16 +804,43 @@ class Qwen3_5Block(nn.Module):
         else:
             conv_state = self._get_runtime_conv_state(batch_size, hidden_states)
             recurrent_state = self._get_runtime_recurrent_state(batch_size, hidden_states)
-            has_previous_state = not context.is_prefill
+            has_previous_state = bool(getattr(context, "has_previous_state", False)) if context.is_prefill else True
         use_precomputed_states = has_previous_state and seq_len == 1
 
         mixed_qkv_input = self.attn_qkv(hidden_states)
-        z = self.attn_gate(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
-        b = self.ssm_beta(hidden_states)
-        a = self.ssm_alpha(hidden_states)
-        if self._gguf_interleave_ssm_ab:
-            b = _interleave_last_dim_halves(b)
-            a = _interleave_last_dim_halves(a)
+        if self.attn_gate_ab is None:
+            z = self.attn_gate(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
+            a = self.ssm_alpha(hidden_states)
+            b = self.ssm_beta(hidden_states)
+        else:
+            gate_ab = self.attn_gate_ab(hidden_states)
+            gate_proj, a, b = torch.split(gate_ab, [self.value_dim, self.num_v_heads, self.num_v_heads], dim=-1)
+            z = gate_proj.reshape(batch_size, seq_len, -1, self.head_v_dim)
+        if self._gguf_v_head_reordered:
+            z = _reorder_v_head_axis_tiled_to_grouped(
+                z,
+                dim=2,
+                num_k_heads=self.num_k_heads,
+                num_v_heads=self.num_v_heads,
+            )
+        if self._gguf_v_head_reordered:
+            b = _reorder_v_heads_tiled_to_grouped(
+                b,
+                dim=-1,
+                num_k_heads=self.num_k_heads,
+                num_v_heads=self.num_v_heads,
+                head_dim=1,
+            )
+            a = _reorder_v_heads_tiled_to_grouped(
+                a,
+                dim=-1,
+                num_k_heads=self.num_k_heads,
+                num_v_heads=self.num_v_heads,
+                head_dim=1,
+            )
+        elif self._gguf_interleave_ssm_ab:
+            b = _interleave_axis_halves(b, dim=-1)
+            a = _interleave_axis_halves(a, dim=-1)
 
         use_short_convolution = (
             self._use_short_convolution
@@ -731,6 +879,9 @@ class Qwen3_5Block(nn.Module):
                         conv_kernel,
                         self.ssm_conv1d.bias,
                     )
+            elif has_previous_state:
+                conv_kernel = self.ssm_conv1d.weight.reshape(self.ssm_conv1d.weight.shape[0], self.ssm_conv1d.weight.shape[-1])
+                mixed_qkv = torch_causal_conv1d_update(mixed_qkv, conv_state, conv_kernel, self.ssm_conv1d.bias)
             else:
                 if cache_params is not None:
                     if mixed_qkv.shape[-1] >= self.conv_kernel_size:
@@ -774,9 +925,30 @@ class Qwen3_5Block(nn.Module):
         query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)
         key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
+        if self._gguf_v_head_reordered:
+            value = _reorder_v_head_axis_tiled_to_grouped(
+                value,
+                dim=2,
+                num_k_heads=self.num_k_heads,
+                num_v_heads=self.num_v_heads,
+            )
 
         beta = b.sigmoid()
-        g = self.ssm_a.float() * F.softplus(a.float() + self.ssm_dt)
+        ssm_a = _maybe_reorder_gguf_ssm_param(
+            self.ssm_a,
+            interleave_halves=self._gguf_interleave_ssm_ab,
+            tiled_to_grouped=self._gguf_ssm_param_reordered,
+            num_k_heads=self.num_k_heads,
+            num_v_heads=self.num_v_heads,
+        )
+        ssm_dt = _maybe_reorder_gguf_ssm_param(
+            self.ssm_dt,
+            interleave_halves=self._gguf_interleave_ssm_ab,
+            tiled_to_grouped=self._gguf_ssm_param_reordered,
+            num_k_heads=self.num_k_heads,
+            num_v_heads=self.num_v_heads,
+        )
+        g = ssm_a.float() * F.softplus(a.float() + ssm_dt)
         if self.num_v_heads // self.num_k_heads > 1:
             repeat_factor = self.num_v_heads // self.num_k_heads
             query = query.repeat_interleave(repeat_factor, dim=2)
@@ -805,6 +977,7 @@ class Qwen3_5Block(nn.Module):
                     output_final_state=True,
                 )
         else:
+            recurrent_initial_state = recurrent_state if has_previous_state else None
             if self._fast_chunk_gated_delta_rule is not None and hidden_states.is_cuda:
                 core_attn_out, last_recurrent_state = self._fast_chunk_gated_delta_rule(
                     query,
@@ -812,7 +985,7 @@ class Qwen3_5Block(nn.Module):
                     value,
                     g=g,
                     beta=beta,
-                    initial_state=None,
+                    initial_state=recurrent_initial_state,
                     output_final_state=True,
                     use_qk_l2norm_in_kernel=True,
                 )
@@ -823,7 +996,7 @@ class Qwen3_5Block(nn.Module):
                     value,
                     g=g,
                     beta=beta,
-                    initial_state=None,
+                    initial_state=recurrent_initial_state,
                     output_final_state=True,
                 )
 
@@ -837,6 +1010,14 @@ class Qwen3_5Block(nn.Module):
             z.reshape(-1, self.head_v_dim),
         )
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
+        if self._gguf_v_head_reordered:
+            core_attn_out = _reorder_v_heads_grouped_to_tiled(
+                core_attn_out,
+                dim=-1,
+                num_k_heads=self.num_k_heads,
+                num_v_heads=self.num_v_heads,
+                head_dim=self.head_v_dim,
+            )
         return self.ssm_out(core_attn_out)
 
     def forward(
@@ -859,7 +1040,8 @@ class Qwen3_5Block(nn.Module):
             hidden_states = self._forward_linear_attention(hidden_states, layer_idx, past_key_values, attention_mask)
 
         hidden_states, residual = self.post_attention_norm(hidden_states, residual)
-        hidden_states = self.ffn_down(self.mlp_act_fn(torch.cat((self.ffn_gate(hidden_states), self.ffn_up(hidden_states)), dim=-1)))
+        gate_up = self.ffn_gate_up(hidden_states) if self.ffn_gate_up is not None else torch.cat((self.ffn_gate(hidden_states), self.ffn_up(hidden_states)), dim=-1)
+        hidden_states = self.ffn_down(self.mlp_act_fn(gate_up))
         return hidden_states, residual
 
 

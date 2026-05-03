@@ -14,13 +14,11 @@ from mmgp import offload
 import torch
 import torch.nn as nn
 import torch.cuda.amp as amp
-import torch.distributed as dist
 import numpy as np
 from tqdm import tqdm
 from PIL import Image
 import torchvision.transforms.functional as TF
 import torch.nn.functional as F
-from .distributed.fsdp import shard_model
 from .modules.model import WanModel
 from mmgp.offload import get_cache, clear_caches
 from .modules.t5 import T5EncoderModel
@@ -52,6 +50,17 @@ from mmgp import safetensors2
 from shared.utils import files_locator as fl 
 
 WAN_USE_FP32_ROPE_FREQS = True
+
+def get_vista4d_rotary_pos_embed(latents_size):
+    lat_t, lat_h, lat_w = latents_size
+    grid_t, grid_h, grid_w = lat_t, lat_h // 2, lat_w // 2
+    offset = max(31, grid_t)
+    cos_parts, sin_parts = [], []
+    for start in (0, offset, offset * 2):
+        cos, sin = get_nd_rotary_pos_embed((start, 0, 0), (start + grid_t, grid_h, grid_w), (grid_t, grid_h, grid_w), L_test=grid_t)
+        cos_parts.append(cos)
+        sin_parts.append(sin)
+    return torch.cat(cos_parts, dim=0), torch.cat(sin_parts, dim=0)
 
 def optimized_scale(positive_flat, negative_flat):
 
@@ -111,7 +120,7 @@ class WanAny2V:
                 tokenizer_path = os.path.dirname(fl.locate_file(os.path.join(text_encoder_folder, "tokenizer_config.json")))
             else:
                 tokenizer_path = os.path.dirname(text_encoder_filename)
-            self.text_encoder = T5EncoderModel(text_len=config.text_len, dtype=config.t5_dtype, device=torch.device('cpu'), checkpoint_path=text_encoder_filename, tokenizer_path=tokenizer_path, shard_fn=None)
+            self.text_encoder = T5EncoderModel(text_len=config.text_len, dtype=config.t5_dtype, device=torch.device('cpu'), checkpoint_path=text_encoder_filename, tokenizer_path=tokenizer_path)
             self.text_encoder_cache = TextEncoderCache()
         if hasattr(config, "clip_checkpoint") and not model_def.get("i2v_2_2", False) or base_model_type in ["animate"]:
             self.clip = CLIPModel(
@@ -485,6 +494,7 @@ class WanAny2V:
         self_refiner_plan="",
         self_refiner_f_uncertainty = 0.0,
         self_refiner_certain_percentage = 0.999,
+        custom_settings=None,
         **bbargs
                 ):
         
@@ -571,8 +581,8 @@ class WanAny2V:
         # context_NAG = context_NAG.to(self.dtype)
         # context_NAG = torch.cat([context_NAG, context_NAG.new_zeros(text_len -context_NAG.size(0), context_NAG.size(1)) ]).unsqueeze(0) 
         
-        # from mmgp import offload
-        # offloadobj.unload_all()
+        from mmgp import offload
+        offloadobj.unload_all()
 
         offload.shared_state.update({"_nag_scale" : NAG_scale, "_nag_tau" : NAG_tau, "_nag_alpha":  NAG_alpha })
         if NAG_scale > 1: context = torch.cat([context, context_null], dim=0)
@@ -597,6 +607,7 @@ class WanAny2V:
         steadydancer = model_type in ["steadydancer"]
         wanmove = model_type in ["wanmove"]
         scail = model_type in ["scail"] 
+        vista4d = model_type in ["vista4d"]
         svi_pro = model_def.get("svi2pro", False)
         svi_mode = 2 if svi_pro  else 0 
         svi_ref_pad_num = 0
@@ -904,6 +915,11 @@ class WanAny2V:
             cam_emb = get_camera_embedding(target_camera)       
             cam_emb = cam_emb.to(dtype=self.dtype, device=self.device)
             kwargs['cam_emb'] = cam_emb
+
+        if vista4d:
+            from .vista4d.preprocess import prepare_vista4d_condition
+            kwargs.update(prepare_vista4d_condition(self, input_frames, input_custom, frame_num, height, width, VAE_tile_size, fps=bbargs.get("fps", model_def.get("fps", 16)), custom_settings=custom_settings, model_mode=model_mode))
+            freqs = get_vista4d_rotary_pos_embed((lat_frames, height // self.vae_stride[1], width // self.vae_stride[2]))
 
         # Video 2 Video
         if "G" in video_prompt_type and input_frames != None:

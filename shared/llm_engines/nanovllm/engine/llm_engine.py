@@ -17,6 +17,7 @@ class LLMEngine:
 
     def __init__(self, model, **kwargs):
         model_object = kwargs.get("model_object", None)
+        graph_pool_handle = kwargs.get("graph_pool_handle", None)
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
@@ -30,7 +31,7 @@ class LLMEngine:
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events, model_object=model_object)
+        self.model_runner = ModelRunner(config, 0, self.events, model_object=model_object, graph_pool_handle=graph_pool_handle)
         tokenizer = kwargs.get("tokenizer", None)
         if tokenizer is not None:
             self.tokenizer = tokenizer
@@ -241,6 +242,7 @@ class LLMEngine:
         # This prevents 'deque index out of range' errors from accumulated block leaks
         if not self.is_finished():
             self.reset()
+        self.model_runner.reset_generation_state()
         
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
@@ -314,6 +316,7 @@ class LLMEngine:
             )
         if not self.is_finished():
             self.reset()
+        self.model_runner.reset_generation_state()
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         if prompt_position_ids is None:

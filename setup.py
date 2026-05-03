@@ -10,20 +10,22 @@ CONFIG_PATH = "setup_config.json"
 ENVS_FILE = "envs.json"
 IS_WIN = os.name == 'nt'
 
+_PY_PATH = f'"{os.path.join("{dir}", "Scripts", "python.exe")}"' if IS_WIN else f'"{os.path.join("{dir}", "bin", "python")}"'
+
 ENV_TEMPLATES = {
     "uv": {
-        "create": "uv venv --python {ver} \"{dir}\"",
-        "run": os.path.join("{dir}", "Scripts", "python.exe") if IS_WIN else os.path.join("{dir}", "bin", "python"),
-        "install": (os.path.join("{dir}", "Scripts", "python.exe") if IS_WIN else os.path.join("{dir}", "bin", "python")) + " -m uv pip install"
+        "create": "uv venv --seed --python {ver} \"{dir}\"",
+        "run": _PY_PATH,
+        "install": "uv pip install --python \"{dir}\""
     },
     "venv": {
-        "create": "{sys_py} -m venv \"{dir}\"",
-        "run": os.path.join("{dir}", "Scripts", "python.exe") if IS_WIN else os.path.join("{dir}", "bin", "python"),
-        "install": (os.path.join("{dir}", "Scripts", "python.exe") if IS_WIN else os.path.join("{dir}", "bin", "python")) + " -m pip install"
+        "create": "\"{sys_py}\" -m venv \"{dir}\"",
+        "run": _PY_PATH,
+        "install": f"{_PY_PATH} -m pip install"
     },
     "conda": {
         "create": "conda create -y -p \"{dir}\" python={ver}",
-        "run": "conda run -p \"{dir}\" python",
+        "run": os.path.join("{dir}", "python.exe"),
         "install": "conda run -p \"{dir}\" pip install"
     },
     "none": {
@@ -245,19 +247,11 @@ def get_env_details(name, env_data):
     dir_name = env_data["path"]
     entry = ENV_TEMPLATES[env_type]
     
-    if env_type == "conda":
-        cmd_base = entry['run'].format(dir=dir_name)
-        full_cmd = f"{cmd_base} -c \"{VERSION_CHECK_SCRIPT.replace(chr(10), ';')}\""
-    else:
-        py_exec = entry['run'].format(dir=dir_name)
-        full_cmd = [py_exec, "-c", VERSION_CHECK_SCRIPT]
+    py_exec = entry['run'].format(dir=dir_name).strip('"')
+    full_cmd = [py_exec, "-c", VERSION_CHECK_SCRIPT]
         
     try:
-        if env_type == "conda":
-            output = subprocess.check_output(full_cmd, shell=True, encoding='utf-8', stderr=subprocess.DEVNULL)
-        else:
-            output = subprocess.check_output(full_cmd, encoding='utf-8', stderr=subprocess.DEVNULL)
-        
+        output = subprocess.check_output(full_cmd, encoding='utf-8', stderr=subprocess.DEVNULL)
         data = {k: v for k, v in [x.split('=') for x in output.strip().split('||')]}
         data['path'] = dir_name
         data['type'] = env_type
@@ -309,9 +303,22 @@ def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k,
     print(f"\n[1/3] Preparing Environment: {env_name} ({env_type})...")
 
     if env_type != "none":
-        create_cmd = template["create"].format(ver=target_py_ver, dir=env_path, sys_py=sys.executable)
-        if create_cmd:
-            run_cmd(create_cmd)
+        if env_type == "venv":
+            py_ver_short = ".".join(target_py_ver.split(".")[:2])
+
+            if IS_WIN:
+                create_cmd = f"py -{py_ver_short} -m venv \"{env_path}\""
+            else:
+                create_cmd = f"python{py_ver_short} -m venv \"{env_path}\""
+        else:
+            create_cmd = template["create"].format(
+                ver=target_py_ver,
+                dir=env_path,
+                sys_py=sys.executable
+            )
+
+    if create_cmd:
+        run_cmd(create_cmd)
 
     pip = template["install"].format(dir=env_path)
     
@@ -332,7 +339,7 @@ def install_logic(env_name, env_type, env_path, py_k, torch_k, triton_k, sage_k,
             run_cmd(f"{pip} {cmd}")
         else:
             if env_type == "venv" or env_type == "uv":
-                act = f". {env_path}/bin/activate && " if not IS_WIN else ""
+                act = f". \"{env_path}/bin/activate\" && " if not IS_WIN else ""
                 run_cmd(f"{act}{cmd}")
             elif env_type == "conda":
                 pass
@@ -382,9 +389,9 @@ def do_install_interactive(env_type, config, detected_key):
         except: pass
 
     print("\n--- Select Install Mode ---")
-    print("1. Autoselect (Recommended - Based on your card)")
-    print("2. Manual Selection (Custom versions)")
-    print("3. Use Latest (Forces RTX 50 Profile)")
+    print("1. Autoselect (Based on your GPU)")
+    print("2. Manual Selection")
+    print("3. Use Latest")
     
     mode = input("Select option (1-3) [Default: 1]: ").strip()
     
@@ -415,6 +422,29 @@ def do_install_interactive(env_type, config, detected_key):
     else:
         print(f"\n[*] '{name}' is the only environment, setting as active.")
         manager.set_active(name)
+
+def do_install_auto(env_type, config, detected_key):
+    manager = EnvsManager()
+    create_wgp_config(detected_key, config)
+
+    name = f"env_{env_type}" if env_type != "none" else "system"
+    cwd = os.getcwd()
+    path = os.path.join(cwd, name) if env_type != "none" else ""
+
+    if name in manager.list_envs():
+        manager.remove_env(name)
+    elif os.path.exists(path) and env_type != "none":
+        try: shutil.rmtree(path)
+        except: pass
+
+    print(f"\n[*] Starting Automatic Install (Hardware Profile: {detected_key})...")
+    p = config['gpu_profiles'][detected_key]
+    
+    install_logic(name, env_type, path, p['python'], p['torch'], p['triton'], p['sage'], p.get('flash'), p['kernels'], config)
+
+    manager.add_env(name, env_type, path)
+    manager.set_active(name)
+    print(f"\n[*] Automatic Install Complete! '{name}' is now active.")
 
 def do_manage():
     manager = EnvsManager()
@@ -475,29 +505,6 @@ def do_manage():
             input("Press Enter...")
         elif choice == "5":
             break
-
-def do_migrate(config):
-    manager = EnvsManager()
-    print("\n" + "="*60)
-    print("      WAN2GP AUTOMATED PLATFORM MIGRATION (TO 3.11)")
-    print("="*60)
-    
-    env_name = manager.resolve_target_env()
-    env_data = manager.list_envs()[env_name]
-    
-    print(f"\nTarget Environment: {env_name} ({env_data['type']})")
-    confirm = input(f"This will wipe '{env_name}' and rebuild it. Proceed? (y/n): ")
-    if confirm.lower() != 'y': return
-
-    target = config['gpu_profiles']['RTX_50']
-
-    manager.remove_env(env_name)
-
-    install_logic(env_name, env_data['type'], env_data['path'], 
-                  target['python'], target['torch'], target['triton'], 
-                  target['sage'], target.get('flash'), target['kernels'], config)
-    
-    manager.add_env(env_name, env_data['type'], env_data['path'])
 
 def do_upgrade(config):
     manager = EnvsManager()
@@ -626,10 +633,43 @@ def create_wgp_config(profile_key, config_data):
     except Exception as e:
         print(f"[!] Error writing config: {e}")
 
+def inject_system_paths():
+    if not IS_WIN:
+        return
+        
+    paths = []
+    user = os.environ.get("USERPROFILE", "")
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    appdata = os.environ.get("APPDATA", "")
+
+    for base in [os.path.join(user, "Miniconda3"), os.path.join(user, "Anaconda3"), r"C:\ProgramData\Miniconda3"]:
+        c_bin = os.path.join(base, "condabin")
+        if os.path.exists(c_bin):
+            paths.extend([c_bin, os.path.join(base, "Scripts"), base])
+            break
+
+    if user: paths.append(os.path.join(user, ".local", "bin"))
+    if appdata: paths.append(os.path.join(appdata, "uv", "bin"))
+
+    if local_app:
+        paths.extend([
+            os.path.join(local_app, "Programs", "Python", "PyManager"),
+            os.path.join(local_app, "Programs", "Python", "Python311", "Scripts")
+        ])
+        
+    current_path = os.environ.get("PATH", "")
+    for p in paths:
+        if p and os.path.exists(p) and p not in current_path:
+            current_path = f"{p};{current_path}"
+            
+    os.environ["PATH"] = current_path
+
 if __name__ == "__main__":
+    inject_system_paths()
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=["install", "run", "update", "migrate", "upgrade", "status", "manage"])
+    parser.add_argument("mode", choices=["install", "run", "update", "upgrade", "status", "manage"])
     parser.add_argument("--env", default="venv", help="Type of env for install (venv, uv, conda, none)")
+    parser.add_argument("--auto", action="store_true", help="Run 1-click automatic install")
     args = parser.parse_args()
     cfg = load_config()
     
@@ -647,7 +687,10 @@ if __name__ == "__main__":
 
     if args.mode == "install":
         print(f"Hardware Detected: {gpu_name} ({vendor})")
-        do_install_interactive(args.env, cfg, profile_key)
+        if args.auto:
+            do_install_auto(args.env, cfg, profile_key)
+        else:
+            do_install_interactive(args.env, cfg, profile_key)
     
     elif args.mode == "run":
         manager = EnvsManager()
@@ -680,12 +723,9 @@ if __name__ == "__main__":
         env_name = manager.resolve_target_env()
         env_data = manager.list_envs()[env_name]
         
-        cmd_fmt = ENV_TEMPLATES[env_data['type']]['run']
-        cmd = f"{cmd_fmt.format(dir=env_data['path'])} -m pip install -r requirements.txt"
+        install_fmt = ENV_TEMPLATES[env_data['type']]['install']
+        cmd = f"{install_fmt.format(dir=env_data['path'])} -r requirements.txt"
         run_cmd(cmd)
-
-    elif args.mode == "migrate":
-        do_migrate(cfg)
 
     elif args.mode == "upgrade":
         do_upgrade(cfg)

@@ -3,6 +3,7 @@ from typing import Protocol
 
 import torch
 
+from ...utils import rms_norm
 from shared.attention import pay_attention
 from .rope import LTXRopeType, apply_rotary_emb_inplace
 
@@ -142,34 +143,20 @@ class AttentionFunction(Enum):
 
 
 class DBMRMSNorm(torch.nn.Module):
-
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.dim = dim
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.ones(dim))
 
-    def forward(self, x, in_place= True):
+    def forward(self, x, in_place=True):
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        y = x.float()
-        y.pow_(2)
-        y = y.mean(dim=-1, keepdim=True)
-        y += self.eps
-        y.rsqrt_()
-        if in_place:
-            x *=  y
-        else:
-            x = x * y
-        x *= self.weight
-        return x
-        # return self._norm(x).type_as(x) * self.weight
+        return rms_norm(x, weight=self.weight, eps=self.eps, in_place=in_place)
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-    
+
 class Attention(torch.nn.Module):
     def __init__(
         self,
@@ -219,6 +206,7 @@ class Attention(torch.nn.Module):
         mask: torch.Tensor | None = None,
         pe: torch.Tensor | None = None,
         k_pe: torch.Tensor | None = None,
+        NAG: dict | None = None,
     ) -> torch.Tensor:
         x = x_list[0]
         gate_input = x
@@ -244,8 +232,55 @@ class Attention(torch.nn.Module):
         q = q.view(q.shape[0], -1, self.heads, self.dim_head)
         k = k.view(k.shape[0], -1, self.heads, self.dim_head)
         v = v.view(v.shape[0], -1, self.heads, self.dim_head)
-
         force_attention, attention_version = self._resolve_attention_override()
+
+        if cross_attn and NAG is not None:
+            cap_len = int(NAG.get("cap_embed_len", 0) or 0)
+            if cap_len > 0 and k.shape[1] == cap_len * 2:
+                pos_mask = None if mask is None else mask[..., :cap_len]
+                neg_mask = None if mask is None else mask[..., cap_len : cap_len * 2]
+                qkv_list = [q, k[:, :cap_len], v[:, :cap_len]]
+                # Keep the merge in attention-output space with in-place ops, following the Wan low-allocation path.
+                x_pos = pay_attention(
+                    qkv_list,
+                    attention_mask=pos_mask,
+                    force_attention=force_attention,
+                    version=attention_version,
+                )
+                qkv_list = [q, k[:, cap_len : cap_len * 2], v[:, cap_len : cap_len * 2]]
+                q = k = v = None
+                out = pay_attention(
+                    qkv_list,
+                    attention_mask=neg_mask,
+                    force_attention=force_attention,
+                    version=attention_version,
+                    recycle_q=True,
+                )
+                nag_scale = float(NAG["scale"])
+                nag_alpha = float(NAG["alpha"])
+                nag_tau = float(NAG["tau"])
+                out.mul_(1 - nag_scale)
+                out.add_(x_pos, alpha=nag_scale)
+                norm_positive = torch.sum(torch.abs(x_pos), dim=(2, 3), keepdim=True)
+                norm_guidance = torch.sum(torch.abs(out), dim=(2, 3), keepdim=True)
+                scale = norm_guidance / norm_positive
+                torch.nan_to_num(scale, nan=10.0, posinf=10.0, neginf=10.0, out=scale)
+                factor = (norm_positive * nag_tau) / (norm_guidance + 1e-7)
+                out = torch.where(scale > nag_tau, out * factor, out)
+                del norm_positive, norm_guidance, scale, factor
+                x_pos.mul_(1 - nag_alpha)
+                out.mul_(nag_alpha)
+                out.add_(x_pos)
+                x_pos = None
+                if self.to_gate_logits is not None:
+                    gate_logits = self.to_gate_logits(gate_input)
+                    gates = 2.0 * torch.sigmoid(gate_logits).to(dtype=out.dtype)
+                    out.mul_(gates.unsqueeze(-1))
+                gate_input = None
+                out = out.flatten(2, 3)
+                out = self.to_out(out)
+                return out
+
         qkv_list = [q, k, v]
         q = k = v = None
         out = pay_attention(
@@ -253,7 +288,7 @@ class Attention(torch.nn.Module):
             attention_mask=mask,
             force_attention=force_attention,
             version=attention_version,
-            cross_attn=cross_attn
+            recycle_q= True,
         )
         if self.to_gate_logits is not None:
             gate_logits = self.to_gate_logits(gate_input)
