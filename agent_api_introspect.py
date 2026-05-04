@@ -83,6 +83,7 @@ def _install_wgp_stub() -> None:
         return
     import types
     stub = types.ModuleType("wgp")
+    stub.__file__ = str(WANGP_ROOT / "wgp.py")  # type: ignore[attr-defined]
     stub.get_lora_root = lambda: str(WANGP_ROOT / "loras")  # type: ignore[attr-defined]
     stub.__wgp_stub__ = True  # type: ignore[attr-defined]
     sys.modules["wgp"] = stub
