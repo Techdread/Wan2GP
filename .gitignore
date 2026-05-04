@@ -26,6 +26,9 @@
 *.exe
 cache
 __pycache__/
+venv/
+env_venv/
+envs.json
 storage/
 samples/
 !.gitignore
@@ -46,3 +49,11 @@ loras_i2v/
 wgp_config.json
 plugins_local.json
 loras_url_cache.json
+AI-integration/01-ai-media-capability-architecture.md
+AI-integration/02-settings-and-capability-dashboard.md
+AI-integration/03-provider-registry-and-shared-api.md
+AI-integration/04-first-app-upgrades-and-new-app-opportunities.md
+AI-integration/Wan2GP-API-HARDENING.md
+AI-integration/Wan2GP-CLIENT-SETUP-REVISION-BRIEF.md
+AI-integration/Wan2GP-CLIENT-SETUP.md
+AI-integration/Wan2GP-NETWORK-API.md
