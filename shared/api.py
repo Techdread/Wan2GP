@@ -946,6 +946,14 @@ class WanGPSession:
                 sys.path.insert(0, str(self._root))
 
             with _pushd(self._root), _temporary_argv(argv):
+                # The introspection layer (agent_api_introspect) installs a
+                # stub `wgp` module in sys.modules so it can AST-scan without
+                # importing the heavy real module. That stub blocks the real
+                # wgp.py from ever loading, which leaves it without __file__
+                # and breaks every job. Eject it before importing for real.
+                existing = sys.modules.get("wgp")
+                if existing is not None and getattr(existing, "__wgp_stub__", False):
+                    del sys.modules["wgp"]
                 module = importlib.import_module("wgp")
                 module_root = Path(module.__file__).resolve().parent
                 if module_root != self._root:

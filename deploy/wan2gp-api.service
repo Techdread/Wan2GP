@@ -1,0 +1,48 @@
+[Unit]
+# WanGP Agent API server (hardened).
+# Install as a user unit:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/wan2gp-api.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now wan2gp-api.service
+#   loginctl enable-linger "$USER"   # so it survives logout
+#
+# Edit `Environment=WAN2GP_TOKEN=...` below before enabling.
+Description=WanGP Agent API server
+After=default.target
+
+[Service]
+Type=simple
+# Both paths below get rewritten by deploy/install-systemd-unit.sh based on
+# the repo location it's run from (template default: /media/peter/AI/Wan2GP).
+WorkingDirectory=/media/peter/AI/Wan2GP
+ExecStart=/media/peter/AI/Wan2GP/venv/bin/python /media/peter/AI/Wan2GP/agent_api.py serve --host 0.0.0.0 --port 8100
+Restart=on-failure
+RestartSec=5
+
+# --- Configuration -------------------------------------------------------
+# Set a shared bearer token. Leave unset for unauthenticated LAN mode.
+Environment=WAN2GP_TOKEN=
+# Default outputs root used for /api/file safety check.
+Environment=WAN2GP_OUTPUTS_ROOT=/media/peter/AI/Wan2GP/outputs
+# Persistent job log (last 200 jobs by default).
+Environment=WAN2GP_JOB_DB=%h/.wan2gp/jobs.sqlite
+# Set to "1" to include prompt text in JSON logs (debugging only).
+Environment=WAN2GP_LOG_PROMPTS=0
+# CORS allow-list for browser dashboards. Comma-separated origins, or "*".
+# Empty = CORS disabled (calls from browser pages will be blocked at preflight).
+# Examples:
+#   Environment=WAN2GP_CORS_ORIGINS=http://localhost:5173
+#   Environment=WAN2GP_CORS_ORIGINS=http://localhost:5173,http://192.168.1.50:8080
+#   Environment=WAN2GP_CORS_ORIGINS=*
+Environment=WAN2GP_CORS_ORIGINS=
+# CUDA: pin to a specific GPU on multi-GPU hosts.
+# Environment=CUDA_VISIBLE_DEVICES=0
+
+# --- Hardening ----------------------------------------------------------
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

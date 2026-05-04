@@ -79,6 +79,7 @@ class WanGPAgent:
         extra_cli_args: list[str] | None = None,
         url: str | None = None,
         timeout: int = 3600,
+        token: str | None = None,
     ):
         """
         Initialize the WanGP agent.
@@ -93,10 +94,12 @@ class WanGPAgent:
             url: URL of a running agent API server (e.g. "http://localhost:8100").
                  When set, all operations are routed via HTTP to the server.
             timeout: HTTP request timeout in seconds for remote mode (default: 3600).
+            token: Bearer token for remote mode. Falls back to WAN2GP_TOKEN env var.
         """
         self._url = url.rstrip('/') if url else None
         self._timeout = timeout
         self._verbose = verbose
+        self._token = token or os.environ.get("WAN2GP_TOKEN") or None
         if self._url:
             # Remote mode — no local session needed
             self._root = Path(root).resolve() if root else None
@@ -114,24 +117,72 @@ class WanGPAgent:
     #  Remote HTTP helpers
     # ------------------------------------------------------------------ #
 
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._token}"} if self._token else {}
+
     def _remote_get(self, endpoint: str) -> Any:
         """GET request to the remote API server."""
         import urllib.request
         url = f"{self._url}{endpoint}"
-        req = urllib.request.Request(url)
+        req = urllib.request.Request(url, headers=self._auth_headers())
         with urllib.request.urlopen(req, timeout=self._timeout) as resp:
             return json.loads(resp.read())
 
-    def _remote_post(self, endpoint: str, data: dict) -> Any:
+    def _remote_post(self, endpoint: str, data: Any) -> Any:
         """POST request to the remote API server."""
         import urllib.request
         url = f"{self._url}{endpoint}"
         body = json.dumps(data).encode('utf-8')
-        req = urllib.request.Request(
-            url, data=body, headers={'Content-Type': 'application/json'},
-        )
+        headers = {'Content-Type': 'application/json', **self._auth_headers()}
+        req = urllib.request.Request(url, data=body, headers=headers)
         with urllib.request.urlopen(req, timeout=self._timeout) as resp:
             return json.loads(resp.read())
+
+    def _remote_delete(self, endpoint: str) -> Any:
+        """DELETE request to the remote API server."""
+        import urllib.request
+        url = f"{self._url}{endpoint}"
+        req = urllib.request.Request(url, method='DELETE', headers=self._auth_headers())
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            return json.loads(resp.read())
+
+    # ------------------------------------------------------------------ #
+    #  Async job API (remote mode)
+    # ------------------------------------------------------------------ #
+
+    def submit_job(self, settings: dict[str, Any]) -> dict[str, Any]:
+        """Create a job. Returns the job record (status: 'queued')."""
+        if not self._url:
+            raise RuntimeError("submit_job() requires remote mode (url=...)")
+        return self._remote_post('/api/jobs', settings)
+
+    def get_job(self, job_id: str) -> dict[str, Any]:
+        if not self._url:
+            raise RuntimeError("get_job() requires remote mode (url=...)")
+        return self._remote_get(f'/api/jobs/{job_id}')
+
+    def list_jobs(self, limit: int = 50) -> dict[str, Any]:
+        if not self._url:
+            raise RuntimeError("list_jobs() requires remote mode (url=...)")
+        return self._remote_get(f'/api/jobs?limit={limit}')
+
+    def cancel_job(self, job_id: str) -> dict[str, Any]:
+        if not self._url:
+            raise RuntimeError("cancel_job() requires remote mode (url=...)")
+        return self._remote_delete(f'/api/jobs/{job_id}')
+
+    def wait_for_job(self, job_id: str, *, poll_seconds: float = 1.0,
+                     timeout: float | None = None) -> dict[str, Any]:
+        """Block until a job reaches a terminal state. Polls /api/jobs/:id."""
+        terminal = ("completed", "failed", "cancelled")
+        deadline = None if timeout is None else time.time() + timeout
+        while True:
+            rec = self.get_job(job_id)
+            if rec.get("status") in terminal:
+                return rec
+            if deadline is not None and time.time() >= deadline:
+                raise TimeoutError(f"job {job_id} did not finish within {timeout}s")
+            time.sleep(poll_seconds)
 
     # ------------------------------------------------------------------ #
     #  Session management
@@ -515,7 +566,13 @@ class WanGPAgent:
         url = f"{self._url}/api/file?path={urllib.parse.quote(remote_path)}"
         if local_path is None:
             local_path = os.path.basename(remote_path)
-        urllib.request.urlretrieve(url, local_path)
+        req = urllib.request.Request(url, headers=self._auth_headers())
+        with urllib.request.urlopen(req, timeout=self._timeout) as resp, open(local_path, 'wb') as out:
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                out.write(chunk)
         return local_path
 
 
@@ -524,147 +581,40 @@ class WanGPAgent:
 # ------------------------------------------------------------------ #
 
 def serve(
-    host: str = "localhost",
+    host: str = "0.0.0.0",
     port: int = 8100,
-    **agent_kwargs,
+    profile: int = 4,
+    attention: str = "sage2",
+    outputs_root: str | None = None,
+    token: str | None = None,
+    history_limit: int | None = None,
+    cors_origins: str | None = None,
+    **_legacy_kwargs,
 ):
     """
-    Start an HTTP API server wrapping WanGPAgent.
+    Start the hardened WanGP Agent API server.
 
-    Clients connect with: WanGPAgent(url="http://host:port")
+    Delegates to ``agent_api_server.serve`` which provides:
+        - async /api/jobs lifecycle (POST/GET/DELETE/SSE)
+        - bearer-token auth (env WAN2GP_TOKEN)
+        - constrained /api/file (env WAN2GP_OUTPUTS_ROOT)
+        - rich /api/health (gpu, queue, version)
+        - structured JSON logs with request/job correlation
+        - back-compat sync /api/generate and /api/batch with Deprecation header
 
-    Endpoints:
-        GET  /api/health              Health check
-        POST /api/generate            Submit a single generation task
-        POST /api/batch               Submit multiple tasks
-        GET  /api/models              List model families
-        GET  /api/loras?model_type=X  List loras for a model type
-        GET  /api/settings            Get default settings template
-        POST /api/release             Release loaded model from VRAM
-        GET  /api/file?path=X         Download a generated file
-
-    Args:
-        host: Bind address (default: "localhost").
-        port: Port number (default: 8100).
-        **agent_kwargs: Forwarded to WanGPAgent() for local init.
+    Clients connect with: ``WanGPAgent(url="http://host:port", token=...)``.
     """
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    from socketserver import ThreadingMixIn
-    import urllib.parse as _up
-    import threading
-
-    agent = WanGPAgent(**agent_kwargs)
-    gen_lock = threading.Lock()
-
-    # Directories from which files may be served
-    _allowed = set()
-    if agent._root:
-        _allowed.add(os.path.realpath(agent._root / "outputs"))
-    if agent._output_dir:
-        _allowed.add(os.path.realpath(agent._output_dir))
-
-    class _Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            p = self.path.split('?')[0]
-            try:
-                if p == '/api/health':
-                    self._ok({"status": "ok"})
-                elif p == '/api/models':
-                    self._ok(agent.list_models())
-                elif p == '/api/loras':
-                    q = self._qs()
-                    self._ok(agent.list_loras(q.get('model_type', 'z_image')))
-                elif p == '/api/settings':
-                    self._ok(agent.get_default_settings())
-                elif p == '/api/file':
-                    self._serve_file()
-                else:
-                    self._err("not found", 404)
-            except Exception as exc:
-                self._err(str(exc), 500)
-
-        def do_POST(self):
-            p = self.path.split('?')[0]
-            try:
-                body = self._body()
-                if p == '/api/generate':
-                    with gen_lock:
-                        self._ok(agent._run_task(body))
-                elif p == '/api/batch':
-                    with gen_lock:
-                        result = agent.generate_batch(body)
-                    self._ok(result)
-                elif p == '/api/release':
-                    with gen_lock:
-                        agent.release_model()
-                    self._ok({"ok": True})
-                else:
-                    self._err("not found", 404)
-            except Exception as exc:
-                self._err(str(exc), 500)
-
-        # --- helpers ---
-
-        def _body(self):
-            n = int(self.headers.get('Content-Length', 0))
-            return json.loads(self.rfile.read(n)) if n else {}
-
-        def _qs(self):
-            if '?' not in self.path:
-                return {}
-            return dict(_up.parse_qsl(self.path.split('?', 1)[1]))
-
-        def _ok(self, data):
-            raw = json.dumps(data).encode()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-
-        def _err(self, msg, code):
-            raw = json.dumps({"error": msg}).encode()
-            self.send_response(code)
-            self.send_header('Content-Type', 'application/json')
-            self.send_header('Content-Length', str(len(raw)))
-            self.end_headers()
-            self.wfile.write(raw)
-
-        def _serve_file(self):
-            q = self._qs()
-            fp = q.get('path', '')
-            if not fp or not os.path.isfile(fp):
-                return self._err("file not found", 404)
-            real = os.path.realpath(fp)
-            if not any(real.startswith(d + os.sep) for d in _allowed):
-                return self._err("access denied", 403)
-            with open(real, 'rb') as f:
-                data = f.read()
-            self.send_response(200)
-            self.send_header('Content-Type', 'application/octet-stream')
-            self.send_header('Content-Length', str(len(data)))
-            self.send_header('Content-Disposition',
-                             f'attachment; filename="{os.path.basename(fp)}"')
-            self.end_headers()
-            self.wfile.write(data)
-
-        def log_message(self, fmt, *a):
-            if agent._verbose:
-                super().log_message(fmt, *a)
-
-    class _Server(ThreadingMixIn, HTTPServer):
-        daemon_threads = True
-
-    srv = _Server((host, port), _Handler)
-    print(f"WanGP Agent API server on http://{host}:{port}")
-    print(f"Connect with: WanGPAgent(url='http://{host}:{port}')")
-    print("Press Ctrl+C to stop.\n")
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-        agent.close()
-        srv.server_close()
+    from agent_api_server import serve as _serve
+    _serve(
+        host=host,
+        port=port,
+        profile=profile,
+        attention=attention,
+        outputs_root=outputs_root,
+        token=token,
+        history_limit=history_limit,
+        cors_origins=cors_origins,
+    )
 
 
 # ------------------------------------------------------------------ #
@@ -703,10 +653,19 @@ if __name__ == "__main__":
 
     # API server
     serve_parser = sub.add_parser("serve", help="Start HTTP API server")
-    serve_parser.add_argument("--host", default="localhost", help="Bind address")
+    serve_parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     serve_parser.add_argument("--port", type=int, default=8100, help="Port")
     serve_parser.add_argument("--profile", type=int, default=4, help="Memory profile")
     serve_parser.add_argument("--attention", default="sage2", help="Attention mode")
+    serve_parser.add_argument("--outputs-root", default=None,
+                              help="Override outputs root for /api/file (default: <repo>/outputs)")
+    serve_parser.add_argument("--token", default=None,
+                              help="Bearer token; falls back to WAN2GP_TOKEN env var")
+    serve_parser.add_argument("--history-limit", type=int, default=None,
+                              help="Number of jobs to retain in SQLite history (default: 200)")
+    serve_parser.add_argument("--cors-origins", default=None,
+                              help="Comma-separated CORS allow-list (e.g. 'http://localhost:5173') or '*'. "
+                                   "Falls back to WAN2GP_CORS_ORIGINS env var. Empty = CORS disabled.")
 
     args = parser.parse_args()
 
@@ -718,6 +677,10 @@ if __name__ == "__main__":
         serve(
             host=args.host, port=args.port,
             profile=args.profile, attention=args.attention,
+            outputs_root=args.outputs_root,
+            token=args.token,
+            history_limit=args.history_limit,
+            cors_origins=args.cors_origins,
         )
         sys.exit(0)
 
