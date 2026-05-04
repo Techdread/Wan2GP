@@ -1,0 +1,6 @@
+[submodule "plugins/wan2gp-gallery"]
+	path = plugins/wan2gp-gallery
+	url = https://github.com/Tophness/wan2gp-gallery
+[submodule "plugins/wan2gp-lora-manager"]
+	path = plugins/wan2gp-lora-manager
+	url = https://github.com/Tophness/wan2gp-lora-manager

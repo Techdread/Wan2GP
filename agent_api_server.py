@@ -52,7 +52,12 @@ from typing import Any
 
 
 WANGP_ROOT = Path(__file__).resolve().parent
-SERVER_VERSION = "0.3.1"
+SERVER_VERSION = "0.4.0"
+
+# Auto-derived schema + size cache live in their own modules so this file
+# stays focused on HTTP plumbing.
+import agent_api_introspect
+import agent_api_sizes
 
 
 # ---------------------------------------------------------------------------
@@ -136,50 +141,21 @@ def make_request_id() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Capability metadata
+# Capability metadata (auto-derived from family handler feature flags)
 # ---------------------------------------------------------------------------
 
-# Family module path → capability and per-family defaults.
-_FAMILY_CAPS: dict[str, dict[str, Any]] = {
-    "models.z_image":      {"capability": "image-generation", "default_resolution": "1024x1024", "default_steps": 8,  "speed_hint": "fast"},
-    "models.flux":         {"capability": "image-generation", "default_resolution": "1024x1024", "default_steps": 30, "speed_hint": "medium"},
-    "models.qwen":         {"capability": "image-generation", "default_resolution": "1024x1024", "default_steps": 30, "speed_hint": "slow"},
-    "models.kandinsky5":   {"capability": "image-generation", "default_resolution": "1024x1024", "default_steps": 30, "speed_hint": "medium"},
-    "models.wan":          {"capability": "video-generation", "default_resolution": "832x480",   "default_steps": 30, "speed_hint": "slow"},
-    "models.hyvideo":      {"capability": "video-generation", "default_resolution": "1280x720",  "default_steps": 30, "speed_hint": "slow"},
-    "models.ltx_video":    {"capability": "video-generation", "default_resolution": "1216x704",  "default_steps": 30, "speed_hint": "medium"},
-    "models.ltx2":         {"capability": "video-generation", "default_resolution": "1216x704",  "default_steps": 30, "speed_hint": "medium"},
-    "models.longcat":      {"capability": "video-generation", "default_resolution": "832x480",   "default_steps": 30, "speed_hint": "slow"},
-    "models.magi_human":   {"capability": "video-generation", "default_resolution": "832x480",   "default_steps": 30, "speed_hint": "slow"},
-    "models.TTS":          {"capability": "audio-generation", "default_resolution": None,         "default_steps": None, "speed_hint": "fast"},
-}
+def capability_for_model_type(model_type: str) -> str:
+    """Best-effort capability label for a model_type string.
 
-# Per-model-type overrides. Keys match settings["model_type"].
-_MODEL_OVERRIDES: dict[str, dict[str, Any]] = {
-    "z_image":             {"speed_hint": "fast",   "default_steps": 8},
-    "z_image_base":        {"speed_hint": "medium", "default_steps": 30},
-    "wan21_t2v_1.3B":      {"speed_hint": "medium"},
-    "ltx2_22B_distilled":  {"speed_hint": "medium"},
-}
-
-
-def _capability_for(family_path: str) -> dict[str, Any]:
-    """Return capability metadata for a `models.x.y_handler` path."""
-    parts = family_path.split(".")
-    family_key = ".".join(parts[:2]) if len(parts) >= 2 else family_path
-    return _FAMILY_CAPS.get(family_key, {
-        "capability": "unknown",
-        "default_resolution": None,
-        "default_steps": None,
-        "speed_hint": "medium",
-    })
-
-
-def capability_for_model_type(model_type: str, *, family_lookup: dict[str, str] | None = None) -> str:
-    """Best-effort capability label for a model_type string."""
-    if family_lookup and model_type in family_lookup:
-        return _capability_for(family_lookup[model_type])["capability"]
-    # fall back to name-based heuristic
+    Pulls from the introspect index (handler-derived feature flags). Falls
+    back to a name-based heuristic if the index has no entry for the model.
+    """
+    try:
+        entry = agent_api_introspect.get_model_entry(model_type)
+        if entry is not None:
+            return entry["capability"]
+    except Exception:
+        pass
     mt = model_type.lower()
     if any(tag in mt for tag in ("t2v", "i2v", "v2v", "video", "hunyuan", "ltx", "longcat", "magi")):
         return "video-generation"
@@ -701,6 +677,9 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
 
     outputs_root = _outputs_root()
     cors_enabled = bool(cors_allowed) or cors_wildcard
+    # First /api/models call blocks briefly to populate size cache; later
+    # calls just read from the warm cache.
+    _api_models_warmed = threading.Event()
 
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -864,13 +843,32 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
 
         def _route_get(self, path: str, qs: dict[str, str]) -> int:
             if path == "/api/models":
-                self._json(200, _models_with_capabilities(agent, _build_family_index(agent)))
+                # First call to /api/models block briefly so size_bytes is
+                # populated on the cold-cache path. After that the size cache
+                # is warm and resolves instantly.
+                wait = 4.0 if not _api_models_warmed.is_set() else 0.0
+                self._json(200, _models_payload(wait_for_sizes=wait))
+                _api_models_warmed.set()
+                return 200
+            if path.startswith("/api/models/"):
+                model_type = path[len("/api/models/"):]
+                if not model_type:
+                    self._json(404, {"error": "not found"})
+                    return 404
+                detail = _model_detail_payload(model_type)
+                if detail is None:
+                    self._json(404, {"error": f"unknown model_type: {model_type}"})
+                    return 404
+                self._json(200, detail)
                 return 200
             if path == "/api/loras":
                 self._json(200, agent.list_loras(qs.get("model_type", "z_image")))
                 return 200
             if path == "/api/settings":
                 self._json(200, agent.get_default_settings())
+                return 200
+            if path == "/api/settings/schema":
+                self._json(200, _settings_schema_payload())
                 return 200
             if path == "/api/file":
                 return self._serve_file(qs)
@@ -900,6 +898,11 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
                 if not isinstance(body, dict) or not body.get("model_type"):
                     self._json(400, {"error": "request must be a JSON object with model_type"})
                     return 400
+                # Validate against the auto-derived schema before queueing.
+                err = agent_api_introspect.validate_request(body["model_type"], body)
+                if err:
+                    self._json(400, {"error": err, "model_type": body["model_type"]})
+                    return 400
                 rec = store.create(request=body, request_id=self._current_request_id)
                 worker.submit(rec.job_id)
                 log_event(
@@ -913,6 +916,17 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
                 store.assign_queue_positions()
                 self._json(202, store.get(rec.job_id).to_dict())
                 return 202
+            if path == "/api/settings/validate":
+                body = self._read_body()
+                if not isinstance(body, dict) or not body.get("model_type"):
+                    self._json(400, {"error": "request must be a JSON object with model_type"})
+                    return 400
+                err = agent_api_introspect.validate_request(body["model_type"], body)
+                if err:
+                    self._json(200, {"valid": False, "error": err})
+                    return 200
+                self._json(200, {"valid": True})
+                return 200
             if path == "/api/release":
                 agent.release_model()
                 self._json(200, {"ok": True})
@@ -1071,6 +1085,11 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
                 self._json(400, {"error": "request must include model_type"},
                            extra_headers=self._legacy_headers())
                 return 400
+            err = agent_api_introspect.validate_request(body["model_type"], body)
+            if err:
+                self._json(400, {"error": err, "model_type": body["model_type"]},
+                           extra_headers=self._legacy_headers())
+                return 400
             rec = store.create(request=body, request_id=self._current_request_id)
             worker.submit(rec.job_id)
             log_event(
@@ -1099,6 +1118,11 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
             for item in body:
                 if not isinstance(item, dict) or not item.get("model_type"):
                     self._json(400, {"error": "each batch item must include model_type"},
+                               extra_headers=self._legacy_headers())
+                    return 400
+                err = agent_api_introspect.validate_request(item["model_type"], item)
+                if err:
+                    self._json(400, {"error": err, "model_type": item["model_type"]},
                                extra_headers=self._legacy_headers())
                     return 400
                 rec = store.create(request=item, request_id=self._current_request_id)
@@ -1173,84 +1197,116 @@ def _legacy_payload(rec: JobRecord | None) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Model listing with capability hints
+# Model listing — auto-derived from defaults/*.json + family handler flags
 # ---------------------------------------------------------------------------
 
-_FAMILY_INDEX_CACHE: dict[str, str] | None = None
-_FAMILY_INDEX_LOCK = threading.Lock()
+def _summary_entry(entry: dict[str, Any], size_lookup: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
+    """Compact per-model entry for the /api/models list response."""
+    defaults = entry.get("defaults") or {}
+    primary_url = entry["urls"][0] if entry["urls"] else None
+    size_info = size_lookup.get(primary_url) if primary_url else None
+    return {
+        "model_type": entry["model_type"],
+        "architecture": entry["architecture"],
+        "family": entry["family"],
+        "capability": entry["capability"],
+        "name": entry["name"],
+        "description": entry["description"],
+        "param_count_b": entry["param_count_b"],
+        "default_resolution": defaults.get("resolution"),
+        "default_steps": defaults.get("num_inference_steps"),
+        "default_video_length": defaults.get("video_length"),
+        "size_bytes": (size_info or {}).get("bytes") if size_info else None,
+        "size_status": (size_info or {}).get("error") if size_info else "pending",
+        "quant_variants": entry["quant_variants"],
+        "applicable_settings_count": len(entry.get("applicable_settings") or []),
+        "url_count": len(entry["urls"]),
+    }
 
 
-def _build_family_index(agent: Any | None = None) -> dict[str, str]:
-    """Return mapping model_type → family handler module path.
+def _families_legacy(index: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
+    """Backwards-compat ``families`` map: family_name → [model_type, ...]."""
+    families: dict[str, list[str]] = {}
+    for mt, entry in index.items():
+        families.setdefault(entry["family"], []).append(mt)
+    return families
 
-    Cached after the first successful build. Imports wgp inside a guarded
-    sys.argv / cwd context (wgp.py does its own argparse on import, so a
-    naive ``import wgp`` would crash when our own CLI args are still on argv).
-    """
-    global _FAMILY_INDEX_CACHE
-    with _FAMILY_INDEX_LOCK:
-        if _FAMILY_INDEX_CACHE is not None:
-            return _FAMILY_INDEX_CACHE
-        sys.path.insert(0, str(WANGP_ROOT))
-        index: dict[str, str] = {}
+
+def _models_payload(*, wait_for_sizes: float = 0.0) -> dict[str, Any]:
+    """Build the /api/models response, with a brief HEAD-cache warm-up on
+    first call so size_bytes is populated when cheap to obtain."""
+    index_data = agent_api_introspect.build_index()
+    index = index_data["models"]
+    all_primary_urls = [e["urls"][0] for e in index.values() if e["urls"]]
+    size_lookup = agent_api_sizes.resolve_sizes(all_primary_urls, wait_seconds=wait_for_sizes)
+    models_list = [_summary_entry(entry, size_lookup) for entry in index.values()]
+    models_list.sort(key=lambda m: (m["family"], m["model_type"]))
+    return {
+        "models": models_list,
+        "families": _families_legacy(index),
+        "errors": index_data.get("errors") or [],
+    }
+
+
+def _model_detail_payload(model_type: str) -> dict[str, Any] | None:
+    """Build the /api/models/{model_type} response: full enriched entry + sizes."""
+    entry = agent_api_introspect.get_model_entry(model_type)
+    if entry is None:
+        return None
+    public = agent_api_introspect.public_entry(entry)
+    size_lookup = agent_api_sizes.resolve_sizes(entry["urls"], wait_seconds=2.0)
+    public["sizes"] = [
+        {"url": url, **(size_lookup.get(url) or {"bytes": None, "error": "pending"})}
+        for url in entry["urls"]
+    ]
+    public["primary_size_bytes"] = agent_api_sizes.total_bytes(entry["urls"], size_lookup)
+    return public
+
+
+def _settings_schema_payload() -> dict[str, Any]:
+    """Build the /api/settings/schema response."""
+    schema = agent_api_introspect.get_settings_schema()
+    template_path = WANGP_ROOT / "models" / "_settings.json"
+    raw_keys: list[dict[str, Any]] = []
+    if template_path.is_file():
         try:
-            # Prefer the session's runtime if it's already up — that avoids
-            # re-importing wgp.
-            if agent is not None and getattr(agent, "_session", None) is not None:
-                try:
-                    agent._session._ensure_runtime()
-                except Exception:
-                    pass
-
-            from shared.api import _pushd, _temporary_argv  # type: ignore
-            import importlib
-
-            with _pushd(WANGP_ROOT), _temporary_argv(["wgp.py"]):
-                wgp_mod = importlib.import_module("wgp")
-                for handler_path in wgp_mod.family_handlers:
-                    try:
-                        mod = importlib.import_module(handler_path)
-                        handler = mod.family_handler
-                        for mt in handler.query_supported_types() or []:
-                            index[mt] = handler_path
-                    except Exception as exc:
-                        log_event("family_handler_load_failed", level="warn",
-                                  handler=handler_path, error=str(exc))
-        except Exception as exc:
-            log_event("family_index_unavailable", level="warn", error=str(exc))
-            return index  # don't cache failures
-        _FAMILY_INDEX_CACHE = index
-        return index
+            template = json.loads(template_path.read_text())
+            registered = {entry["key"] for entry in schema}
+            for k, v in template.items():
+                if k in registered:
+                    continue
+                raw_keys.append({
+                    "key": k,
+                    "type": _infer_type(v),
+                    "default": v,
+                })
+        except Exception:
+            pass
+    return {
+        "registered": schema,
+        "freeform": raw_keys,
+        "note": (
+            "registered: typed/bounded settings discovered from "
+            "shared/extra_settings.py (label/min/max/step). "
+            "freeform: every other key from models/_settings.json with a "
+            "type inferred from its default value. Both are accepted by "
+            "POST /api/jobs."
+        ),
+    }
 
 
-def _models_with_capabilities(agent: Any, family_index: dict[str, str]) -> dict[str, Any]:
-    """Return a /api/models payload that's both legacy-compatible and capability-aware."""
-    families = agent.list_models()
-    models_list: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for family_name, model_types in families.items():
-        for mt in model_types:
-            if mt in seen:
-                continue
-            seen.add(mt)
-            handler_path = family_index.get(mt, "")
-            caps = _capability_for(handler_path) if handler_path else {
-                "capability": capability_for_model_type(mt),
-                "default_resolution": None,
-                "default_steps": None,
-                "speed_hint": "medium",
-            }
-            override = _MODEL_OVERRIDES.get(mt, {})
-            entry = {
-                "model_type": mt,
-                "family": family_name,
-                "capability": caps["capability"],
-                "default_resolution": override.get("default_resolution", caps.get("default_resolution")),
-                "default_steps": override.get("default_steps", caps.get("default_steps")),
-                "speed_hint": override.get("speed_hint", caps.get("speed_hint")),
-            }
-            models_list.append(entry)
-    return {"models": models_list, "families": families}
+def _infer_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, list):
+        return "array"
+    if value is None:
+        return "null"
+    return "string"
 
 
 # ---------------------------------------------------------------------------
