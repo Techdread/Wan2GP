@@ -16,6 +16,8 @@ Async-job HTTP layer in front of the in-process WanGP runtime. Provides:
   - GET    /api/settings          — default settings template
   - POST   /api/release           — release VRAM
   - GET    /api/file              — download (constrained to outputs root)
+  - POST   /api/transcribe        — submit audio for Whisper transcription (multipart)
+  - GET    /api/transcribe/models — list whisper model ids + supported formats
   - POST   /api/generate          — DEPRECATED back-compat (sync wrap of /api/jobs)
   - POST   /api/batch             — DEPRECATED back-compat (sync, single batch task)
 
@@ -26,6 +28,7 @@ Configuration (env vars):
   WAN2GP_JOB_DB         — SQLite job log path (default: ~/.wan2gp/jobs.sqlite).
   WAN2GP_LOG_PROMPTS    — "1" to include prompt text in logs (default: off).
   WAN2GP_JOB_HISTORY    — number of jobs to retain in DB (default: 200).
+  WHISPER_BIN           — path to the whisper CLI (default: "whisper").
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ import contextlib
 import json
 import os
 import queue
+import re
 import secrets
 import sqlite3
 import subprocess
@@ -144,12 +148,25 @@ def make_request_id() -> str:
 # Capability metadata (auto-derived from family handler feature flags)
 # ---------------------------------------------------------------------------
 
+WHISPER_MODEL_NAMES = ("tiny", "base", "small", "medium", "large", "turbo")
+WHISPER_MODEL_TYPES = tuple(f"whisper-{m}" for m in WHISPER_MODEL_NAMES)
+WHISPER_BIN = os.environ.get("WHISPER_BIN", "whisper")
+TRANSCRIPTION_FORMATS = ("txt", "json", "srt", "vtt", "tsv")
+TRANSCRIPTION_CAPABILITY = "transcription"
+
+
+def is_transcription_model_type(model_type: str) -> bool:
+    return isinstance(model_type, str) and model_type.startswith("whisper-")
+
+
 def capability_for_model_type(model_type: str) -> str:
     """Best-effort capability label for a model_type string.
 
     Pulls from the introspect index (handler-derived feature flags). Falls
     back to a name-based heuristic if the index has no entry for the model.
     """
+    if is_transcription_model_type(model_type):
+        return TRANSCRIPTION_CAPABILITY
     try:
         entry = agent_api_introspect.get_model_entry(model_type)
         if entry is not None:
@@ -190,6 +207,10 @@ class JobRecord:
     files: list[str] = field(default_factory=list)
     error: str | None = None
     request_id: str = ""
+    # Capability-specific result payload. Generation jobs leave this null and
+    # surface their output via `files`; transcription jobs use it to carry
+    # text + segments alongside the format files.
+    result: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -277,11 +298,12 @@ class JobStore:
 
     # --- public api ---
 
-    def create(self, *, request: dict[str, Any], request_id: str) -> JobRecord:
+    def create(self, *, request: dict[str, Any], request_id: str,
+               job_id: str | None = None, capability: str | None = None) -> JobRecord:
         model_type = str(request.get("model_type") or "")
         rec = JobRecord(
-            job_id=make_job_id(),
-            capability=capability_for_model_type(model_type),
+            job_id=job_id or make_job_id(),
+            capability=capability or capability_for_model_type(model_type),
             model_type=model_type,
             status="queued",
             created_at=_now_iso(),
@@ -425,7 +447,227 @@ class JobWorker:
             rec = self._store.get(job_id)
             if rec is None or rec.status != "queued":
                 continue
-            self._run_one(rec)
+            if rec.capability == TRANSCRIPTION_CAPABILITY:
+                self._run_transcription(rec)
+            else:
+                self._run_one(rec)
+
+    def _run_transcription(self, rec: JobRecord) -> None:
+        """Run a Whisper CLI subprocess for a transcription job.
+
+        Bypasses the WanGP session entirely — transcription doesn't share
+        state with generation, and we don't want to load a generation model
+        into VRAM just to satisfy `_ensure_session()`.
+        """
+        started = time.time()
+        with self._lock:
+            self._current_job_id = rec.job_id
+            self._current_session_job = None
+        self._store.update(
+            rec.job_id,
+            status="running",
+            started_at=_now_iso(),
+            queue_position=None,
+        )
+        self._store.assign_queue_positions()
+        log_event(
+            "job_started",
+            job_id=rec.job_id,
+            request_id=rec.request_id,
+            capability=rec.capability,
+            model_type=rec.model_type,
+        )
+
+        request = rec.request or {}
+        audio_path = request.get("audio_path") or ""
+        if not audio_path or not Path(audio_path).is_file():
+            self._store.update(
+                rec.job_id,
+                status="failed",
+                completed_at=_now_iso(),
+                duration_seconds=round(time.time() - started, 2),
+                error=f"audio file not found: {audio_path}",
+            )
+            with self._lock:
+                self._current_job_id = None
+            return
+
+        model_name = rec.model_type.removeprefix("whisper-") if rec.model_type.startswith("whisper-") else "turbo"
+        if model_name not in WHISPER_MODEL_NAMES:
+            model_name = "turbo"
+        language = request.get("language") or None
+        translate = bool(request.get("translate"))
+        duration_sec = float(request.get("duration_sec") or 0)
+        job_dir = Path(audio_path).parent
+
+        cmd = [
+            WHISPER_BIN,
+            audio_path,
+            "--model", model_name,
+            "--output_dir", str(job_dir),
+            "--output_format", "all",
+            "--task", "translate" if translate else "transcribe",
+            "--verbose", "True",
+        ]
+        if language:
+            cmd.extend(["--language", language])
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            cwd=str(job_dir),
+        )
+        cancelled = False
+        progress_re = re.compile(r"\[(\d+):(\d+(?:\.\d+)?)\s+-->\s+(\d+):(\d+(?:\.\d+)?)\]")
+        last_persist = 0.0
+
+        try:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                rec_now = self._store.get(rec.job_id)
+                if rec_now and rec_now.status == "cancelling":
+                    cancelled = True
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    break
+                m = progress_re.search(line)
+                if m:
+                    end_sec = int(m.group(3)) * 60 + float(m.group(4))
+                    if duration_sec > 0:
+                        progress = min(0.99, end_sec / duration_sec)
+                    else:
+                        prev = (rec_now.progress if rec_now else 0.0) or 0.0
+                        progress = min(0.95, prev + 0.01)
+                    now = time.time()
+                    if now - last_persist >= 0.5:
+                        self._store.update(rec.job_id, progress=round(progress, 4))
+                        last_persist = now
+                    elif rec_now is not None:
+                        rec_now.progress = round(progress, 4)
+            rc = proc.wait()
+        finally:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+        duration = round(time.time() - started, 2)
+
+        if cancelled:
+            self._store.update(
+                rec.job_id,
+                status="cancelled",
+                completed_at=_now_iso(),
+                duration_seconds=duration,
+            )
+            log_event(
+                "job_cancelled",
+                job_id=rec.job_id,
+                request_id=rec.request_id,
+                duration_ms=int(duration * 1000),
+            )
+            with self._lock:
+                self._current_job_id = None
+            return
+
+        if rc != 0:
+            self._store.update(
+                rec.job_id,
+                status="failed",
+                completed_at=_now_iso(),
+                duration_seconds=duration,
+                error=f"whisper exited with code {rc}",
+            )
+            log_event(
+                "job_failed",
+                level="error",
+                job_id=rec.job_id,
+                request_id=rec.request_id,
+                error=f"whisper exit {rc}",
+            )
+            with self._lock:
+                self._current_job_id = None
+            return
+
+        # Parse outputs
+        base = Path(audio_path).stem
+        files: list[str] = []
+        for fmt in TRANSCRIPTION_FORMATS:
+            candidate = job_dir / f"{base}.{fmt}"
+            if candidate.exists():
+                files.append(str(candidate))
+
+        text = ""
+        segments: list[dict[str, Any]] = []
+        json_path = job_dir / f"{base}.json"
+        if json_path.exists():
+            try:
+                data = json.loads(json_path.read_text(encoding="utf-8"))
+                text = (data.get("text") or "").strip()
+                for s in data.get("segments") or []:
+                    segments.append({
+                        "startSec": float(s.get("start") or 0),
+                        "endSec": float(s.get("end") or 0),
+                        "text": str(s.get("text") or "").strip(),
+                    })
+            except Exception as exc:
+                self._store.update(
+                    rec.job_id,
+                    status="failed",
+                    completed_at=_now_iso(),
+                    duration_seconds=duration,
+                    error=f"output parse failed: {exc}",
+                )
+                log_event(
+                    "job_failed",
+                    level="error",
+                    job_id=rec.job_id,
+                    request_id=rec.request_id,
+                    error=f"parse: {exc}",
+                )
+                with self._lock:
+                    self._current_job_id = None
+                return
+
+        self._store.update(
+            rec.job_id,
+            status="completed",
+            completed_at=_now_iso(),
+            duration_seconds=duration,
+            progress=1.0,
+            files=files,
+            result={
+                "text": text,
+                "segments": segments,
+                "model": model_name,
+                "language": language,
+                "translate": translate,
+                "filename": request.get("filename") or Path(audio_path).name,
+                "owner_ref": request.get("owner_ref"),
+            },
+        )
+        log_event(
+            "job_completed",
+            job_id=rec.job_id,
+            request_id=rec.request_id,
+            duration_ms=int(duration * 1000),
+            files=len(files),
+        )
+        with self._lock:
+            self._current_job_id = None
 
     def _run_one(self, rec: JobRecord) -> None:
         started = time.time()
@@ -614,6 +856,72 @@ def _outputs_root() -> Path:
     if env:
         return Path(env).resolve()
     return (WANGP_ROOT / "outputs").resolve()
+
+
+def _parse_multipart(content_type: str, raw: bytes) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    """Minimal multipart/form-data parser.
+
+    Returns (fields, files) where files map name -> { filename, mime_type, data }.
+    Hand-rolled to avoid the `cgi` module (deprecated in 3.11, removed in 3.13).
+    """
+    m = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', content_type, re.I)
+    if not m:
+        raise ValueError("missing multipart boundary")
+    boundary = b"--" + (m.group(1) or m.group(2)).strip().encode()
+    parts = raw.split(boundary)
+    fields: dict[str, str] = {}
+    files: dict[str, dict[str, Any]] = {}
+    for part in parts:
+        if not part or part in (b"--\r\n", b"--", b"\r\n"):
+            continue
+        if part.startswith(b"\r\n"):
+            part = part[2:]
+        sep = part.find(b"\r\n\r\n")
+        if sep < 0:
+            continue
+        header_str = part[:sep].decode("utf-8", errors="replace")
+        value = part[sep + 4:]
+        if value.endswith(b"\r\n"):
+            value = value[:-2]
+        disp_match = re.search(
+            r'content-disposition:\s*form-data;\s*name="([^"]+)"(?:;\s*filename="([^"]*)")?',
+            header_str, re.I,
+        )
+        if not disp_match:
+            continue
+        name = disp_match.group(1)
+        filename = disp_match.group(2)
+        if filename:
+            ct_match = re.search(r"content-type:\s*([^\r\n]+)", header_str, re.I)
+            files[name] = {
+                "filename": filename,
+                "mime_type": ct_match.group(1).strip() if ct_match else "application/octet-stream",
+                "data": value,
+            }
+        else:
+            fields[name] = value.decode("utf-8", errors="replace")
+    return fields, files
+
+
+def _safe_filename(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name or "audio.bin")
+    return cleaned[:120] or "audio.bin"
+
+
+def _transcription_models_payload() -> dict[str, Any]:
+    return {
+        "models": [
+            {
+                "id": f"whisper-{m}",
+                "model_type": f"whisper-{m}",
+                "name": m,
+                "capability": TRANSCRIPTION_CAPABILITY,
+                "family": "whisper",
+            }
+            for m in WHISPER_MODEL_NAMES
+        ],
+        "formats": list(TRANSCRIPTION_FORMATS),
+    }
 
 
 def _path_inside(child_path: Path, parent: Path) -> bool:
@@ -864,6 +1172,9 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
             if path == "/api/loras":
                 self._json(200, agent.list_loras(qs.get("model_type", "z_image")))
                 return 200
+            if path == "/api/transcribe/models":
+                self._json(200, _transcription_models_payload())
+                return 200
             if path == "/api/settings":
                 self._json(200, agent.get_default_settings())
                 return 200
@@ -931,6 +1242,8 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
                 agent.release_model()
                 self._json(200, {"ok": True})
                 return 200
+            if path == "/api/transcribe":
+                return self._route_transcribe()
             if path == "/api/generate":
                 return self._legacy_generate()
             if path == "/api/batch":
@@ -982,6 +1295,90 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
                 self._json(503, payload)
                 return
             self._json(200, payload)
+
+        def _route_transcribe(self) -> int:
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.lower().startswith("multipart/form-data"):
+                self._json(400, {"error": "expected multipart/form-data"})
+                return 400
+            n = int(self.headers.get("Content-Length", 0))
+            if n <= 0:
+                self._json(400, {"error": "empty body"})
+                return 400
+            if n > 1024 * 1024 * 1024:
+                self._json(413, {"error": "upload too large (1 GB cap)"})
+                return 413
+            raw = self.rfile.read(n)
+            try:
+                fields, files = _parse_multipart(content_type, raw)
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+                return 400
+            file_part = files.get("file")
+            if not file_part:
+                self._json(400, {"error": "missing 'file' field"})
+                return 400
+
+            model_name = (fields.get("model") or "turbo").lower()
+            if model_name not in WHISPER_MODEL_NAMES:
+                model_name = "turbo"
+            language = fields.get("language") or None
+            if language == "auto" or not language:
+                language = None
+            translate = fields.get("translate") in ("true", "1")
+            try:
+                duration_sec = float(fields.get("duration_sec") or fields.get("durationSec") or 0)
+            except ValueError:
+                duration_sec = 0.0
+            owner_ref = None
+            raw_owner = fields.get("owner_ref") or fields.get("ownerRef")
+            if raw_owner:
+                try:
+                    owner_ref = json.loads(raw_owner)
+                except Exception:
+                    owner_ref = None
+
+            job_id = make_job_id()
+            safe_name = _safe_filename(fields.get("filename") or file_part["filename"])
+            job_dir = outputs_root / "transcripts" / job_id
+            try:
+                job_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                self._json(500, {"error": f"could not create job dir: {exc}"})
+                return 500
+            audio_path = job_dir / safe_name
+            audio_path.write_bytes(file_part["data"])
+
+            request = {
+                "model_type": f"whisper-{model_name}",
+                "audio_path": str(audio_path),
+                "filename": safe_name,
+                "mime_type": file_part.get("mime_type"),
+                "bytes": len(file_part["data"]),
+                "language": language,
+                "translate": translate,
+                "duration_sec": duration_sec,
+                "owner_ref": owner_ref,
+            }
+            rec = store.create(
+                request=request,
+                request_id=self._current_request_id,
+                job_id=job_id,
+                capability=TRANSCRIPTION_CAPABILITY,
+            )
+            worker.submit(rec.job_id)
+            log_event(
+                "job_created",
+                job_id=rec.job_id,
+                request_id=rec.request_id,
+                capability=rec.capability,
+                model_type=rec.model_type,
+                via="transcribe",
+                bytes=request["bytes"],
+            )
+            store.assign_queue_positions()
+            self._json(202, store.get(rec.job_id).to_dict())
+            return 202
 
         def _serve_file(self, qs: dict[str, str]) -> int:
             fp = qs.get("path", "")
