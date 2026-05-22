@@ -1,10 +1,13 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import sys
 import torch
 from importlib.metadata import version
 from mmgp import offload
 import torch.nn.functional as F
 import warnings
 from importlib.metadata import version
+
+_is_mps = sys.platform == 'darwin' and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
 
 major, minor = torch.cuda.get_device_capability(None)
 bfloat16_supported =  major >= 8 
@@ -164,7 +167,8 @@ def sageattn3_wrapper(
 def sdpa_wrapper(
         qkv_list,
         attention_length,
-        attention_mask = None        
+        attention_mask = None,
+        causal = False,
     ):
     q, k, v = qkv_list
 
@@ -173,7 +177,7 @@ def sdpa_wrapper(
     v = v.transpose(1,2)
     if attention_mask != None:
         attention_mask = attention_mask.transpose(1,2)
-    o = F.scaled_dot_product_attention( q, k, v, attn_mask=attention_mask, is_causal=False).transpose(1,2)
+    o = F.scaled_dot_product_attention(q, k, v, attn_mask=attention_mask, is_causal=causal).transpose(1,2)
     del q, k ,v
     qkv_list.clear()
 
@@ -199,6 +203,9 @@ def get_attention_modes():
     return ret
 
 def get_supported_attention_modes():
+    # MPS compatibility: only SDPA is supported on Apple Silicon
+    if _is_mps:
+        return ["sdpa", "auto"]
     ret = get_attention_modes()
     major, minor = torch.cuda.get_device_capability()
     if  major < 10 or not triton_installed:
@@ -223,7 +230,9 @@ __all__ = [
 ]
 
 def get_cu_seqlens(batch_size, lens, max_len):
-    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device="cuda")
+    # MPS compatibility: use dynamic device detection
+    _cu_device = "mps" if _is_mps else "cuda"
+    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device=_cu_device)
 
     for i in range(batch_size):
         s = lens[i] 
@@ -273,6 +282,7 @@ def pay_attention(
     batch = len(q)
     if len(k) != batch: k = k.expand(batch, -1, -1, -1)
     if len(v) != batch: v = v.expand(batch, -1, -1, -1)
+    if q.device.type == "mps": q, k, v = q.contiguous(), k.contiguous(),v.contiguous()
     if attn == "chipmunk":
         from src.chipmunk.modules import SparseDiffMlp, SparseDiffAttn
         from src.chipmunk.util import LayerCounter, GLOBAL_CONFIG
@@ -340,11 +350,11 @@ def pay_attention(
             szq = q_lens[0].item() if q_lens != None else lq
             szk = k_lens[0].item() if k_lens != None else lk
             if szq != lq or szk != lk:
-                cu_seqlens_q = torch.tensor([0, szq, lq], dtype=torch.int32, device="cuda")
-                cu_seqlens_k = torch.tensor([0, szk, lk], dtype=torch.int32, device="cuda")
+                cu_seqlens_q = torch.tensor([0, szq, lq], dtype=torch.int32, device=q.device)
+                cu_seqlens_k = torch.tensor([0, szk, lk], dtype=torch.int32, device=q.device)
             else:
-                cu_seqlens_q = torch.tensor([0, lq], dtype=torch.int32, device="cuda")
-                cu_seqlens_k = torch.tensor([0, lk], dtype=torch.int32, device="cuda")
+                cu_seqlens_q = torch.tensor([0, lq], dtype=torch.int32, device=q.device)
+                cu_seqlens_k = torch.tensor([0, lk], dtype=torch.int32, device=q.device)
             q = q.squeeze(0)
             k = k.squeeze(0)
             v = v.squeeze(0)
@@ -372,7 +382,7 @@ def pay_attention(
     elif attn=="sdpa":
         qkv_list = [q, k, v]
         del q ,k ,v
-        x = sdpa_wrapper( qkv_list, lq, attention_mask = attention_mask) #.unsqueeze(0)
+        x = sdpa_wrapper(qkv_list, lq, attention_mask=attention_mask, causal=causal)
     elif attn=="flash" and version == 3:
         x = flash_attn_interface.flash_attn_varlen_func(
             q=q,

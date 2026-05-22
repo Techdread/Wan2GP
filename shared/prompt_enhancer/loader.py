@@ -14,11 +14,15 @@ from .florence2.image_processing_florence2 import Florence2ImageProcessorLite
 
 from transformers import AutoTokenizer, BartTokenizer, BartTokenizerFast
 
-
-FLORENCE2_FOLDER = "Florence2"
-LLAMA32_FOLDER = "Llama3_2"
-LLAMAJOY_FOLDER = "llama-joycaption-beta-one-hf-llava"
-PROMPT_ENHANCER_REPO = "DeepBeepMeep/LTX_Video"
+from .assets import (
+    FLORENCE2_FILES,
+    FLORENCE2_FOLDER,
+    LLAMA32_FILES,
+    LLAMA32_FOLDER,
+    LLAMAJOY_FILES,
+    LLAMAJOY_FOLDER,
+    PROMPT_ENHANCER_REPO,
+)
 
 
 @dataclass(slots=True)
@@ -38,8 +42,8 @@ def ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled: int, qwen
             repoId=PROMPT_ENHANCER_REPO,
             sourceFolderList=[FLORENCE2_FOLDER, LLAMA32_FOLDER],
             fileList=[
-                ["config.json", "configuration_florence2.py", "model.safetensors", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json"],
-                ["config.json", "generation_config.json", "Llama3_2_quanto_bf16_int8.safetensors", "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json"],
+                FLORENCE2_FILES,
+                LLAMA32_FILES,
             ],
         )
         return
@@ -48,8 +52,8 @@ def ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled: int, qwen
             repoId=PROMPT_ENHANCER_REPO,
             sourceFolderList=[FLORENCE2_FOLDER, LLAMAJOY_FOLDER],
             fileList=[
-                ["config.json", "configuration_florence2.py", "model.safetensors", "preprocessor_config.json", "tokenizer.json", "tokenizer_config.json"],
-                ["config.json", "llama_config.json", "llama_joycaption_quanto_bf16_int8.safetensors", "special_tokens_map.json", "tokenizer.json", "tokenizer_config.json"],
+                FLORENCE2_FILES,
+                LLAMAJOY_FILES,
             ],
         )
         return
@@ -57,6 +61,31 @@ def ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled: int, qwen
         from .qwen35_vl import ensure_qwen35_prompt_enhancer_assets, get_qwen35_prompt_enhancer_variant
 
         ensure_qwen35_prompt_enhancer_assets(process_files_def, backend=qwen_backend, variant=get_qwen35_prompt_enhancer_variant(enhancer_enabled))
+
+
+def download_prompt_enhancer_assets(enhancer_enabled: int, qwen_backend: str = "quanto_int8", send_cmd=None, progress=None, status_text="Downloading Prompt Enhancer model files..."):
+    enhancer_enabled = int(enhancer_enabled)
+    if enhancer_enabled <= 0:
+        return False
+
+    from shared.utils.download import download_def_missing_files, process_files_def_if_needed
+
+    downloaded = False
+    status_sent = False
+
+    def process_download_def(**download_def):
+        nonlocal downloaded, status_sent
+        has_missing_files = len(download_def_missing_files(download_def)) > 0
+        download_status_text = None
+        if has_missing_files and not status_sent:
+            if progress is not None:
+                progress(0, status_text)
+            download_status_text = status_text
+            status_sent = True
+        downloaded = process_files_def_if_needed(download_def, send_cmd=send_cmd, status_text=download_status_text) or downloaded
+
+    ensure_prompt_enhancer_assets(process_download_def, enhancer_enabled=enhancer_enabled, qwen_backend=qwen_backend)
+    return downloaded
 
 
 def unload_prompt_enhancer_models(*models):
