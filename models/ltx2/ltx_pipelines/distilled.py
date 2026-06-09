@@ -2,6 +2,7 @@ import logging
 import os
 import time
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 import torch
 
@@ -16,12 +17,15 @@ from ..ltx_core.model.video_vae import decode_video_to_tensor as vae_decode_vide
 from ..ltx_core.text_encoders.gemma import encode_text, postprocess_text_embeddings, resolve_text_connectors
 from ..ltx_core.tools import VideoLatentTools
 from ..ltx_core.types import LatentState, VideoPixelShape
+from shared.prompt_relay import encode_prompt_relay
 from .utils import ModelLedger
 from .utils.args import default_2_stage_distilled_arg_parser
 from .utils.constants import (
     AUDIO_SAMPLE_RATE,
     DEFAULT_NEGATIVE_PROMPT,
+    DISTILLED_8_STEPS_STAGE_2_SIGMA_VALUES,
     DISTILLED_SIGMA_VALUES,
+    LTX23_USE_DISTILLED_8_STEPS_STAGE_2_SIGMAS,
     STAGE_2_DISTILLED_SIGMA_VALUES,
 )
 from .utils.helpers import (
@@ -35,6 +39,7 @@ from .utils.helpers import (
     image_conditionings_by_adding_guiding_latent,
     image_conditionings_by_replacing_latent,
     latent_conditionings_by_latent_sequence,
+    paired_reference_conditionings_by_latents,
     prepare_mask_injection,
     simple_denoising_func,
     video_conditionings_by_frozen_video,
@@ -164,6 +169,7 @@ class DistilledPipeline:
             device=device,
         )
         self.text_encoder_cache = TextEncoderCache()
+        self._joyai_echo = None
 
     def _get_model(self, name: str):
         if self.models is not None:
@@ -171,6 +177,32 @@ class DistilledPipeline:
         if self.model_ledger is None:
             raise ValueError(f"Missing model source for '{name}'.")
         return getattr(self.model_ledger, name)()
+
+    @contextmanager
+    def joyai_echo_context(self, joyai_echo):
+        previous = self._joyai_echo
+        self._joyai_echo = joyai_echo
+        try:
+            yield
+        finally:
+            self._joyai_echo = previous
+
+    def _joyai_echo_reference_conditionings(self, joyai_echo, suffix: str, dtype):
+        paired_audio = bool(joyai_echo.get(f"paired_audio{suffix}"))
+        video_latent = joyai_echo.get(f"video_latent{suffix}")
+        audio_latent = joyai_echo.get(f"audio_latent{suffix}")
+        audio_segment_lengths = joyai_echo.get(f"audio_segment_lengths{suffix}")
+        return paired_reference_conditionings_by_latents(
+            video_latent=video_latent,
+            audio_latent=audio_latent,
+            audio_segment_lengths=audio_segment_lengths,
+            components=self.pipeline_components,
+            dtype=dtype,
+            device=self.device,
+            video_downscale_factor=int(joyai_echo.get("downscale_factor", 1)),
+            use_paired_cross_attention_mask=paired_audio,
+            audio_target_to_reference=not paired_audio,
+        )
 
     def __call__(
         self,
@@ -181,6 +213,7 @@ class DistilledPipeline:
         num_frames: int,
         frame_rate: float,
         images: list[tuple[str, int, float]],
+        prompt_relay_frame_offset: int = 0,
         negative_prompt: str = DEFAULT_NEGATIVE_PROMPT,
         guiding_images: list[tuple] | None = None,
         guiding_images_stage2: list[tuple] | None = None,
@@ -220,7 +253,10 @@ class DistilledPipeline:
         self_refiner_certain_percentage: float = 0.999,
         self_refiner_max_plans: int = 1,
         editanything_ref_images=None,
+        ltx2_22B_class: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
+        joyai_echo = self._joyai_echo or {}
+        return_joyai_memory = bool(joyai_echo.get("return_latents"))
         assert_resolution(height=height, width=width, is_two_stage=True)
         alt_guidance_scale = 1.0
         negative_prompt = negative_prompt or DEFAULT_NEGATIVE_PROMPT
@@ -277,6 +313,8 @@ class DistilledPipeline:
             audio_context = None if skip_audio else audio_context.to(device=self.device, dtype=dtype)
             contexts = [(video_context, audio_context)]
             NAG_scale = 1.0
+            video_context_mask_builder = None
+            audio_context_mask_builder = None
         else:
             text_encoder = self._get_model("text_encoder")
             if enhance_prompt:
@@ -290,15 +328,37 @@ class DistilledPipeline:
                 video_connector,
                 audio_connector,
             )
-            if float(NAG_scale) > 1.0:
+            encode_fn_with_masks = lambda prompts: postprocess_text_embeddings(
+                encode_text(text_encoder, prompts=prompts),
+                feature_extractor,
+                video_connector,
+                audio_connector,
+                return_attention_masks=True,
+            )
+            relay_conditioning = encode_prompt_relay(prompt, encode_fn_with_masks, self.text_encoder_cache, self.device, num_frames, frame_rate, text_encoder.tokenizer, visible_frame_offset=prompt_relay_frame_offset)
+            if relay_conditioning is not None:
+                video_context = relay_conditioning.video_context
+                audio_context = None if skip_audio else relay_conditioning.audio_context
+                video_context_mask_builder = relay_conditioning.video_mask_builder
+                audio_context_mask_builder = None if skip_audio else relay_conditioning.audio_mask_builder
+                if float(NAG_scale) > 1.0:
+                    context_n = self.text_encoder_cache.encode(encode_fn, [negative_prompt], device=self.device, parallel=True)[0]
+                    contexts = [(video_context, audio_context), context_n]
+                else:
+                    contexts = [(video_context, audio_context)]
+            elif float(NAG_scale) > 1.0:
                 contexts = self.text_encoder_cache.encode(
                     encode_fn,
                     [prompt, negative_prompt],
                     device=self.device,
                     parallel=True,
                 )
+                video_context_mask_builder = None
+                audio_context_mask_builder = None
             else:
                 contexts = self.text_encoder_cache.encode(encode_fn, [prompt], device=self.device, parallel=True)
+                video_context_mask_builder = None
+                audio_context_mask_builder = None
 
             torch.cuda.synchronize()
             del text_encoder
@@ -345,6 +405,7 @@ class DistilledPipeline:
             height=height if skip_stage_2 else height // 2,
             fps=frame_rate,
         )
+        memory_video_conditionings, memory_audio_conditionings, cross_attention_mask_builder = self._joyai_echo_reference_conditionings(joyai_echo, "", dtype)
         video_encoder = self._get_model("video_encoder")
         transformer = _TransformerBenchWrapper(self._get_model("transformer"), enabled=bench_transformer)
         bind_interrupt_check(transformer, interrupt_check)
@@ -400,6 +461,9 @@ class DistilledPipeline:
                     skip_audio_to_video=frozen_video_conditioning is not None,
                     ref_context=stage_1_ref_context,
                     ref_adaln=stage_1_ref_adaln,
+                    video_context_mask_builder=video_context_mask_builder,
+                    audio_context_mask_builder=audio_context_mask_builder,
+                    cross_attention_mask_builder=cross_attention_mask_builder,
                 ),
                 mask_context=mask_context,
                 interrupt_check=interrupt_check,
@@ -459,6 +523,8 @@ class DistilledPipeline:
                 tiling_config=tiling_config,
                 continuous_conditioning_and_guide=continuous_conditioning_and_guide,
             )
+        stage_1_conditionings += memory_video_conditionings
+        stage_1_audio_conditionings = list(audio_conditionings or []) + memory_audio_conditionings
 
         mask_context = prepare_mask_injection(
             masking_source=masking_source,
@@ -477,7 +543,7 @@ class DistilledPipeline:
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
-            audio_conditionings=audio_conditionings,
+            audio_conditionings=stage_1_audio_conditionings,
             noiser=noiser,
             sigmas=stage_1_sigmas,
             stepper=stepper,
@@ -500,6 +566,12 @@ class DistilledPipeline:
             return None, None
         if interrupt_check is not None and interrupt_check():
             return None, None
+        stage_1_memory_latents = None
+        if return_joyai_memory:
+            stage_1_memory_latents = {
+                "video": video_state.latent.detach().cpu(),
+                "audio": audio_state.latent.detach().cpu() if audio_state is not None else None,
+            }
         if skip_stage_2:
             if bench_transformer:
                 print(
@@ -532,11 +604,14 @@ class DistilledPipeline:
                 decoded_audio = vae_decode_audio(
                     audio_state.latent, self._get_model("audio_decoder"), self._get_model("vocoder")
                 )
+            if return_joyai_memory:
+                return decoded_video, decoded_audio, latent_slice, {"phase1": stage_1_memory_latents}
             if latent_slice is not None:
                 return decoded_video, decoded_audio, latent_slice
             return decoded_video, decoded_audio
 
-        stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+        stage_2_sigma_values = DISTILLED_8_STEPS_STAGE_2_SIGMA_VALUES if LTX23_USE_DISTILLED_8_STEPS_STAGE_2_SIGMAS and ltx2_22B_class else STAGE_2_DISTILLED_SIGMA_VALUES
+        stage_2_sigmas = torch.Tensor(stage_2_sigma_values).to(self.device)
         upscaled_video_latent = upsample_video(
             latent=video_state.latent[:1],
             video_encoder=video_encoder,
@@ -561,6 +636,8 @@ class DistilledPipeline:
         if set_progress_status is not None:
             set_progress_status("VAE Encoding")
 
+        stage_2_memory_video_conditionings, stage_2_memory_audio_conditionings, stage_2_cross_attention_mask_builder = self._joyai_echo_reference_conditionings(joyai_echo, "_stage2", dtype)
+
         def denoising_loop_stage2(
             sigmas: torch.Tensor,
             video_state: LatentState,
@@ -584,6 +661,9 @@ class DistilledPipeline:
                     skip_audio_to_video=frozen_video_conditioning is not None,
                     ref_context=stage_2_ref_context,
                     ref_adaln=stage_2_ref_adaln,
+                    video_context_mask_builder=video_context_mask_builder,
+                    audio_context_mask_builder=audio_context_mask_builder,
+                    cross_attention_mask_builder=stage_2_cross_attention_mask_builder,
                 ),
                 mask_context=mask_context,
                 interrupt_check=interrupt_check,
@@ -666,6 +746,7 @@ class DistilledPipeline:
                 tiling_config=tiling_config,
                 continuous_conditioning_and_guide=continuous_conditioning_and_guide,
             )
+        stage_2_conditionings += stage_2_memory_video_conditionings
         mask_context = prepare_mask_injection(
             masking_source=masking_source,
             masking_strength=masking_strength,
@@ -680,8 +761,9 @@ class DistilledPipeline:
         )
         if callback is not None:
             callback(-1, None, True, override_num_inference_steps=len(stage_2_sigmas) - 1, pass_no=pass_no)
-        freeze_audio_stage2 = audio_identity_guidance_scale > 0.0
+        freeze_audio_stage2 = audio_identity_guidance_scale > 0.0 or bool(joyai_echo.get("freeze_stage2_audio", False))
         stage_2_audio_conditionings = audio_conditionings if audio_conditionings_stage2 is None else audio_conditionings_stage2
+        stage_2_audio_conditionings = list(stage_2_audio_conditionings or []) + stage_2_memory_audio_conditionings
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_2_output_shape,
             conditionings=stage_2_conditionings,
@@ -745,6 +827,15 @@ class DistilledPipeline:
             decoded_audio = vae_decode_audio(
                 audio_state.latent, self._get_model("audio_decoder"), self._get_model("vocoder")
             )
+        if return_joyai_memory:
+            memory_latents = {
+                "phase1": stage_1_memory_latents,
+                "phase2": {
+                    "video": video_state.latent.detach().cpu(),
+                    "audio": audio_state.latent.detach().cpu() if audio_state is not None else None,
+                },
+            }
+            return decoded_video, decoded_audio, latent_slice, memory_latents
         if latent_slice is not None:
             return decoded_video, decoded_audio, latent_slice
         return decoded_video, decoded_audio

@@ -34,6 +34,7 @@ from .modeling_omnivoice import (
     VoiceClonePrompt,
 )
 from .utils.duration import RuleDurationEstimator
+from .utils.text import add_punctuation
 from .utils.voice_design import _INSTRUCT_VALID_EN, _INSTRUCT_VALID_ZH
 
 
@@ -53,6 +54,7 @@ OMNIVOICE_TRAILING_SILENCE_KEEP_SECONDS = 0.20
 OMNIVOICE_TRAILING_SILENCE_RELATIVE_RMS = 0.015
 OMNIVOICE_TRAILING_SILENCE_MIN_RMS = 1e-4
 OMNIVOICE_AUTO_SPLIT_BOUNDARY_PUNCTUATION = set(".。．｡!！?？;；:：,，、،؛؟।॥…")
+OMNIVOICE_VOICE_DESIGN_PROMPT_TAIL_SECONDS = 20.0
 OMNIVOICE_SPECIAL_TOKENS = [
     "<|denoise|>",
     "<|lang_start|>",
@@ -635,8 +637,49 @@ class OmniVoicePipeline:
         lines = [line.strip() for line in normalized.split("\n") if line.strip()]
         return [(lines[0] if len(lines) > 0 else ""), (lines[1] if len(lines) > 1 else "")]
 
-    def _create_voice_clone_prompt(self, audio_path: str, ref_text: Optional[str], generation_config: OmniVoiceGenerationConfig) -> VoiceClonePrompt:
-        return self.model.create_voice_clone_prompt(audio_path, ref_text=ref_text, preprocess_prompt=generation_config.preprocess_prompt)
+    def _create_voice_clone_prompt(self, audio_source, ref_text: Optional[str], generation_config: OmniVoiceGenerationConfig) -> VoiceClonePrompt:
+        return self.model.create_voice_clone_prompt(audio_source, ref_text=ref_text, preprocess_prompt=generation_config.preprocess_prompt)
+
+    def _voice_prompt_token_tail(self, token_result) -> tuple[Optional[torch.Tensor], bool]:
+        if isinstance(token_result, list):
+            token_chunks = [chunk.detach().cpu() for chunk in token_result if isinstance(chunk, torch.Tensor) and chunk.numel() > 0]
+            tokens = torch.cat(token_chunks, dim=-1) if token_chunks else None
+        elif isinstance(token_result, torch.Tensor) and token_result.numel() > 0:
+            tokens = token_result.detach().cpu()
+        else:
+            tokens = None
+        if tokens is None:
+            return None, False
+        max_tokens = max(1, int(round(OMNIVOICE_VOICE_DESIGN_PROMPT_TAIL_SECONDS * self.audio_tokenizer.config.frame_rate)))
+        tail_was_cut = tokens.shape[-1] > max_tokens
+        if tail_was_cut:
+            tokens = tokens[..., -max_tokens:]
+        return tokens.contiguous(), tail_was_cut
+
+    def _voice_prompt_audio_tail(self, segment_audio: torch.Tensor) -> tuple[torch.Tensor, bool]:
+        max_samples = max(1, int(round(OMNIVOICE_VOICE_DESIGN_PROMPT_TAIL_SECONDS * self.sample_rate)))
+        tail_audio = segment_audio.detach().to(device="cpu", dtype=torch.float32).flatten()
+        tail_was_cut = tail_audio.numel() > max_samples
+        if tail_was_cut:
+            tail_audio = tail_audio[-max_samples:]
+        return tail_audio.contiguous(), tail_was_cut
+
+    def _transcribe_voice_prompt_tail(self, tail_audio: torch.Tensor) -> str:
+        waveform = tail_audio.detach().to(device="cpu", dtype=torch.float32).numpy()[np.newaxis, :]
+        return self._auto_transcribe_reference_audio((tail_audio, self.sample_rate), waveform, self.sample_rate)
+
+    def _create_voice_design_continuation_prompt(self, segment_audio: torch.Tensor, segment_text: str, generation_config: OmniVoiceGenerationConfig, token_result=None, force_transcribe: bool = False) -> VoiceClonePrompt:
+        tail_audio, audio_was_cut = self._voice_prompt_audio_tail(segment_audio)
+        ref_text = None if force_transcribe or audio_was_cut else segment_text
+        ref_tokens, token_was_cut = self._voice_prompt_token_tail(token_result)
+        if ref_tokens is None:
+            return self._create_voice_clone_prompt((tail_audio, self.sample_rate), ref_text, generation_config)
+        if ref_text is None or token_was_cut:
+            ref_text = self._transcribe_voice_prompt_tail(tail_audio)
+        if generation_config.preprocess_prompt:
+            ref_text = add_punctuation(ref_text)
+        ref_rms = float(torch.sqrt(torch.mean(tail_audio * tail_audio))) if tail_audio.numel() > 0 else None
+        return VoiceClonePrompt(ref_audio_tokens=ref_tokens, ref_text=ref_text, ref_rms=ref_rms)
 
     def _run_segment(
         self,
@@ -646,7 +689,7 @@ class OmniVoicePipeline:
         voice_clone_prompt: Optional[VoiceClonePrompt],
         instruct: Optional[str],
         generation_config: OmniVoiceGenerationConfig,
-    ) -> Optional[torch.Tensor]:
+    ) -> Optional[tuple[torch.Tensor, object]]:
         if self._abort_requested() or self._early_stop_requested():
             return None
         try:
@@ -663,7 +706,9 @@ class OmniVoicePipeline:
             raise
         if self._abort_requested() or not audios:
             return None
-        return torch.from_numpy(np.asarray(audios[0], dtype=np.float32)).cpu()
+        token_results = getattr(self.model, "_last_generated_token_results", None)
+        token_result = token_results[0] if token_results else None
+        return torch.from_numpy(np.asarray(audios[0], dtype=np.float32)).cpu(), token_result
 
     def _generate_segments(
         self,
@@ -679,6 +724,7 @@ class OmniVoicePipeline:
         callback,
         offloadobj=None,
         verbose_level: int = 0,
+        preserve_voice_design: bool = False,
     ) -> Optional[dict]:
         max_total_samples = int(round(float(duration_seconds) * self.sample_rate)) if duration_seconds is not None and duration_seconds > 0 else None
         pause_samples = max(0, int(round(float(pause_seconds or 0.0) * self.sample_rate)))
@@ -727,24 +773,30 @@ class OmniVoicePipeline:
                 )
 
             self.model._progress_callback = _segment_callback
-            segment_audio = self._run_segment(
+            segment_result = self._run_segment(
                 text=segment_text,
                 language=language,
                 voice_clone_prompt=speaker_prompts.get(speaker_id),
                 instruct=instruct,
                 generation_config=generation_config,
             )
-            if segment_audio is None:
+            if segment_result is None:
                 break
+            segment_audio, segment_tokens = segment_result
             if auto_end_trim:
                 segment_audio = self._post_process_generated_segment_end(segment_audio, segment_text, segment_index, len(segments), offloadobj=offloadobj, verbose_level=verbose_level)
             _poll_early_stop(segment_index + 1)
+            duration_truncated = False
             if max_total_samples is not None:
                 samples_left = max_total_samples - elapsed_samples
                 if samples_left <= 0:
                     break
+                duration_truncated = samples_left < segment_audio.numel()
                 segment_audio = segment_audio[:samples_left]
             if segment_audio.numel() > 0:
+                if preserve_voice_design and segment_index == 0 and len(segments) > 1:
+                    token_result = None if duration_truncated or auto_end_trim else segment_tokens
+                    speaker_prompts[speaker_id] = self._create_voice_design_continuation_prompt(segment_audio, segment_text, generation_config, token_result=token_result, force_transcribe=duration_truncated)
                 audio_segments.append(segment_audio)
                 elapsed_samples += int(segment_audio.shape[-1])
             if self._abort_requested() or self._early_stop_requested():
@@ -772,109 +824,18 @@ class OmniVoicePipeline:
         audio_guide: Optional[str] = None,
         *,
         alt_prompt: Optional[str] = None,
-        image_start=None,
-        image_end=None,
-        input_frames=None,
-        input_frames2=None,
-        input_ref_images=None,
-        input_ref_masks=None,
-        input_masks=None,
-        input_masks2=None,
-        input_video=None,
-        input_faces=None,
-        input_custom=None,
-        denoising_strength=None,
-        masking_strength=None,
-        prefix_frames_count=None,
-        frame_num=None,
-        batch_size=None,
-        height=None,
-        width=None,
-        fit_into_canvas=None,
-        shift=None,
-        sample_solver=None,
         sampling_steps: int = 32,
         guide_scale: float = 2.0,
-        guide2_scale=None,
-        guide3_scale=None,
-        switch_threshold=None,
-        switch2_threshold=None,
-        guide_phases=None,
-        model_switch_phase=None,
-        embedded_guidance_scale=None,
-        n_prompt=None,
         seed: int = -1,
         callback=None,
-        enable_RIFLEx=None,
-        VAE_tile_size=None,
-        joint_pass=None,
-        perturbation_switch=None,
-        perturbation_layers=None,
-        perturbation_start=None,
-        perturbation_end=None,
-        apg_switch=None,
-        cfg_star_switch=None,
-        cfg_zero_step=None,
-        alt_guide_scale=None,
-        audio_cfg_scale=None,
-        input_waveform=None,
-        input_waveform_sample_rate=None,
         audio_guide2: Optional[str] = None,
         audio_prompt_type: str = "",
-        audio_proj=None,
-        audio_scale=None,
-        audio_context_lens=None,
-        context_scale=None,
-        control_scale_alt=None,
-        alt_scale=None,
-        motion_amplitude=None,
-        causal_block_size=None,
-        causal_attention=None,
-        fps=None,
-        overlapped_latents=None,
-        return_latent_slice=None,
-        overlap_noise=None,
-        overlap_size=None,
-        color_correction_strength=None,
-        conditioning_latents_size=None,
-        input_video_is_hdr=None,
-        lora_dir=None,
-        keep_frames_parsed=None,
-        model_filename=None,
-        model_type=None,
-        loras_slists=None,
-        NAG_scale=None,
-        NAG_tau=None,
-        NAG_alpha=None,
-        speakers_bboxes=None,
-        image_mode=None,
-        video_prompt_type=None,
-        window_no=None,
         offloadobj=None,
-        set_header_text=None,
-        pre_video_frame=None,
-        prefix_video=None,
-        original_input_ref_images=None,
-        image_refs_relative_size=None,
-        outpainting_dims=None,
-        face_arc_embeds=None,
         custom_settings=None,
-        temperature: float = 0.0,
-        window_start_frame_no=None,
-        input_video_strength=None,
-        self_refiner_setting=None,
-        self_refiner_plan=None,
-        self_refiner_f_uncertainty=None,
-        self_refiner_certain_percentage=None,
         duration_seconds: Optional[float] = None,
         pause_seconds: float = 0.2,
-        top_p: float = 0.9,
-        top_k: int = 50,
-        set_progress_status=None,
-        loras_selected=None,
-        frames_relative_positions_list=None,
-        frames_to_inject=None,
         verbose_level: int = 0,
+        **kwargs,
     ) -> Optional[dict]:
         self._interrupt = False
         self._early_stop = False
@@ -938,6 +899,7 @@ class OmniVoicePipeline:
                 callback=callback,
                 offloadobj=offloadobj,
                 verbose_level=self._verbose_level,
+                preserve_voice_design=False,
             )
 
         if mode == "A":
@@ -966,4 +928,5 @@ class OmniVoicePipeline:
             callback=callback,
             offloadobj=offloadobj,
             verbose_level=self._verbose_level,
+            preserve_voice_design=mode == "",
         )

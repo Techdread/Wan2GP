@@ -16,12 +16,14 @@ from ..ltx_core.model.video_vae import decode_video_to_tensor as vae_decode_vide
 from ..ltx_core.text_encoders.gemma import encode_text, postprocess_text_embeddings, resolve_text_connectors
 from ..ltx_core.tools import VideoLatentTools
 from ..ltx_core.types import LatentState, VideoLatentShape, VideoPixelShape
+from shared.prompt_relay import encode_prompt_relay
 from .utils import ModelLedger
 from .utils.args import default_2_stage_arg_parser
 from .utils.constants import (
     AUDIO_SAMPLE_RATE,
     DISTILLED_SIGMA_VALUES,
     DISTILLED_8_STEPS_STAGE_2_SIGMA_VALUES,
+    LTX23_USE_DISTILLED_8_STEPS_STAGE_2_SIGMAS,
     STAGE_2_DISTILLED_SIGMA_VALUES,
 )
 from .utils.helpers import (
@@ -41,6 +43,7 @@ from .utils.helpers import (
     multi_modal_guider_denoising_func,
     res2s_audio_video_denoising_loop,
     simple_denoising_func,
+    video_conditionings_by_frozen_video,
     video_conditionings_by_control_video,
 )
 from .utils.types import PipelineComponents
@@ -134,6 +137,7 @@ class TI2VidTwoStagesPipeline:
         num_inference_steps: int,
         cfg_guidance_scale: float,
         images: list[tuple[str, int, float]],
+        prompt_relay_frame_offset: int = 0,
         audio_cfg_guidance_scale: float | None = None,
         cfg_star_switch: int = 0,
         apg_switch: int = 0,
@@ -166,12 +170,15 @@ class TI2VidTwoStagesPipeline:
         return_latent_slice: slice | None = None,
         continuous_conditioning_and_guide: bool = False,
         skip_stage_2: bool = False,
+        frozen_video_conditioning: torch.Tensor | None = None,
+        frozen_output_video: torch.Tensor | None = None,
         self_refiner_setting: int = 0,
         self_refiner_plan: str = "",
         self_refiner_f_uncertainty: float = 0.1,
         self_refiner_certain_percentage: float = 0.999,
         self_refiner_max_plans: int = 1,
         editanything_ref_images=None,
+        ltx2_22B_class: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -248,12 +255,31 @@ class TI2VidTwoStagesPipeline:
             video_connector,
             audio_connector,
         )
-        contexts = self.text_encoder_cache.encode(
-            encode_fn,
-            [prompt, negative_prompt],
-            device=self.device,
-            parallel=True,
+        encode_fn_with_masks = lambda prompts: postprocess_text_embeddings(
+            encode_text(text_encoder, prompts=prompts),
+            feature_extractor,
+            video_connector,
+            audio_connector,
+            return_attention_masks=True,
         )
+        relay_conditioning = encode_prompt_relay(prompt, encode_fn_with_masks, self.text_encoder_cache, self.device, num_frames, frame_rate, text_encoder.tokenizer, visible_frame_offset=prompt_relay_frame_offset)
+        if relay_conditioning is None:
+            contexts = self.text_encoder_cache.encode(
+                encode_fn,
+                [prompt, negative_prompt],
+                device=self.device,
+                parallel=True,
+            )
+            context_p, context_n = contexts
+            v_context_p, a_context_p = context_p
+            v_context_p_mask_builder = None
+            a_context_p_mask_builder = None
+        else:
+            v_context_p = relay_conditioning.video_context
+            a_context_p = relay_conditioning.audio_context
+            context_n = self.text_encoder_cache.encode(encode_fn, [negative_prompt], device=self.device, parallel=True)[0]
+            v_context_p_mask_builder = relay_conditioning.video_mask_builder
+            a_context_p_mask_builder = relay_conditioning.audio_mask_builder
 
         torch.cuda.synchronize()
         del text_encoder
@@ -261,8 +287,6 @@ class TI2VidTwoStagesPipeline:
         # Codex: now that the text encoder has been released, compute the text_embedding_projection,
         # audio_embeddings_connector, video_embeddings_connector in order to get v_context_p, a_context_p
         # and v_context_n, a_context_n
-        context_p, context_n = contexts
-        v_context_p, a_context_p = context_p
         v_context_n, a_context_n = context_n
 
         # Stage 1: Initial low resolution video generation.
@@ -359,6 +383,9 @@ class TI2VidTwoStagesPipeline:
                         audio_identity_guidance_scale=audio_identity_guidance_scale,
                         ref_context=stage_1_ref_context,
                         ref_adaln=stage_1_ref_adaln,
+                        v_context_p_mask_builder=v_context_p_mask_builder,
+                        a_context_p_mask_builder=a_context_p_mask_builder,
+                        skip_audio_to_video=frozen_video_conditioning is not None,
                     ),
                     noise_seed=seed,
                     mask_context=mask_context,
@@ -390,6 +417,9 @@ class TI2VidTwoStagesPipeline:
                     audio_identity_guidance_scale=audio_identity_guidance_scale,
                     ref_context=stage_1_ref_context,
                     ref_adaln=stage_1_ref_adaln,
+                    v_context_p_mask_builder=v_context_p_mask_builder,
+                    a_context_p_mask_builder=a_context_p_mask_builder,
+                    skip_audio_to_video=frozen_video_conditioning is not None,
                 ),
                 mask_context=mask_context,
                 interrupt_check=interrupt_check,
@@ -403,17 +433,29 @@ class TI2VidTwoStagesPipeline:
             )
         if interrupt_check is not None and interrupt_check():
             return None, None
-        stage_1_conditionings = image_conditionings_by_replacing_latent(
-            images=images,
-            height=stage_1_output_shape.height,
-            width=stage_1_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-            tiling_config=tiling_config,
-        )
+        if frozen_video_conditioning is not None:
+            stage_1_conditionings = video_conditionings_by_frozen_video(
+                video=frozen_video_conditioning,
+                height=stage_1_output_shape.height,
+                width=stage_1_output_shape.width,
+                num_frames=num_frames,
+                video_encoder=video_encoder,
+                dtype=dtype,
+                device=self.device,
+                tiling_config=tiling_config,
+            )
+        else:
+            stage_1_conditionings = image_conditionings_by_replacing_latent(
+                images=images,
+                height=stage_1_output_shape.height,
+                width=stage_1_output_shape.width,
+                video_encoder=video_encoder,
+                dtype=dtype,
+                device=self.device,
+                tiling_config=tiling_config,
+            )
         stage_1_conditionings += stage_1_ref_conditionings
-        if guiding_images:
+        if frozen_video_conditioning is None and guiding_images:
             stage_1_conditionings += image_conditionings_by_adding_guiding_latent(
                 images=guiding_images,
                 height=stage_1_output_shape.height,
@@ -423,7 +465,7 @@ class TI2VidTwoStagesPipeline:
                 device=self.device,
                 tiling_config=tiling_config,
             )
-        if video_conditioning:
+        if frozen_video_conditioning is None and video_conditioning:
             stage_1_conditionings += video_conditionings_by_control_video(
                 video_conditioning=video_conditioning,
                 height=stage_1_output_shape.height,
@@ -476,15 +518,18 @@ class TI2VidTwoStagesPipeline:
             latent_slice = None
             if return_latent_slice is not None:
                 latent_slice = video_state.latent[:, :, return_latent_slice].detach().to("cpu")
-            decoded_video = vae_decode_video_to_tensor(
-                video_state.latent,
-                self._get_stage_model(1, "video_decoder"),
-                tiling_config,
-                expected_frames=int(stage_1_output_shape.frames),
-                expected_height=int(stage_1_output_shape.height),
-                expected_width=int(stage_1_output_shape.width),
-                interrupt_check=interrupt_check,
-            )
+            if frozen_output_video is None:
+                decoded_video = vae_decode_video_to_tensor(
+                    video_state.latent,
+                    self._get_stage_model(1, "video_decoder"),
+                    tiling_config,
+                    expected_frames=int(stage_1_output_shape.frames),
+                    expected_height=int(stage_1_output_shape.height),
+                    expected_width=int(stage_1_output_shape.width),
+                    interrupt_check=interrupt_check,
+                )
+            else:
+                decoded_video = frozen_output_video[:, :num_frames, :height, :width].permute(1, 2, 3, 0)
             decoded_audio = vae_decode_audio(
                 audio_state.latent, self._get_stage_model(1, "audio_decoder"), self._get_stage_model(1, "vocoder")
             )
@@ -510,7 +555,8 @@ class TI2VidTwoStagesPipeline:
         bind_interrupt_check(transformer, interrupt_check)
         stage_2_ref_context = stage_2_ref_adaln = None
         stage_2_ref_conditionings = []
-        stage_2_sigma_values = DISTILLED_8_STEPS_STAGE_2_SIGMA_VALUES if use_distilled_8_steps else STAGE_2_DISTILLED_SIGMA_VALUES
+        use_ltx23_stage_2_sigmas = LTX23_USE_DISTILLED_8_STEPS_STAGE_2_SIGMAS and ltx2_22B_class
+        stage_2_sigma_values = DISTILLED_8_STEPS_STAGE_2_SIGMA_VALUES if use_distilled_8_steps or use_ltx23_stage_2_sigmas else STAGE_2_DISTILLED_SIGMA_VALUES
         distilled_sigmas = torch.Tensor(stage_2_sigma_values).to(self.device)
         if loras_slists is not None:
             stage_2_steps = len(distilled_sigmas) - 1
@@ -541,6 +587,9 @@ class TI2VidTwoStagesPipeline:
                 manage_lora_step=not use_hq_sampler,
                 ref_context=stage_2_ref_context,
                 ref_adaln=stage_2_ref_adaln,
+                video_context_mask_builder=v_context_p_mask_builder,
+                audio_context_mask_builder=a_context_p_mask_builder,
+                skip_audio_to_video=frozen_video_conditioning is not None,
             )
             if use_hq_sampler:
                 return res2s_audio_video_denoising_loop(
@@ -588,17 +637,29 @@ class TI2VidTwoStagesPipeline:
         if interrupt_check is not None and interrupt_check():
             return None, None
         stage_2_images = images if images_stage2 is None else images_stage2
-        stage_2_conditionings = image_conditionings_by_replacing_latent(
-            images=stage_2_images,
-            height=stage_2_output_shape.height,
-            width=stage_2_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-            tiling_config=tiling_config,
-        )
+        if frozen_video_conditioning is not None:
+            stage_2_conditionings = video_conditionings_by_frozen_video(
+                video=frozen_video_conditioning,
+                height=stage_2_output_shape.height,
+                width=stage_2_output_shape.width,
+                num_frames=num_frames,
+                video_encoder=video_encoder,
+                dtype=dtype,
+                device=self.device,
+                tiling_config=tiling_config,
+            )
+        else:
+            stage_2_conditionings = image_conditionings_by_replacing_latent(
+                images=stage_2_images,
+                height=stage_2_output_shape.height,
+                width=stage_2_output_shape.width,
+                video_encoder=video_encoder,
+                dtype=dtype,
+                device=self.device,
+                tiling_config=tiling_config,
+            )
         stage_2_conditionings += stage_2_ref_conditionings
-        if guiding_images_stage2:
+        if frozen_video_conditioning is None and guiding_images_stage2:
             stage_2_conditionings += image_conditionings_by_adding_guiding_latent(
                 images=guiding_images_stage2,
                 height=stage_2_output_shape.height,
@@ -608,13 +669,13 @@ class TI2VidTwoStagesPipeline:
                 device=self.device,
                 tiling_config=tiling_config,
             )
-        if latent_conditioning_stage2 is not None:
+        if frozen_video_conditioning is None and latent_conditioning_stage2 is not None:
             stage_2_conditionings += latent_conditionings_by_latent_sequence(
                 latent_conditioning_stage2,
                 strength=1.0,
                 start_index=0,
             )
-        if video_conditioning_stage2:
+        if frozen_video_conditioning is None and video_conditioning_stage2:
             stage_2_conditionings += video_conditionings_by_control_video(
                 video_conditioning=video_conditioning_stage2,
                 height=stage_2_output_shape.height,
@@ -674,15 +735,18 @@ class TI2VidTwoStagesPipeline:
         latent_slice = None
         if return_latent_slice is not None:
             latent_slice = video_state.latent[:, :, return_latent_slice].detach().to("cpu")
-        decoded_video = vae_decode_video_to_tensor(
-            video_state.latent,
-            self._get_stage_model(2, "video_decoder"),
-            tiling_config,
-            expected_frames=int(stage_2_output_shape.frames),
-            expected_height=int(stage_2_output_shape.height),
-            expected_width=int(stage_2_output_shape.width),
-            interrupt_check=interrupt_check,
-        )
+        if frozen_output_video is None:
+            decoded_video = vae_decode_video_to_tensor(
+                video_state.latent,
+                self._get_stage_model(2, "video_decoder"),
+                tiling_config,
+                expected_frames=int(stage_2_output_shape.frames),
+                expected_height=int(stage_2_output_shape.height),
+                expected_width=int(stage_2_output_shape.width),
+                interrupt_check=interrupt_check,
+            )
+        else:
+            decoded_video = frozen_output_video[:, :num_frames, :height, :width].permute(1, 2, 3, 0)
         decoded_audio = vae_decode_audio(
             audio_state.latent, self._get_stage_model(2, "audio_decoder"), self._get_stage_model(2, "vocoder")
         )

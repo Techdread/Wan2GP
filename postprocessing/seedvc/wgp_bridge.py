@@ -53,6 +53,7 @@ def _get_runtime(persistent_models: bool, profile_no=4, verbose_level: int = 1, 
         offload_kwargs = {"coTenantsMap": seedvc.get_cotenants_map(pipe)}
         if init_pipe is not None:
             profile_no = init_pipe(pipe, offload_kwargs, profile_no)
+        offload_kwargs["pinnedMemory"] = False
         offloadobj = offload.profile(pipe, profile_no=profile_no, quantizeTransformer=False, convertWeightsFloatTo=torch.float16, verboseLevel=verbose_level, **offload_kwargs)
         if persistent_models:
             _persistent_converter = converter
@@ -315,7 +316,7 @@ class SeedVCBridge:
 
     def _replace_two_speaker_audio_file(self, source_audio_path: str, voice_sample_path: str, output_path: str, *, voice_sample2_path: str, process_files: Callable[..., Any], profile_no=4, verbose_level: int = 1, init_pipe: Callable[..., int] | None = None, prefix: str = "seedvc") -> str:
         import numpy as np
-        from preprocessing.speakers_separator import extract_dual_audio
+        from preprocessing.speaker_separator import extract_dual_audio
         from shared.utils.audio_video import cleanup_temp_audio_files
 
         output_dir = os.path.dirname(os.path.abspath(output_path)) or "."

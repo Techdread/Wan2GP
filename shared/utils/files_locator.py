@@ -1,11 +1,120 @@
 from __future__ import annotations
+from functools import lru_cache
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Iterable, List, Optional, Union
 
 default_checkpoints_paths = ["ckpts", "."]
 
 _checkpoints_paths = default_checkpoints_paths
+
+
+def _is_probable_url(value: str) -> bool:
+    return "://" in str(value) or str(value).startswith(("mailto:", "urn:"))
+
+
+def _absolute_normalized_path(path: Union[str, os.PathLike]) -> str:
+    return os.path.abspath(os.path.normpath(os.path.expanduser(os.fspath(path))))
+
+
+def _checkpoint_roots() -> list[str]:
+    roots = []
+    seen = set()
+    for root in _checkpoints_paths:
+        normalized = _absolute_normalized_path(root)
+        key = normalized.casefold()
+        if key not in seen:
+            roots.append(normalized)
+            seen.add(key)
+    return roots
+
+
+def _is_under_root(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([path, root]).casefold() == root.casefold()
+    except ValueError:
+        return False
+
+
+def compress_path(path: Union[str, os.PathLike]) -> str:
+    """Store checkpoint-root paths as relative paths; leave URLs unchanged."""
+    if path is None:
+        return ""
+    value = os.fspath(path).strip()
+    if not value or _is_probable_url(value) or value.startswith("="):
+        return value
+    if not os.path.isabs(value):
+        normalized_relative = os.path.normpath(value)
+        if is_relative_down_path(normalized_relative):
+            return normalized_relative.replace("\\", "/")
+        normalized = _absolute_normalized_path(value)
+    else:
+        normalized = _absolute_normalized_path(value)
+    for root in sorted(_checkpoint_roots(), key=len, reverse=True):
+        if not _is_under_root(normalized, root):
+            continue
+        relative = os.path.relpath(normalized, root)
+        if relative and relative != ".":
+            return relative.replace("\\", "/")
+    return normalized
+
+
+def uncompress_path(path: Union[str, os.PathLike]) -> str:
+    """Return an absolute local path for checkpoint-relative values; leave URLs unchanged."""
+    if path is None:
+        return ""
+    value = os.fspath(path).strip()
+    if not value or _is_probable_url(value) or value.startswith("="):
+        return value
+    if os.path.isabs(value):
+        return _absolute_normalized_path(value)
+    if not is_relative_down_path(value):
+        return _absolute_normalized_path(value)
+    located = locate_file(value, error_if_none=False)
+    if located is not None:
+        return _absolute_normalized_path(located)
+    roots = _checkpoint_roots()
+    return _absolute_normalized_path(os.path.join(roots[0] if roots else ".", value))
+
+
+def compress_paths(paths):
+    if isinstance(paths, (list, tuple)):
+        return [compress_path(path) for path in paths]
+    return compress_path(paths)
+
+
+def uncompress_paths(paths):
+    if isinstance(paths, (list, tuple)):
+        return [uncompress_path(path) for path in paths]
+    return uncompress_path(paths)
+
+@lru_cache(maxsize=4096)
+def _is_relative_down_path_cached(path: str) -> bool:
+    if len(path) == 0 or "\x00" in path:
+        return False
+    windows_path = PureWindowsPath(path)
+    posix_path = PurePosixPath(path)
+    if windows_path.drive or windows_path.root or posix_path.root:
+        return False
+    if ".." in windows_path.parts or ".." in posix_path.parts:
+        return False
+    return any(part not in ("", ".") for part in path.replace("\\", "/").split("/"))
+
+def is_relative_down_path(path: Union[str, os.PathLike]) -> bool:
+    """Return True for relative paths that cannot escape a base folder."""
+    try:
+        path = os.fspath(path).strip()
+    except TypeError:
+        return False
+    if not isinstance(path, str):
+        return False
+    return _is_relative_down_path_cached(path)
+
+def clean_relative_path(path, trigger_error = True):
+    if path=="" or path is None: return path
+    if is_relative_down_path(path): return path
+    if not trigger_error: return ""
+    raise Exception(f"Unsafe relative path found : '{path}'")
 
 def set_checkpoints_paths(checkpoints_paths):
     global _checkpoints_paths
@@ -34,7 +143,7 @@ def extract_alternate_path(url, lora_dir = None):
     new_url = os.path.basename(path_parts[0]) 
     if len(path_parts) == 1: return new_url
     if len(path_parts) != 2: raise f"Invalid path {url}"
-    alternate_path = path_parts[1]
+    alternate_path = clean_relative_path(path_parts[1])
     if alternate_path == "%lora_dir":
         if lora_dir is None:
             raise Exception(f"Unable to compute %lora_dir in {url}, no lora_dir was provided")
