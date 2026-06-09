@@ -3,6 +3,10 @@ from shared.utils.plugins import WAN2GPPlugin
 import json
 from shared.deepy.engine import get_or_create_assistant_session
 from shared.gradio import assistant_chat, gradio_queue_focus_patch
+from shared.gradio.hierarchy_selector import HierarchySelector
+from shared.utils import prompt_parser
+from shared.gradio.model_selector_toolbar import unload_models_from_ram
+from shared.utils.video_codecs import SDR_VIDEO_CODEC_CHOICES, VIDEO_CONTAINER_CHOICES, validate_video_output_settings
 from shared.deepy.config import (
     DEEPY_CONTEXT_TOKENS_MIN,
     DEEPY_CONTEXT_TOKENS_DEFAULT,
@@ -28,16 +32,17 @@ from postprocessing.flashvsr.sparse_backend_config import (
     normalize_sparse_backend,
 )
 from postprocessing.seedvc.wgp_bridge import SeedVCBridge
+from postprocessing.pid.runtime import PID_TILING_THRESHOLD_CHOICES, PID_TILING_THRESHOLD_DEFAULT, normalize_pid_tiling_threshold
 from .defaults_migration import (
     FLASHVSR_DEFAULT_MODE,
     FLASHVSR_MODE_CHOICES,
     MMAUDIO_DEFAULT_MODE,
     MMAUDIO_MODE_CHOICES,
     PROMPT_ENHANCER_CHOICES,
-    PROMPT_ENHANCER_DEFAULT_MODE,
     SEEDVC_DEFAULT_MODE,
     SEEDVC_MODE_CHOICES,
     enabled_choice_value,
+    get_prompt_enhancer_default_mode,
     migrate_extension_defaults,
 )
 
@@ -84,13 +89,14 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.request_global("quit_application")
         self.request_global("release_model")
         self.request_global("release_flashvsr_vram")
+        self.request_global("release_pid_vram")
         self.request_global("release_seedvc_vram")
-        self.request_global("get_sorted_dropdown")
         self.request_global("app")
         self.request_global("fl")
         self.request_global("is_generation_in_progress")
         self.request_global("generate_header")
         self.request_global("generate_dropdown_model_list")
+        self.request_global("create_models_selector_hierarchy")
         self.request_global("get_unique_id")
         self.request_global("reset_prompt_enhancer")
         self.request_global("reset_prompt_enhancer_if_requested")
@@ -118,14 +124,19 @@ class ConfigTabPlugin(WAN2GPPlugin):
     def create_config_ui(self):
         migrate_extension_defaults(self.server_config, self.server_config_filename)
         set_deepy_runtime_config(self.server_config, self.server_config_filename)
+        prompt_enhancer_default_mode = get_prompt_enhancer_default_mode()
         with gr.Column():
             with gr.Tabs():
                 with gr.Tab("General"):
-                    _, _, dropdown_choices = self.get_sorted_dropdown(self.displayed_model_types, None, None, False)
-
-                    self.transformer_types_choices = gr.Dropdown(
-                        choices=dropdown_choices, value=self.transformer_types,
-                        label="Selectable Generative Models (leave empty for all)", multiselect=True
+                    self.transformer_types_choices = HierarchySelector(
+                        hierarchy=self.create_models_selector_hierarchy(self.displayed_model_types),
+                        value=self.transformer_types,
+                        height=0,
+                        label="Selectable Generative Models (leave empty for all)",
+                        display_mode="breadcrumb",
+                        sort_hierarchy=False,
+                        search_empty_label="No matching models",
+                        interactive=not self.args.lock_config,
                     )
                     self.model_hierarchy_type_choice = gr.Dropdown(
                         choices=[
@@ -158,6 +169,11 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     self.clear_file_list_choice = gr.Dropdown(
                         choices=[("None", 0), ("Keep last video", 1), ("Keep last 5 videos", 5), ("Keep last 10", 10), ("Keep last 20", 20), ("Keep last 30", 30)],
                         value=self.server_config.get("clear_file_list", 5), label="Keep Previous Generations in Gallery"
+                    )
+                    self.multi_prompts_gen_type_choice = gr.Dropdown(
+                        choices=prompt_parser.get_multi_prompts_gen_choices("Video"),
+                        value=prompt_parser.normalize_multi_prompts_mode(self.server_config.get("multi_prompts_gen_type", prompt_parser.DEFAULT_MULTI_PROMPTS_MODE), default=prompt_parser.DEFAULT_MULTI_PROMPTS_MODE),
+                        label="How to Process each Line of the Text Prompt (First Time Model SDefault)",
                     )
                     self.display_stats_choice = gr.Dropdown(
                         choices=[("Disabled", 0), ("Enabled", 1)],
@@ -323,6 +339,18 @@ class ConfigTabPlugin(WAN2GPPlugin):
                                 info="Higher keeps more sparse attention candidates and can improve quality at the cost of speed and memory."
                             )
                     with gr.Group():
+                        with gr.Row():
+                            self.pid_tiling_threshold_choice = gr.Dropdown(
+                                choices=PID_TILING_THRESHOLD_CHOICES,
+                                value=normalize_pid_tiling_threshold(self.server_config.get("pid_tiling_threshold", PID_TILING_THRESHOLD_DEFAULT)),
+                                label="PiD Tiling Threshold",
+                            )
+                            self.pid_persistence_choice = gr.Dropdown(
+                                choices=[("Unload after use", 1), ("Persistent in RAM", 2)],
+                                value=self.server_config.get("pid_persistence", 1),
+                                label="PiD Model Persistence"
+                            )
+                    with gr.Group():
                         self.rife_version_choice = gr.Dropdown(
                             choices=[("RIFE HDv3 (default)", "v3"), ("RIFE v4.26 (latest)", "v4")],
                             value=self.server_config.get("rife_version", "v4"),
@@ -345,11 +373,11 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     with gr.Group():
                         self.enhancer_enabled_choice = gr.Dropdown(
                             choices=PROMPT_ENHANCER_CHOICES,
-                            value=enabled_choice_value(self.server_config.get("enhancer_enabled", PROMPT_ENHANCER_DEFAULT_MODE), PROMPT_ENHANCER_CHOICES, PROMPT_ENHANCER_DEFAULT_MODE),
+                            value=enabled_choice_value(self.server_config.get("enhancer_enabled", prompt_enhancer_default_mode), PROMPT_ENHANCER_CHOICES, prompt_enhancer_default_mode),
                             label="Prompt Enhancer (requires extra model files)"
                         )
                         self.enhancer_quantization_choice = gr.Dropdown(
-                            choices=[("Quanto Int8 (better quality)", "quanto_int8"), ("GGUF Q4 (less VRAM/RAM & faster if kernels are installed, but worse quality)", "gguf")],
+                            choices=[("Quanto Int8 (recommended, better quality)", "quanto_int8"), ("GGUF Q4 (less VRAM/RAM & faster if kernels are installed, but worse quality)", "gguf")],
                             value=self.server_config.get("prompt_enhancer_quantization", "quanto_int8"),
                             label="Qwen3.5 LLM Quantization",
                         )
@@ -407,7 +435,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     self.deepy_requirement_md = gr.Markdown(value=deepy_requirement_message(self.server_config))
 
                 with gr.Tab("Outputs"):
-                    self.video_output_codec_choice = gr.Dropdown(choices=[("x265 CRF 28 (Balanced)", 'libx265_28'), ("x264 Level 8 (Balanced)", 'libx264_8'), ("x265 CRF 8 (High Quality)", 'libx265_8'), ("x264 Level 10 (High Quality)", 'libx264_10'), ("x264 Lossless", 'libx264_lossless')], value=self.server_config.get("video_output_codec", "libx264_8"), label="SDR Video Codec")
+                    self.video_container_choice = gr.Dropdown(choices=VIDEO_CONTAINER_CHOICES, value=self.server_config.get("video_container", "mp4"), label="Video Container")
+                    self.video_output_codec_choice = gr.Dropdown(choices=SDR_VIDEO_CODEC_CHOICES, value=self.server_config.get("video_output_codec", "libx264_8"), label="SDR Video Codec")
                     self.hdr_video_crf_choice = gr.Dropdown(
                         choices=[
                             ("Low (x265 CRF 14)", 14),
@@ -428,7 +457,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         ],
                         value=self.server_config.get("audio_output_codec", "aac_128"),
                         visible=True,
-                        label="Audio Codec to use for mp4 container",
+                        label="Audio Codec to use for MP4/MOV/MKV container",
                     )
                     audio_standalone_default = self.server_config.get("audio_stand_alone_output_codec", "wav")
                     if audio_standalone_default == "mp3":
@@ -456,7 +485,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     self.embed_source_images_choice = gr.Checkbox(
                         value=self.server_config.get("embed_source_images", False),
                         label="Embed Source Images",
-                        info="Saves i2v source images inside MP4 files"
+                        info="Saves i2v source images inside MP4/MOV/MKV files"
                     )
                     self.video_save_path_choice = gr.Textbox(label="Video Output Folder (requires restart)", value=self.save_path)
                     self.image_save_path_choice = gr.Textbox(label="Image Output Folder (requires restart)", value=self.image_save_path)
@@ -499,7 +528,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         inputs = [
             self.state,
             self.transformer_types_choices, self.model_hierarchy_type_choice, self.fit_canvas_choice,
-            self.attention_choice, self.preload_model_policy_choice, self.clear_file_list_choice, self.keep_intermediate_sliding_windows_choice,
+            self.attention_choice, self.preload_model_policy_choice, self.clear_file_list_choice, self.multi_prompts_gen_type_choice, self.keep_intermediate_sliding_windows_choice,
             self.display_stats_choice, self.max_frames_multiplier_choice, self.enable_4k_resolutions_choice, self.checkpoints_paths_choice, self.loras_root_choice, self.save_queue_if_crash_choice,
             self.UI_theme_choice, self.queue_color_scheme_choice, self.process_queues_when_browser_unfocused_choice,
             self.quantization_choice, self.transformer_dtype_policy_choice, self.mixed_precision_choice,
@@ -510,10 +539,10 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.preload_in_VRAM_choice, self.max_reserved_loras_choice,
             self.enhancer_enabled_choice, self.enhancer_quantization_choice, self.enhancer_mode_choice,
             self.prompt_enhancer_temperature_choice, self.prompt_enhancer_top_p_choice, self.prompt_enhancer_randomize_seed_choice,
-            self.mmaudio_mode_choice, self.mmaudio_persistence_choice, self.seedvc_mode_choice, self.seedvc_persistence_choice, self.flashvsr_mode_choice, self.flashvsr_persistence_choice, self.flashvsr_backend_choice, self.flashvsr_topk_ratio_choice, self.rife_version_choice, self.matanyone_version_choice,
+            self.mmaudio_mode_choice, self.mmaudio_persistence_choice, self.seedvc_mode_choice, self.seedvc_persistence_choice, self.flashvsr_mode_choice, self.flashvsr_persistence_choice, self.pid_tiling_threshold_choice, self.pid_persistence_choice, self.flashvsr_backend_choice, self.flashvsr_topk_ratio_choice, self.rife_version_choice, self.matanyone_version_choice,
             self.deepy_enabled_choice, self.deepy_vram_mode_choice,
             self.deepy_context_tokens_choice, self.deepy_custom_system_prompt_choice,
-            self.video_output_codec_choice, self.hdr_video_crf_choice, self.image_output_codec_choice, self.audio_output_codec_choice, self.audio_stand_alone_output_codec_choice,
+            self.video_container_choice, self.video_output_codec_choice, self.hdr_video_crf_choice, self.image_output_codec_choice, self.audio_output_codec_choice, self.audio_stand_alone_output_codec_choice,
             self.metadata_choice, self.embed_source_images_choice,
             self.video_save_path_choice, self.image_save_path_choice, self.audio_save_path_choice,
             self.notification_sound_enabled_choice, self.notification_sound_volume_choice,
@@ -536,40 +565,19 @@ class ConfigTabPlugin(WAN2GPPlugin):
             ]
         )
 
-        def _unload_targets_text():
-            targets = ["Models"]
-            try:
-                enhancer_enabled = int(self.server_config.get("enhancer_enabled", 0) or 0) > 0
-            except Exception:
-                enhancer_enabled = False
-            if enhancer_enabled:
-                targets.append("Prompt Enhancer")
-            if int(self.server_config.get("seedvc_mode", 0) or 0) > 0:
-                targets.append("SeedVC")
-            if int(self.server_config.get("flashvsr_mode", 0) or 0) > 0:
-                targets.append("FlashVSR")
-            if deepy_available(self.server_config):
-                targets.append("Deepy")
-            if len(targets) == 1:
-                return targets[0]
-            return ", ".join(targets[:-1]) + f", and {targets[-1]}" if len(targets) > 2 else " and ".join(targets)
-
         def release_ram_and_notify(state):
-            unload_targets = _unload_targets_text()
-            if self.any_GPU_process_running(state, "configuration"):
-                gr.Info(f"Unable to unload {unload_targets} while GPU resources are allocated.")
-                return
-            if deepy_available(self.server_config):
-                self.release_deepy_vram(state, clear_session_state=False, discard_runtime_snapshot=True)
-            if "Prompt Enhancer" in unload_targets:
-                self.reset_prompt_enhancer()
-                self.reset_prompt_enhancer_if_requested()
-            if "FlashVSR" in unload_targets:
-                self.release_flashvsr_vram()
-            if "SeedVC" in unload_targets:
-                self.release_seedvc_vram()
-            self.release_model()
-            gr.Info(f"{unload_targets} unloaded from RAM.")
+            unload_models_from_ram(
+                state,
+                server_config=self.server_config,
+                any_GPU_process_running=self.any_GPU_process_running,
+                release_deepy_vram=self.release_deepy_vram,
+                reset_prompt_enhancer=self.reset_prompt_enhancer,
+                reset_prompt_enhancer_if_requested=self.reset_prompt_enhancer_if_requested,
+                release_flashvsr_vram=self.release_flashvsr_vram,
+                release_pid_vram=self.release_pid_vram,
+                release_seedvc_vram=self.release_seedvc_vram,
+                release_model=self.release_model,
+            )
 
         self.release_RAM_btn.click(fn=release_ram_and_notify, inputs=[self.state])
         return [self.release_RAM_btn]
@@ -585,7 +593,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         (
             transformer_types_choices, model_hierarchy_type_choice, fit_canvas_choice,
-            attention_choice, preload_model_policy_choice, clear_file_list_choice, keep_intermediate_sliding_windows_choice,
+            attention_choice, preload_model_policy_choice, clear_file_list_choice, multi_prompts_gen_type_choice, keep_intermediate_sliding_windows_choice,
             display_stats_choice, max_frames_multiplier_choice, enable_4k_resolutions_choice, checkpoints_paths_choice, loras_root_choice, save_queue_if_crash_choice,
             UI_theme_choice, queue_color_scheme_choice, process_queues_when_browser_unfocused_choice,
             quantization_choice, transformer_dtype_policy_choice, mixed_precision_choice,
@@ -596,10 +604,10 @@ class ConfigTabPlugin(WAN2GPPlugin):
             preload_in_VRAM_choice, max_reserved_loras_choice,
             enhancer_enabled_choice, enhancer_quantization_choice, enhancer_mode_choice,
             prompt_enhancer_temperature_choice, prompt_enhancer_top_p_choice, prompt_enhancer_randomize_seed_choice,
-            mmaudio_mode_choice, mmaudio_persistence_choice, seedvc_mode_choice, seedvc_persistence_choice, flashvsr_mode_choice, flashvsr_persistence_choice, flashvsr_backend_choice, flashvsr_topk_ratio_choice, rife_version_choice, matanyone_version_choice,
+            mmaudio_mode_choice, mmaudio_persistence_choice, seedvc_mode_choice, seedvc_persistence_choice, flashvsr_mode_choice, flashvsr_persistence_choice, pid_tiling_threshold_choice, pid_persistence_choice, flashvsr_backend_choice, flashvsr_topk_ratio_choice, rife_version_choice, matanyone_version_choice,
             deepy_enabled_choice, deepy_vram_mode_choice,
             deepy_context_tokens_choice, deepy_custom_system_prompt_choice,
-            video_output_codec_choice, hdr_video_crf_choice, image_output_codec_choice, audio_output_codec_choice, audio_stand_alone_output_codec_choice,
+            video_container_choice, video_output_codec_choice, hdr_video_crf_choice, image_output_codec_choice, audio_output_codec_choice, audio_stand_alone_output_codec_choice,
             metadata_choice, embed_source_images_choice,
             save_path_choice, image_save_path_choice, audio_save_path_choice,
             notification_sound_enabled_choice, notification_sound_volume_choice,
@@ -611,10 +619,17 @@ class ConfigTabPlugin(WAN2GPPlugin):
         else:
             checkpoints_paths = [path.strip() for path in checkpoints_paths_choice.replace("\r", "").split("\n") if len(path.strip()) > 0]
 
+        video_output_error = validate_video_output_settings(video_output_codec_choice, video_container_choice, audio_output_codec_choice)
+        if video_output_error is not None:
+            gr.Info(f"Configuration was not saved: {video_output_error}")
+            return f"<div style='color:red; text-align:center;'>Configuration was not saved: {video_output_error}</div>", *[gr.update()]*8
+
         self.fl.set_checkpoints_paths(checkpoints_paths)
 
         flashvsr_mode_choice = int(flashvsr_mode_choice or 0)
         flashvsr_persistence_choice = int(flashvsr_persistence_choice or 1)
+        pid_tiling_threshold_choice = normalize_pid_tiling_threshold(pid_tiling_threshold_choice)
+        pid_persistence_choice = int(pid_persistence_choice or 1)
         flashvsr_backend_choice = normalize_sparse_backend(flashvsr_backend_choice)
         seedvc_config = {"seedvc_mode": seedvc_mode_choice, "seedvc_persistence": seedvc_persistence_choice}
         seedvc_mode_choice, seedvc_persistence_choice = SeedVCBridge(self.server_config, self.fl).normalize_config(seedvc_config)
@@ -641,6 +656,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "mixed_precision": mixed_precision_choice, "metadata_type": metadata_choice,
             "transformer_quantization": quantization_choice, "transformer_dtype_policy": transformer_dtype_policy_choice,
             "boost": boost_choice, "enable_int8_kernels": enable_int8_kernels_choice, "clear_file_list": clear_file_list_choice,
+            "multi_prompts_gen_type": prompt_parser.normalize_multi_prompts_mode(multi_prompts_gen_type_choice, default=prompt_parser.DEFAULT_MULTI_PROMPTS_MODE),
             "keep_intermediate_sliding_windows": keep_intermediate_sliding_windows_choice,
             "preload_model_policy": preload_model_policy_choice, "UI_theme": UI_theme_choice,
             "fit_canvas": fit_canvas_choice, "enhancer_enabled": enhancer_enabled_choice,
@@ -648,7 +664,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "enhancer_mode": enhancer_mode_choice, "mmaudio_mode": mmaudio_mode_choice,
             "mmaudio_persistence": mmaudio_persistence_choice, "mmaudio_enabled": mmaudio_enabled_choice,
             "seedvc_mode": seedvc_mode_choice, "seedvc_persistence": seedvc_persistence_choice,
-            "flashvsr_mode": flashvsr_mode_choice, "flashvsr_persistence": flashvsr_persistence_choice, "flashvsr_backend": flashvsr_backend_choice, "flashvsr_topk_ratio": flashvsr_topk_ratio_choice,
+            "flashvsr_mode": flashvsr_mode_choice, "flashvsr_persistence": flashvsr_persistence_choice, "pid_tiling_threshold": pid_tiling_threshold_choice, "pid_persistence": pid_persistence_choice, "flashvsr_backend": flashvsr_backend_choice, "flashvsr_topk_ratio": flashvsr_topk_ratio_choice,
             "rife_version": rife_version_choice, "matanyone_version": matanyone_version_choice,
             "prompt_enhancer_temperature": prompt_enhancer_temperature_choice,
             "prompt_enhancer_top_p": prompt_enhancer_top_p_choice,
@@ -674,7 +690,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "queue_color_scheme": queue_color_scheme_choice,
             gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY: process_queues_when_browser_unfocused_choice,
             "embed_source_images": embed_source_images_choice,
-            "video_container": "mp4", # Fixed to MP4
+            "video_container": video_container_choice,
             "last_model_type": state["model_type"],
             "last_model_per_family": state["last_model_per_family"],
             "last_model_per_type": state["last_model_per_type"],
@@ -696,10 +712,10 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         no_reload_keys = [
             "attention_mode", "vae_config", "boost", "enable_int8_kernels", "save_path", "image_save_path", "audio_save_path",
-            "metadata_type", "clear_file_list", "keep_intermediate_sliding_windows", "fit_canvas", "depth_anything_v2_variant",
+            "metadata_type", "clear_file_list", "multi_prompts_gen_type", "keep_intermediate_sliding_windows", "fit_canvas", "depth_anything_v2_variant",
             "notification_sound_enabled", "notification_sound_volume", "mmaudio_mode",
-            "mmaudio_persistence", "mmaudio_enabled", "seedvc_mode", "seedvc_persistence", "flashvsr_mode", "flashvsr_persistence", "flashvsr_backend", "flashvsr_topk_ratio", "rife_version", "matanyone_version",
-            "prompt_enhancer_temperature", "prompt_enhancer_top_p", "prompt_enhancer_randomize_seed", "prompt_enhancer_quantization",
+            "mmaudio_persistence", "mmaudio_enabled", "seedvc_mode", "seedvc_persistence", "flashvsr_mode", "flashvsr_persistence", "pid_tiling_threshold", "pid_persistence", "flashvsr_backend", "flashvsr_topk_ratio", "rife_version", "matanyone_version",
+            "prompt_enhancer_temperature", "prompt_enhancer_top_p", "prompt_enhancer_randomize_seed", "prompt_enhancer_quantization", "enhancer_mode",
             DEEPY_ENABLED_KEY, DEEPY_VRAM_MODE_KEY, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_CUSTOM_SYSTEM_PROMPT_KEY,
             "max_frames_multiplier", "display_stats", "enable_4k_resolutions", "max_reserved_loras", "video_output_codec", "hdr_video_crf", "video_container",
             "embed_source_images", "image_output_codec", "audio_output_codec", "audio_stand_alone_output_codec", "checkpoints_paths", "loras_root", "save_queue_if_crash",
@@ -732,13 +748,21 @@ class ConfigTabPlugin(WAN2GPPlugin):
         if needs_reload: self.set_global("reload_needed", True)
         self.server_config.update(new_server_config)
 
-        if "enhancer_enabled" in changes or "enhancer_mode" in changes or "prompt_enhancer_quantization" in changes or "lm_decoder_engine" in changes or DEEPY_ENABLED_KEY in changes or DEEPY_VRAM_MODE_KEY in changes:
+        enhancer_runtime_changed = "enhancer_enabled" in changes or "prompt_enhancer_quantization" in changes or "lm_decoder_engine" in changes or DEEPY_ENABLED_KEY in changes or DEEPY_VRAM_MODE_KEY in changes
+        enhancer_profile_changed = "profile" in changes or "video_profile" in changes
+        if enhancer_runtime_changed:
             get_or_create_assistant_session(state).force_loading_status_once = True
             self.release_deepy_vram(state, clear_session_state=True, discard_runtime_snapshot=True)
             self.reset_prompt_enhancer()
             self.reset_prompt_enhancer_if_requested()
+        elif enhancer_profile_changed:
+            self.release_deepy_vram(state, clear_session_state=False, discard_runtime_snapshot=True)
+            self.reset_prompt_enhancer()
+            self.reset_prompt_enhancer_if_requested()
         if "seedvc_mode" in changes or "seedvc_persistence" in changes:
             self.release_seedvc_vram()
+        if "pid_tiling_threshold" in changes or "pid_persistence" in changes or "image_profile" in changes:
+            self.release_pid_vram()
         if "enable_int8_kernels" in changes:
             self.apply_int8_kernel_setting(new_server_config["enable_int8_kernels"], True)
 

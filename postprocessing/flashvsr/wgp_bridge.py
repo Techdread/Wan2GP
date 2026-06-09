@@ -177,7 +177,7 @@ class FlashVSRBridge:
         mixed_precision = self.server_config.get("vae_precision", "16") == "32"
         return WanVAE.get_VAE_tile_size(vae_config, device_mem_capacity, mixed_precision, output_height=output_height, output_width=output_width)
 
-    def download(self, process_files: Callable[..., Any], send_cmd=None, status_text: str | None = None) -> bool:
+    def download(self, process_files: Callable[..., Any], send_cmd=None, status_text: str | None = None, spatial_upsampling=None) -> bool:
         flashvsr_def = self.query_download_def()
         if flashvsr_def is None:
             return False
@@ -216,10 +216,11 @@ class FlashVSRBridge:
             continue_cache=continue_cache,
             return_continue_cache=return_continue_cache,
             persistent_models=persistence == self.PERSIST_RAM,
-            vae_tile_size=flashvsr_tile_size if variant == "full" or vae_tile_size is None else vae_tile_size,
+            vae_tile_size=flashvsr_tile_size,
             topk_ratio=self.topk_ratio(),
             init_pipe=init_pipe,
             profile=profile,
+            attention_mode=self.server_config.get("attention_mode"),
             still_image=still_image,
             two_pass=self.is_two_pass_upsampling(spatial_upsampling),
             abort_callback=abort_callback,

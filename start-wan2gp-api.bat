@@ -9,7 +9,7 @@ set "PYTHON_EXE=%WANGP_DIR%\venv\Scripts\python.exe"
 set "WAN2GP_OUTPUTS_ROOT=%WANGP_DIR%\outputs"
 set "WAN2GP_JOB_DB=%USERPROFILE%\.wan2gp\jobs.sqlite"
 set "WAN2GP_LOG_PROMPTS=0"
-set "WAN2GP_CORS_ORIGINS="
+set "WAN2GP_CORS_ORIGINS=*"
 set "HOST=0.0.0.0"
 set "PORT=8100"
 

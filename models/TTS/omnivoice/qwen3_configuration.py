@@ -14,12 +14,21 @@
 # limitations under the License.
 """Qwen3 model configuration"""
 
-from transformers.configuration_utils import PretrainedConfig, layer_type_validation
+from transformers.configuration_utils import PretrainedConfig, layer_type_validation as _hf_layer_type_validation
 from transformers.modeling_rope_utils import rope_config_validation
 from transformers.utils import logging
 
 
 logger = logging.get_logger(__name__)
+
+
+def layer_type_validation(layer_types, num_hidden_layers=None):
+    _hf_layer_type_validation(layer_types)
+    if num_hidden_layers is not None and num_hidden_layers != len(layer_types):
+        raise ValueError(
+            f"`num_hidden_layers` ({num_hidden_layers}) must be equal to the number of layer types "
+            f"({len(layer_types)})"
+        )
 
 
 class Qwen3Config(PretrainedConfig):
@@ -152,6 +161,14 @@ class Qwen3Config(PretrainedConfig):
         layer_types=None,
         **kwargs,
     ):
+        rope_parameters = kwargs.pop("rope_parameters", None)
+        if rope_parameters is not None:
+            rope_theta = rope_parameters.get("rope_theta", rope_theta)
+            rope_type = rope_parameters.get("rope_type", rope_parameters.get("type", "default"))
+            if rope_type != "default":
+                rope_scaling = dict(rope_parameters)
+                rope_scaling["rope_type"] = rope_type
+
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
