@@ -155,7 +155,7 @@ def test_construction():
     agent2 = WanGPAgent(profile=3, attention="flash", output_dir="/tmp/out", verbose=False)
     check("custom profile", agent2._profile == 3)
     check("custom attention", agent2._attention == "flash")
-    check("custom output_dir", agent2._output_dir == Path("/tmp/out"))
+    check("custom output_dir", agent2._output_dir == Path("/tmp/out").resolve())
     check("verbose=False", agent2._verbose is False)
 
 
@@ -295,6 +295,56 @@ def test_audio_no_source():
     agent.generate_audio(prompt="TTS test")
     s = session.submitted_tasks[0]
     check("no audio_source key", "audio_source" not in s)
+
+
+def test_edit_settings():
+    """Late-edit helpers assemble model-less native API payloads."""
+    print("\n--- Edit Settings ---")
+    from agent_api import WanGPAgent
+
+    agent = WanGPAgent(verbose=False)
+    session = FakeSession()
+    agent._session = session
+
+    result = agent.postprocess_media(
+        "input.mp4", spatial_upsampling="lanczos2", film_grain_intensity=0.2
+    )
+    media = session.submitted_tasks[-1]
+    check("media edit success", result["success"] is True)
+    check("media edit mode", media["mode"] == "edit_postprocessing")
+    check("media edit source", media["video_source"] == "input.mp4")
+    check("media edit operation", media["spatial_upsampling"] == "lanczos2")
+    check("media edit model-less", "model_type" not in media)
+
+    agent.remux_audio("video.mp4", postprocess_audio="custom", audio_source="sound.wav")
+    remux = session.submitted_tasks[-1]
+    check("remux mode", remux["mode"] == "edit_remux")
+    check("remux method", remux["postprocess_audio"] == "custom")
+    check("remux audio source", remux["audio_source"] == "sound.wav")
+
+    agent.postprocess_audio("voice.wav", postprocess_audio="remove_background")
+    audio = session.submitted_tasks[-1]
+    check("audio edit mode", audio["mode"] == "edit_audio")
+    check("audio edit source", audio["audio_source"] == "voice.wav")
+    check("audio edit method", audio["postprocess_audio"] == "remove_background")
+
+
+def test_server_edit_validation():
+    """The HTTP API accepts valid edit jobs without model_type."""
+    print("\n--- Server Edit Validation ---")
+    from agent_api_server import capability_for_request, validate_job_request
+
+    media = {"mode": "edit_postprocessing", "video_source": "input.mp4", "spatial_upsampling": "lanczos2"}
+    remux = {"mode": "edit_remux", "video_source": "input.mp4", "postprocess_audio": "mmaudio"}
+    audio = {"mode": "edit_audio", "audio_source": "input.wav", "postprocess_audio": "remove_background"}
+    check("valid media edit", validate_job_request(media) is None)
+    check("valid remux edit", validate_job_request(remux) is None)
+    check("valid audio edit", validate_job_request(audio) is None)
+    check("media capability", capability_for_request(media) == "media-postprocessing")
+    check("remux capability", capability_for_request(remux) == "audio-remux")
+    check("audio capability", capability_for_request(audio) == "audio-postprocessing")
+    check("edit requires operation", "at least one" in validate_job_request({"mode": "edit_postprocessing", "video_source": "x"}))
+    check("edit rejects model_type", "must not include" in validate_job_request({**audio, "model_type": "z_image"}))
 
 
 def test_batch():
@@ -546,6 +596,14 @@ def test_remote_roundtrip():
                 self._ok(["lora1.safetensors"])
             elif p == '/api/settings':
                 self._ok({"prompt": "", "seed": -1})
+            elif p == '/api/jobs/mock-job':
+                self._ok({
+                    "job_id": "mock-job",
+                    "status": "completed",
+                    "files": ["/tmp/mock.png"],
+                    "error": None,
+                    "duration_seconds": 1.23,
+                })
             else:
                 self._err("not found", 404)
 
@@ -553,16 +611,8 @@ def test_remote_roundtrip():
             p = self.path.split('?')[0]
             n = int(self.headers.get('Content-Length', 0))
             body = json.loads(self.rfile.read(n)) if n else {}
-            if p == '/api/generate':
-                self._ok({
-                    "success": True,
-                    "files": ["/tmp/mock.png"],
-                    "errors": [],
-                    "total_tasks": 1,
-                    "successful_tasks": 1,
-                    "failed_tasks": 0,
-                    "duration_seconds": 1.23,
-                })
+            if p == '/api/jobs':
+                self._ok({"job_id": "mock-job", "status": "queued", "request": body})
             elif p == '/api/batch':
                 count = len(body) if isinstance(body, list) else 1
                 self._ok({
@@ -631,6 +681,9 @@ def test_remote_roundtrip():
         r3 = agent.generate_audio(prompt="audio")
         check("generate_audio success", r3["success"] is True)
 
+        r_edit = agent.postprocess_media("input.mp4", spatial_upsampling="lanczos2")
+        check("postprocess_media success", r_edit["success"] is True)
+
         r4 = agent.generate_batch([{"prompt": "a"}, {"prompt": "b"}])
         check("batch success", r4["success"] is True)
         check("batch count", r4["total_tasks"] == 2)
@@ -660,6 +713,8 @@ if __name__ == "__main__":
     test_video_no_images()
     test_audio_settings()
     test_audio_no_source()
+    test_edit_settings()
+    test_server_edit_validation()
     test_batch()
     test_extra_settings()
     test_verbose_progress()

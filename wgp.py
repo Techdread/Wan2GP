@@ -10652,7 +10652,8 @@ def get_prompt_helper_html(model_type, model_def, prompt_id, elem_id):
 def render_prompt_info_label(label, model_type, model_def, prompt_id):
     elem_id = PROMPT_WIZARD_ELEM_ID if prompt_id == "wizard" else PROMPT_ADVANCED_ELEM_ID
     helper_popup_id, helper_html = get_prompt_helper_html(model_type, model_def, prompt_id, elem_id)
-    return field_help.render_model_prompt_tools(label, elem_id, model_type, model_def, prompt_id, helper_popup_id=helper_popup_id if helper_html else None, helper_title="Prompt Helper") + helper_html
+    helper_title = str((model_def or {}).get("prompt_helper_button_label") or "Prompt Helper")
+    return field_help.render_model_prompt_tools(label, elem_id, model_type, model_def, prompt_id, helper_popup_id=helper_popup_id if helper_html else None, helper_title=helper_title) + helper_html
 
 def get_image_end_label(multi_prompts_gen_type):
     return "Images as ending points for each new Window of the same Video Generation" if "W" in multi_prompts_gen_type else "Images as ending points for new Videos in the Generation Queue"

@@ -1447,6 +1447,44 @@ window.wangpIdeogram4PromptHelper = window.wangpIdeogram4PromptHelper || {};
         const api = helper.init(card);
         if (api) api.open();
     };
+    helper.promptPopupConfig = function(popup) {
+        const card = popup?.querySelector?.("[data-ideogram4-prompt-helper]");
+        if (!card) return null;
+        try {
+            return JSON.parse(card.getAttribute("data-ideogram4-config") || "{}");
+        } catch (_error) {
+            return null;
+        }
+    };
+    helper.findPromptPopup = function(promptId) {
+        const popups = Array.from(document.querySelectorAll(".ideogram4-prompt-helper-popup"));
+        if (!popups.length) return null;
+        const wantedPrompt = String(promptId || "").trim();
+        if (wantedPrompt) {
+            const exact = popups.find((popup) => helper.promptPopupConfig(popup)?.promptId === wantedPrompt);
+            if (exact) return exact;
+        }
+        return popups.find((popup) => {
+            const targetId = helper.promptPopupConfig(popup)?.promptTarget;
+            const target = targetId ? document.getElementById(targetId) : null;
+            return target && !!(target.offsetWidth || target.offsetHeight || target.getClientRects().length);
+        }) || popups[0];
+    };
+    helper.openMagicWand = function(promptId) {
+        window.wangpPromptTools?.attach?.(document);
+        const popup = helper.findPromptPopup(promptId);
+        if (!popup?.id) return false;
+        const button = Array.from(document.querySelectorAll("[data-wangp-model-info-open]")).find((node) => node.getAttribute("data-wangp-model-info-open") === popup.id);
+        const opener = button || { getAttribute: (name) => name === "data-wangp-model-info-open" ? popup.id : null };
+        if (window.wangpModelInfo?.open) {
+            window.wangpModelInfo.open(opener);
+        } else {
+            popup.hidden = false;
+            popup.dispatchEvent(new CustomEvent("wangp:model-info-opened", { bubbles: true }));
+        }
+        return true;
+    };
+    helper.openPromptHelper = helper.openMagicWand;
     if (!helper.boundOpenEvent) {
         document.addEventListener("wangp:model-info-opened", (event) => {
             const popup = event.target?.closest?.(".ideogram4-prompt-helper-popup");

@@ -56,7 +56,7 @@ from typing import Any
 
 
 WANGP_ROOT = Path(__file__).resolve().parent
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 
 # Auto-derived schema + size cache live in their own modules so this file
 # stays focused on HTTP plumbing.
@@ -153,6 +153,11 @@ WHISPER_MODEL_TYPES = tuple(f"whisper-{m}" for m in WHISPER_MODEL_NAMES)
 WHISPER_BIN = os.environ.get("WHISPER_BIN", "whisper")
 TRANSCRIPTION_FORMATS = ("txt", "json", "srt", "vtt", "tsv")
 TRANSCRIPTION_CAPABILITY = "transcription"
+EDIT_MODE_CAPABILITIES = {
+    "edit_postprocessing": "media-postprocessing",
+    "edit_remux": "audio-remux",
+    "edit_audio": "audio-postprocessing",
+}
 
 
 def is_transcription_model_type(model_type: str) -> bool:
@@ -179,6 +184,55 @@ def capability_for_model_type(model_type: str) -> str:
     if any(tag in mt for tag in ("tts", "audio", "ace_step", "heartmula", "kugel", "chatterbox")):
         return "audio-generation"
     return "image-generation"
+
+
+def capability_for_request(request: dict[str, Any]) -> str:
+    """Return the capability represented by a generation or edit request."""
+    mode = str(request.get("mode") or "")
+    if mode in EDIT_MODE_CAPABILITIES:
+        return EDIT_MODE_CAPABILITIES[mode]
+    return capability_for_model_type(str(request.get("model_type") or ""))
+
+
+def validate_job_request(request: Any) -> str | None:
+    """Validate the HTTP-level shape of a generation or late-edit request."""
+    if not isinstance(request, dict):
+        return "request must be a JSON object"
+
+    mode = str(request.get("mode") or "")
+    if not mode:
+        model_type = request.get("model_type")
+        if not isinstance(model_type, str) or not model_type.strip():
+            return "request must include model_type or a supported edit mode"
+        return agent_api_introspect.validate_request(model_type, request)
+
+    if mode not in EDIT_MODE_CAPABILITIES:
+        return f"unsupported mode: {mode}"
+
+    if request.get("model_type"):
+        return f"{mode} requests must not include model_type"
+
+    if mode == "edit_postprocessing":
+        if not request.get("video_source"):
+            return "edit_postprocessing requires video_source"
+        has_operation = bool(
+            request.get("temporal_upsampling")
+            or request.get("spatial_upsampling")
+            or float(request.get("film_grain_intensity") or 0) > 0
+        )
+        if not has_operation:
+            return "edit_postprocessing requires at least one postprocessing operation"
+    elif mode == "edit_remux":
+        if not request.get("video_source"):
+            return "edit_remux requires video_source"
+        if not request.get("postprocess_audio"):
+            return "edit_remux requires postprocess_audio"
+    elif mode == "edit_audio":
+        if not request.get("audio_source"):
+            return "edit_audio requires audio_source"
+        if not request.get("postprocess_audio"):
+            return "edit_audio requires postprocess_audio"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +357,7 @@ class JobStore:
         model_type = str(request.get("model_type") or "")
         rec = JobRecord(
             job_id=job_id or make_job_id(),
-            capability=capability or capability_for_model_type(model_type),
+            capability=capability or capability_for_request(request),
             model_type=model_type,
             status="queued",
             created_at=_now_iso(),
@@ -813,26 +867,16 @@ class JobWorker:
 # ---------------------------------------------------------------------------
 
 def _gpu_info() -> dict[str, Any] | None:
-    """Return GPU info using torch (already imported by WanGP) or nvidia-smi fallback."""
-    try:
-        import torch  # type: ignore
-        if torch.cuda.is_available():
-            idx = 0
-            name = torch.cuda.get_device_name(idx)
-            free, total = torch.cuda.mem_get_info(idx)
-            used = total - free
-            return {
-                "name": name,
-                "vram_total_mb": int(total // (1024 * 1024)),
-                "vram_used_mb": int(used // (1024 * 1024)),
-            }
-    except Exception:
-        pass
+    """Return GPU info without entering the active process's CUDA context.
+
+    CUDA runtime calls can block behind generation work.  A short-lived
+    nvidia-smi query keeps the health endpoint bounded and independent.
+    """
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=name,memory.total,memory.used",
              "--format=csv,noheader,nounits"],
-            stderr=subprocess.DEVNULL, timeout=5,
+            stderr=subprocess.DEVNULL, timeout=2,
         ).decode().strip()
         if out:
             first = out.splitlines()[0]
@@ -1206,14 +1250,11 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
         def _route_post(self, path: str, qs: dict[str, str]) -> int:
             if path == "/api/jobs":
                 body = self._read_body()
-                if not isinstance(body, dict) or not body.get("model_type"):
-                    self._json(400, {"error": "request must be a JSON object with model_type"})
-                    return 400
-                # Validate against the auto-derived schema before queueing.
-                err = agent_api_introspect.validate_request(body["model_type"], body)
+                err = validate_job_request(body)
                 if err:
-                    self._json(400, {"error": err, "model_type": body["model_type"]})
+                    self._json(400, {"error": err})
                     return 400
+                assert isinstance(body, dict)
                 rec = store.create(request=body, request_id=self._current_request_id)
                 worker.submit(rec.job_id)
                 log_event(
@@ -1229,10 +1270,7 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
                 return 202
             if path == "/api/settings/validate":
                 body = self._read_body()
-                if not isinstance(body, dict) or not body.get("model_type"):
-                    self._json(400, {"error": "request must be a JSON object with model_type"})
-                    return 400
-                err = agent_api_introspect.validate_request(body["model_type"], body)
+                err = validate_job_request(body)
                 if err:
                     self._json(200, {"valid": False, "error": err})
                     return 200

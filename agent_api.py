@@ -6,6 +6,7 @@ A simplified, agent-friendly interface around WanGP's in-process Python API.
 
 This wrapper provides:
   - Simple function calls for image/video/audio generation
+  - Late media post-processing, audio remuxing, and audio editing
   - Blocking (synchronous) execution with progress logging
   - Model listing and discovery
   - Automatic session management
@@ -223,7 +224,20 @@ class WanGPAgent:
             duration_seconds: float - total generation time
         """
         if self._url:
-            return self._remote_post('/api/generate', settings)
+            submitted = self.submit_job(settings)
+            record = self.wait_for_job(submitted["job_id"])
+            error = record.get("error")
+            success = record.get("status") == "completed"
+            return {
+                "success": success,
+                "files": record.get("files") or [],
+                "errors": [str(error)] if error else [],
+                "total_tasks": 1,
+                "successful_tasks": 1 if success else 0,
+                "failed_tasks": 0 if success else 1,
+                "duration_seconds": record.get("duration_seconds") or 0,
+                "job_id": record.get("job_id"),
+            }
         self._ensure_session()
 
         start_time = time.time()
@@ -428,6 +442,99 @@ class WanGPAgent:
         if audio_source:
             settings["audio_source"] = audio_source
         settings.update(extra_settings)
+        return self._run_task(settings)
+
+    def postprocess_media(
+        self,
+        media_source: str | Path,
+        *,
+        temporal_upsampling: str = "",
+        spatial_upsampling: str = "",
+        film_grain_intensity: float = 0,
+        film_grain_saturation: float = 0.5,
+        seed: int = -1,
+        **extra_settings: Any,
+    ) -> dict[str, Any]:
+        """Late-postprocess an existing image or video."""
+        settings = {
+            "mode": "edit_postprocessing",
+            "prompt": "Media postprocessing",
+            "image_mode": 0,
+            "video_source": os.fspath(media_source),
+            "temporal_upsampling": temporal_upsampling,
+            "spatial_upsampling": spatial_upsampling,
+            "film_grain_intensity": film_grain_intensity,
+            "film_grain_saturation": film_grain_saturation,
+            "postprocess_audio": "",
+            "repeat_generation": 1,
+            "batch_size": 1,
+            "seed": seed,
+        }
+        settings.update(extra_settings)
+        settings.pop("model_type", None)
+        return self._run_task(settings)
+
+    def remux_audio(
+        self,
+        video_source: str | Path,
+        *,
+        postprocess_audio: str,
+        audio_source: str | Path | None = None,
+        postprocess_audio_prompt: str = "",
+        postprocess_audio_neg_prompt: str = "",
+        seed: int = -1,
+        repeat_generation: int = 1,
+        replace_voice_sample: str | Path | None = None,
+        replace_voice_sample2: str | Path | None = None,
+        **extra_settings: Any,
+    ) -> dict[str, Any]:
+        """Replace or generate the audio track of an existing video."""
+        settings = {
+            "mode": "edit_remux",
+            "prompt": "Audio remuxing",
+            "image_mode": 0,
+            "video_source": os.fspath(video_source),
+            "postprocess_audio": postprocess_audio,
+            "postprocess_audio_prompt": postprocess_audio_prompt,
+            "postprocess_audio_neg_prompt": postprocess_audio_neg_prompt,
+            "seed": seed,
+            "repeat_generation": repeat_generation,
+            "audio_source": None if audio_source is None else os.fspath(audio_source),
+            "replace_voice_sample": None if replace_voice_sample is None else os.fspath(replace_voice_sample),
+            "replace_voice_sample2": None if replace_voice_sample2 is None else os.fspath(replace_voice_sample2),
+            "temporal_upsampling": "",
+            "spatial_upsampling": "",
+            "film_grain_intensity": 0,
+            "film_grain_saturation": 0.5,
+            "batch_size": 1,
+        }
+        settings.update(extra_settings)
+        settings.pop("model_type", None)
+        return self._run_task(settings)
+
+    def postprocess_audio(
+        self,
+        audio_source: str | Path,
+        *,
+        postprocess_audio: str,
+        replace_voice_sample: str | Path | None = None,
+        replace_voice_sample2: str | Path | None = None,
+        **extra_settings: Any,
+    ) -> dict[str, Any]:
+        """Late-postprocess an existing audio file."""
+        settings = {
+            "mode": "edit_audio",
+            "prompt": "Audio postprocessing",
+            "image_mode": 0,
+            "audio_source": os.fspath(audio_source),
+            "postprocess_audio": postprocess_audio,
+            "replace_voice_sample": None if replace_voice_sample is None else os.fspath(replace_voice_sample),
+            "replace_voice_sample2": None if replace_voice_sample2 is None else os.fspath(replace_voice_sample2),
+            "repeat_generation": 1,
+            "batch_size": 1,
+        }
+        settings.update(extra_settings)
+        settings.pop("model_type", None)
         return self._run_task(settings)
 
     def generate_batch(

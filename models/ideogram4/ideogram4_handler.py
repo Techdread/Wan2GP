@@ -188,6 +188,7 @@ class family_handler:
             "resolutions_categories": ["<=2k"],
             "vae_block_size": 16,
             "prompt_enhancer_button_label": "Magic Prompt",
+            "prompt_helper_button_label": "Visual Helper",
             "prompt_infos": IDEOGRAM4_PROMPT_INFOS,
             "prompt_helper_popup_dims": [78, 100],
             "prompt_enhancer_def": {

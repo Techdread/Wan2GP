@@ -16,7 +16,7 @@ are tracked in the companion file `Wan2GP-API-HARDENING.md`.
 GET    /api/health                        — liveness + GPU + queue + version
 GET    /api/models                        — list of model_type entries with sizes + capability hints
 GET    /api/models/{model_type}           — full enriched entry: defaults, applicable settings, model_def, sizes
-GET    /api/loras?model_type=...          — lora files for a model
+GET    /api/loras?model_type=...          — lora files for a model 
 GET    /api/settings                      — global default settings template
 GET    /api/settings/schema               — typed settings schema (registered + freeform)
 POST   /api/settings/validate             — dry-run validate a request without queueing it
@@ -209,6 +209,107 @@ curl -X POST http://192.168.1.199:8100/api/jobs \
 
 Then poll `/api/jobs/{id}` until `status: "completed"` and download via
 `/api/file`.
+
+---
+
+## New upstream models and Ideogram 4
+
+Network nodes should not hard-code the old model list. After updating a node,
+call `GET /api/models` or `GET /api/models/{model_type}` and build the UI or
+task payloads from the returned model definition/defaults. New upstream model
+definitions live in `defaults/*.json`; once the node has pulled the latest
+repo, `ideogram4` and `ideogram4_nf4` are available as normal `model_type`
+values.
+
+### Ideogram 4 model ids
+
+| `model_type` | Quantization | Notes |
+| --- | --- | --- |
+| `ideogram4` | FP8 | Default Ideogram 4 path. |
+| `ideogram4_nf4` | NF4 | Uses the NF4 transformer files and should run with the NF4/bitsandbytes kernels installed. The model definition forces SDPA on lower-capability GPUs. |
+
+Both variants are image-output models. They use the `ideogram4` architecture,
+the Flux2 VAE backbone, the Qwen3-VL text encoder, and paired conditional /
+unconditional Ideogram 4 transformer files. First use may download the model
+assets from Hugging Face, so each network node needs outbound model-download
+access or pre-populated `models/` cache files.
+
+### Ideogram 4 generation payload
+
+Ideogram 4 works best with its structured JSON prompt format. Plain text is
+accepted, but nodes should either submit serialized JSON in `prompt` or let the
+operator use Magic Prompt / the Visual Helper in the main UI to create the JSON
+first.
+
+Minimum payload:
+
+```bash
+curl -X POST http://192.168.1.199:8100/api/jobs \
+  -H 'Authorization: Bearer mysecret' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_type": "ideogram4",
+    "image_mode": 1,
+    "prompt": "{\"aspect_ratio\":\"4:3\",\"high_level_description\":\"A clean poster for a night market noodle stall, readable title text, warm lights, busy street background.\",\"style_description\":{\"medium\":\"graphic_design\",\"aesthetics\":\"polished editorial poster\",\"lighting\":\"warm neon and lantern light\",\"color_palette\":[\"#101820\",\"#FEE715\",\"#E94F37\",\"#FFFFFF\"]},\"compositional_deconstruction\":{\"background\":\"A lively night market street with lanterns, steam, and softly blurred people.\",\"elements\":[{\"type\":\"text\",\"bbox\":[80,120,210,880],\"text\":\"MIDNIGHT NOODLES\",\"desc\":\"Large crisp uppercase title, centered, high contrast, readable from a distance.\"},{\"type\":\"obj\",\"bbox\":[360,260,820,740],\"desc\":\"A steaming bowl of noodles with chopsticks, placed as the main subject.\"}]}}",
+    "resolution": "1024x768",
+    "batch_size": 1,
+    "model_mode": "V4_DEFAULT_20",
+    "seed": -1
+  }'
+```
+
+WanGP settings treat `prompt` as a string. If your node builds the prompt from a
+native object, serialize the Ideogram JSON before calling `/api/jobs`:
+
+```json
+{
+  "model_type": "ideogram4",
+  "image_mode": 1,
+  "prompt": "{\"aspect_ratio\":\"4:3\",\"high_level_description\":\"A clean poster...\"}",
+  "resolution": "1024x768",
+  "batch_size": 1,
+  "model_mode": "V4_DEFAULT_20",
+  "seed": -1
+}
+```
+
+Supported Ideogram 4 presets:
+
+| `model_mode` | Use |
+| --- | --- |
+| `V4_QUALITY_48` | Highest quality, slowest. |
+| `V4_DEFAULT_20` | Balanced default. |
+| `V4_TURBO_12` | Fastest. |
+
+Recommended node behavior:
+
+- set `image_mode` to `1`
+- keep `batch_size` at `1` unless the node has enough VRAM for larger batches
+- omit `negative_prompt`; Ideogram 4 does not use it
+- prefer `model_mode` over legacy `sample_solver` for the preset
+- treat safety-filter failures as model/runtime failures, not client retry loops
+- use `GET /api/models/ideogram4` or `GET /api/models/ideogram4_nf4` to inspect
+  the current defaults before queueing work
+
+### Visual Helper / Magic Wand exposure
+
+The Visual Helper is a browser-side editor for Ideogram 4's JSON prompt format.
+It is exposed in the main Web UI through the Magic Wand next to the prompt when
+an Ideogram 4 model is selected. It edits/draws bounding boxes and applies the
+final JSON back into the prompt field.
+
+Headless network API clients do not receive the Visual Helper UI over
+`/api/jobs`; they should send the final prompt JSON in the job payload. Browser
+clients embedding the WanGP UI can open the helper with:
+
+```js
+window.wangpIdeogram4PromptHelper.openMagicWand();
+window.wangpIdeogram4PromptHelper.openMagicWand("advanced");
+window.wangpIdeogram4PromptHelper.openMagicWand("wizard");
+```
+
+Use Magic Prompt to create the first JSON draft, then Visual Helper to adjust
+object and text boxes before queueing the job.
 
 ---
 
