@@ -252,6 +252,12 @@ def _capability_from_def(model_def: dict[str, Any], arch: str) -> str:
         return "image-generation"
     if model_def.get("audio_only"):
         return "audio-generation"
+    # Native audiovisual models (for example MiniMax H3) are video
+    # generators even though they also return an audio track. Prefer the
+    # explicit metadata so future multimedia families do not need another
+    # API-specific architecture allowlist update.
+    if model_def.get("multimedia_generation") or model_def.get("returns_audio"):
+        return "video-generation"
     arch_l = (arch or "").lower()
     if any(t in arch_l for t in ("tts", "ace_step", "chatterbox", "qwen3_tts",
                                   "yue", "heartmula", "kugel", "index_tts")):
@@ -261,7 +267,8 @@ def _capability_from_def(model_def: dict[str, Any], arch: str) -> str:
             "wan_5B_class", "lynx_class", "alpha_class")):
         return "video-generation"
     if any(t in arch_l for t in ("wan", "ltx", "hunyuan", "longcat",
-                                  "magi", "video", "ovi", "k5_", "kandinsky")):
+                                  "magi", "video", "ovi", "k5_", "kandinsky",
+                                  "minimax", "shotplan")):
         return "video-generation"
     return "image-generation"
 

@@ -1,6 +1,6 @@
 {
     "model": {
-        "name": "LTX-2 2.3 MSR Ref Distilled 1.1 22B",
+        "name": "LTX-2 2.3 MSR Ref V1 Distilled 1.1 22B",
         "architecture": "ltx2_22B_msr",
         "description": "LTX-2.3 distilled 1.1 checkpoint (22B) configured for the LiconStudio Multiple Subject Reference LoRA. Provide 2 to 5 reference images; background first, then subjects and objects.",
         "URLs": "ltx2_22B_distilled_1_1",

@@ -30,6 +30,7 @@ __pycache__/
 venv/
 env_venv/
 envs.json
+shared/gradio/wangp_image_editor/templates/component/index.js.map
 storage/
 samples/
 !.gitignore
@@ -44,7 +45,7 @@ gradio_outputs/
 ckpts/
 loras/
 loras_i2v/
-
+tmp/
 /settings/
 
 wgp_config.json

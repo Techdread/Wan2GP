@@ -522,6 +522,41 @@ def test_settings_keys_match_api():
         check(f"audio key '{key}' valid", key in valid_keys, f"not in _settings.json")
 
 
+def test_capability_classification():
+    """New audiovisual/video families must be exposed under the video API."""
+    print("\n--- Capability Classification ---")
+    from agent_api_introspect import _capability_from_def
+
+    check(
+        "multimedia model is video",
+        _capability_from_def({"multimedia_generation": True}, "future_av_model")
+        == "video-generation",
+    )
+    check(
+        "audio-returning model is video",
+        _capability_from_def({"returns_audio": True}, "future_av_model")
+        == "video-generation",
+    )
+    check(
+        "MiniMax fallback is video",
+        _capability_from_def({}, "minimax_h3_fl2va") == "video-generation",
+    )
+    check(
+        "Shotplan fallback is video",
+        _capability_from_def({}, "shotplan_t2v") == "video-generation",
+    )
+    check(
+        "image output takes precedence",
+        _capability_from_def({"image_outputs": True, "returns_audio": True}, "hybrid")
+        == "image-generation",
+    )
+    check(
+        "audio-only takes precedence",
+        _capability_from_def({"audio_only": True, "returns_audio": True}, "tts")
+        == "audio-generation",
+    )
+
+
 # ------------------------------------------------------------------ #
 #  Remote mode tests
 # ------------------------------------------------------------------ #
@@ -723,6 +758,7 @@ if __name__ == "__main__":
     test_release_model_idempotent()
     test_default_settings_file()
     test_settings_keys_match_api()
+    test_capability_classification()
     test_remote_construction()
     test_remote_ensure_session_noop()
     test_remote_close_noop()
