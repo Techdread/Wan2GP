@@ -66,6 +66,37 @@ from typing import Any, Optional
 # Resolve WanGP root relative to this script
 WANGP_ROOT = Path(__file__).resolve().parent
 
+MINIMAX_H3_FL2VA_MODELS = {
+    "minimax_h3_fl2va",
+    "minimax_h3_fl2va_pruned",
+}
+MINIMAX_H3_REF2VA_MODELS = {
+    "minimax_h3_ref2va",
+    "minimax_h3_ref2va_pruned",
+}
+MINIMAX_H3_MODELS = MINIMAX_H3_FL2VA_MODELS | MINIMAX_H3_REF2VA_MODELS
+MINIMAX_H3_TEXT_ENCODER_CONFIGS = {
+    "",
+    "bf16",
+    "int8",
+    "nvfp4_awq",
+    "gguf_q2_k",
+    "gguf_q4_k_m",
+}
+
+
+def _merge_prompt_flags(current: str | None, flags: str) -> str:
+    """Append prompt-mode flags once while preserving separators/order."""
+    value = str(current or "")
+    for flag in flags:
+        if flag not in value:
+            value += flag
+    return value
+
+
+def _path_list(values: list[str | Path] | None) -> list[str]:
+    return [os.fspath(value) for value in (values or [])]
+
 
 class WanGPAgent:
     """Agent-friendly wrapper around WanGP's Python API."""
@@ -138,6 +169,39 @@ class WanGPAgent:
         req = urllib.request.Request(url, data=body, headers=headers)
         with urllib.request.urlopen(req, timeout=self._timeout) as resp:
             return json.loads(resp.read())
+
+    def _remote_multipart_file(
+        self,
+        endpoint: str,
+        file_path: str | Path,
+        *,
+        filename: str | None = None,
+    ) -> Any:
+        """POST one file using the server's bounded multipart contract."""
+        import mimetypes
+        import urllib.request
+        import uuid
+
+        path = Path(file_path)
+        payload = path.read_bytes()
+        upload_name = Path(filename or path.name).name.replace('"', "_").replace("\r", "").replace("\n", "")
+        mime_type = mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
+        boundary = f"----WanGP-{uuid.uuid4().hex}"
+        prefix = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{upload_name}"\r\n'
+            f"Content-Type: {mime_type}\r\n\r\n"
+        ).encode("utf-8")
+        body = prefix + payload + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        headers = {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            **self._auth_headers(),
+        }
+        request = urllib.request.Request(
+            f"{self._url}{endpoint}", data=body, headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=self._timeout) as response:
+            return json.loads(response.read())
 
     def _remote_delete(self, endpoint: str) -> Any:
         """DELETE request to the remote API server."""
@@ -287,6 +351,12 @@ class WanGPAgent:
         loras: list[str] | None = None,
         loras_multipliers: str = "",
         output_filename: str = "",
+        reference_images: list[str | Path] | None = None,
+        control_image: str | Path | None = None,
+        mask_image: str | Path | None = None,
+        video_prompt_type: str = "",
+        model_mode: int | str | None = None,
+        config: str = "",
         **extra_settings,
     ) -> dict[str, Any]:
         """
@@ -307,6 +377,14 @@ class WanGPAgent:
             loras: List of lora filenames to activate.
             loras_multipliers: Lora strength multipliers (space-separated).
             output_filename: Custom output filename (without extension).
+            reference_images: Reference/conditional images, used by models such
+                              as Krea 2 Identity Edit and LTX image workflows.
+            control_image: Source/control image for image-to-image or inpainting.
+            mask_image: Optional mask paired with ``control_image``.
+            video_prompt_type: Explicit WanGP media-mode flags. ``I`` is added
+                               automatically when reference images are supplied.
+            model_mode: Optional model-specific mode, such as a Krea LanPaint mode.
+            config: Optional model config variant.
             **extra_settings: Any additional WanGP settings.
 
         Returns:
@@ -325,6 +403,22 @@ class WanGPAgent:
             "loras_multipliers": loras_multipliers,
             "output_filename": output_filename,
         }
+        refs = _path_list(reference_images)
+        if refs:
+            settings["image_refs"] = refs
+            video_prompt_type = _merge_prompt_flags(video_prompt_type, "I")
+        if control_image is not None:
+            settings["image_guide"] = os.fspath(control_image)
+            video_prompt_type = _merge_prompt_flags(video_prompt_type, "V")
+        if mask_image is not None:
+            settings["image_mask"] = os.fspath(mask_image)
+            video_prompt_type = _merge_prompt_flags(video_prompt_type, "AG")
+        if video_prompt_type:
+            settings["video_prompt_type"] = video_prompt_type
+        if model_mode is not None:
+            settings["model_mode"] = model_mode
+        if config:
+            settings["config"] = config
         settings.update(extra_settings)
         return self._run_task(settings)
 
@@ -346,6 +440,10 @@ class WanGPAgent:
         start_image: str | None = None,
         end_image: str | None = None,
         output_filename: str = "",
+        reference_images: list[str | Path] | None = None,
+        image_prompt_type: str = "",
+        video_prompt_type: str = "",
+        config: str = "",
         **extra_settings,
     ) -> dict[str, Any]:
         """
@@ -375,6 +473,14 @@ class WanGPAgent:
             start_image: Path to start frame image (for i2v or guided generation).
             end_image: Path to end frame image.
             output_filename: Custom output filename.
+            reference_images: Reference images for models such as MiniMax H3
+                              Ref2VA and LTX-2 MSR.
+            image_prompt_type: Explicit start/end/continuation flags. ``S`` and
+                               ``E`` are inferred from ``start_image`` and
+                               ``end_image``.
+            video_prompt_type: Explicit reference/control flags. ``I`` is added
+                               when reference images are supplied.
+            config: Optional model config, including quantized text encoders.
             **extra_settings: Any additional WanGP settings.
 
         Returns:
@@ -399,10 +505,129 @@ class WanGPAgent:
         }
         if start_image:
             settings["image_start"] = start_image
+            image_prompt_type = _merge_prompt_flags(image_prompt_type, "S")
         if end_image:
             settings["image_end"] = end_image
+            image_prompt_type = _merge_prompt_flags(image_prompt_type, "E")
+        refs = _path_list(reference_images)
+        if refs:
+            settings["image_refs"] = refs
+            video_prompt_type = _merge_prompt_flags(video_prompt_type, "I")
+        if image_prompt_type:
+            settings["image_prompt_type"] = image_prompt_type
+        if video_prompt_type:
+            settings["video_prompt_type"] = video_prompt_type
+        if config:
+            settings["config"] = config
         settings.update(extra_settings)
         return self._run_task(settings)
+
+    def generate_minimax_h3(
+        self,
+        prompt: str,
+        model: str = "minimax_h3_fl2va",
+        resolution: str = "832x480",
+        steps: int = 20,
+        frames: int = 124,
+        seed: int = -1,
+        start_image: str | Path | None = None,
+        end_image: str | Path | None = None,
+        reference_images: list[str | Path] | None = None,
+        reference_videos: list[str | Path] | None = None,
+        reference_audios: list[str | Path] | None = None,
+        use_reference_video_soundtracks: bool = False,
+        text_encoder_config: str = "",
+        loras: list[str] | None = None,
+        loras_multipliers: str = "",
+        output_filename: str = "",
+        **extra_settings: Any,
+    ) -> dict[str, Any]:
+        """Generate native-audio video with a MiniMax H3 v12.41 model.
+
+        FL2VA accepts optional start/end boundary images. Ref2VA instead
+        accepts up to nine images, two videos, and two audio references.
+        Paths are interpreted on the WanGP server when using remote mode.
+        """
+        if model not in MINIMAX_H3_MODELS:
+            raise ValueError(f"unsupported MiniMax H3 model: {model}")
+        if text_encoder_config not in MINIMAX_H3_TEXT_ENCODER_CONFIGS:
+            choices = ", ".join(sorted(v for v in MINIMAX_H3_TEXT_ENCODER_CONFIGS if v))
+            raise ValueError(f"invalid MiniMax H3 text encoder config; choose one of: {choices}")
+
+        images = _path_list(reference_images)
+        videos = _path_list(reference_videos)
+        audios = _path_list(reference_audios)
+        is_reference_model = model in MINIMAX_H3_REF2VA_MODELS
+        if not is_reference_model:
+            if images or videos or audios or use_reference_video_soundtracks:
+                raise ValueError("MiniMax H3 references require a Ref2VA model")
+        else:
+            if start_image is not None or end_image is not None:
+                raise ValueError("MiniMax H3 Ref2VA does not accept start/end boundary images")
+            if len(images) > 9:
+                raise ValueError("MiniMax H3 Ref2VA accepts at most 9 reference images")
+            if len(videos) > 2:
+                raise ValueError("MiniMax H3 Ref2VA accepts at most 2 reference videos")
+            if len(audios) > 2:
+                raise ValueError("MiniMax H3 Ref2VA accepts at most 2 audio references")
+            if use_reference_video_soundtracks and audios:
+                raise ValueError("reference audio and reference-video soundtrack modes are mutually exclusive")
+            if use_reference_video_soundtracks and not videos:
+                raise ValueError("reference-video soundtrack mode requires a reference video")
+            audio_count = len(videos) if use_reference_video_soundtracks else len(audios)
+            visual_count = len(images) + len(videos)
+            if audio_count > visual_count:
+                raise ValueError("MiniMax H3 requires at least as many visual references as audio references")
+            file_count = visual_count + (0 if use_reference_video_soundtracks else len(audios))
+            if file_count == 0:
+                raise ValueError("MiniMax H3 Ref2VA requires at least one reference")
+            if file_count > 12:
+                raise ValueError("MiniMax H3 Ref2VA accepts at most 12 reference files")
+
+        video_prompt_type = ""
+        if len(videos) == 1:
+            video_prompt_type = "VG"
+        elif len(videos) == 2:
+            video_prompt_type = "V+G"
+        audio_prompt_type = ""
+        if use_reference_video_soundtracks:
+            audio_prompt_type = "K"
+        elif len(audios) == 1:
+            audio_prompt_type = "A"
+        elif len(audios) == 2:
+            audio_prompt_type = "AB"
+
+        if videos:
+            extra_settings["video_guide"] = videos[0]
+        if len(videos) > 1:
+            extra_settings["video_guide2"] = videos[1]
+        if audios:
+            extra_settings["audio_guide"] = audios[0]
+        if len(audios) > 1:
+            extra_settings["audio_guide2"] = audios[1]
+        if audio_prompt_type:
+            extra_settings["audio_prompt_type"] = audio_prompt_type
+
+        return self.generate_video(
+            prompt=prompt,
+            model=model,
+            resolution=resolution,
+            steps=steps,
+            frames=frames,
+            seed=seed,
+            guidance_scale=1.0,
+            flow_shift=12.0,
+            fps=24,
+            loras=loras,
+            loras_multipliers=loras_multipliers,
+            start_image=None if start_image is None else os.fspath(start_image),
+            end_image=None if end_image is None else os.fspath(end_image),
+            output_filename=output_filename,
+            reference_images=images,
+            video_prompt_type=video_prompt_type,
+            config=text_encoder_config,
+            **extra_settings,
+        )
 
     def generate_audio(
         self,
@@ -598,6 +823,107 @@ class WanGPAgent:
                 pass
         return families
 
+    def discover_models(
+        self,
+        *,
+        family: str | None = None,
+        capability: str | None = None,
+        input_modality: str | None = None,
+        output_modality: str | None = None,
+    ) -> dict[str, Any]:
+        """Return enriched model records suitable for building an API UI.
+
+        Filters accept comma-separated values. For example, request models
+        that consume images and return video with
+        ``input_modality="image", output_modality="video"``.
+        """
+        filters = {
+            "family": family,
+            "capability": capability,
+            "input": input_modality,
+            "output": output_modality,
+        }
+        if self._url:
+            import urllib.parse
+
+            query = urllib.parse.urlencode({k: v for k, v in filters.items() if v})
+            endpoint = "/api/models" + (f"?{query}" if query else "")
+            return self._remote_get(endpoint)
+
+        import agent_api_introspect
+
+        index_data = agent_api_introspect.build_index()
+        requested = {
+            key: {part.strip().casefold() for part in str(value or "").replace("|", ",").split(",") if part.strip()}
+            for key, value in filters.items()
+        }
+        records = []
+        families: dict[str, list[str]] = {}
+        for entry in index_data["models"].values():
+            metadata = entry.get("api_metadata") or {}
+            if requested["family"] and str(entry["family"]).casefold() not in requested["family"]:
+                continue
+            if requested["capability"] and str(entry["capability"]).casefold() not in requested["capability"]:
+                continue
+            if requested["input"] and not requested["input"].intersection(str(v).casefold() for v in metadata.get("inputs") or []):
+                continue
+            if requested["output"] and not requested["output"].intersection(str(v).casefold() for v in metadata.get("outputs") or []):
+                continue
+            record = agent_api_introspect.public_entry(entry, include_model_def=False)
+            records.append(record)
+            families.setdefault(entry["family"], []).append(entry["model_type"])
+        records.sort(key=lambda record: (record["family"], record["model_type"]))
+        return {
+            "models": records,
+            "families": families,
+            "filters": {key: sorted(value) for key, value in requested.items()},
+            "errors": index_data.get("errors") or [],
+        }
+
+    def get_model(self, model_type: str) -> dict[str, Any] | None:
+        """Return one enriched model record and its accepted settings."""
+        if self._url:
+            import urllib.parse
+
+            return self._remote_get(f"/api/models/{urllib.parse.quote(model_type)}")
+        import agent_api_introspect
+
+        entry = agent_api_introspect.get_model_entry(model_type)
+        return None if entry is None else agent_api_introspect.public_entry(entry)
+
+    def get_health(self) -> dict[str, Any]:
+        """Return dedicated server health, or a compact local-mode status."""
+        if self._url:
+            return self._remote_get("/api/health")
+        return {"status": "ok", "mode": "local", "root": str(self._root)}
+
+    def get_settings_schema(self) -> dict[str, Any]:
+        """Return typed registered settings plus freeform WanGP keys."""
+        if self._url:
+            return self._remote_get("/api/settings/schema")
+        import agent_api_introspect
+
+        registered = agent_api_introspect.get_settings_schema()
+        registered_keys = {entry["key"] for entry in registered}
+        freeform = [
+            {"key": key, "default": value, "type": type(value).__name__}
+            for key, value in self.get_default_settings().items()
+            if key not in registered_keys
+        ]
+        return {"registered": registered, "freeform": freeform}
+
+    def validate_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        """Dry-run validate settings without queueing a generation."""
+        if self._url:
+            return self._remote_post("/api/settings/validate", settings)
+        import agent_api_introspect
+
+        model_type = str(settings.get("model_type") or "")
+        if not model_type:
+            return {"valid": False, "error": "request must include model_type"}
+        error = agent_api_introspect.validate_request(model_type, settings)
+        return {"valid": error is None, **({"error": error} if error else {})}
+
     def list_loras(self, model_type: str = "z_image") -> list[str]:
         """
         List available lora files for a given model type.
@@ -681,6 +1007,28 @@ class WanGPAgent:
                     break
                 out.write(chunk)
         return local_path
+
+    def upload_file(
+        self,
+        local_path: str | Path,
+        *,
+        filename: str | None = None,
+    ) -> dict[str, Any]:
+        """Upload an image/video/audio input and return its server-side path.
+
+        Pass the returned ``path`` to ``reference_images``,
+        ``reference_videos``, ``reference_audios``, or other media settings.
+        In local mode no copy is needed and the resolved local path is returned.
+        """
+        path = Path(local_path).resolve()
+        if not self._url:
+            return {
+                "upload_id": None,
+                "filename": filename or path.name,
+                "path": str(path),
+                "bytes": path.stat().st_size,
+            }
+        return self._remote_multipart_file("/api/uploads", path, filename=filename)
 
 
 # ------------------------------------------------------------------ #

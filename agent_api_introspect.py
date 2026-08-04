@@ -294,6 +294,56 @@ def _resolution_choices(model_def: dict[str, Any]) -> list[str] | None:
     return None
 
 
+def _model_api_metadata(model_def: dict[str, Any]) -> dict[str, Any]:
+    """Return normalized media/capability metadata for API consumers.
+
+    WanGP already owns the inference rules in ``models.model_metadata``.
+    Reusing them here keeps the network API aligned with the Web UI as new
+    families add reference inputs, audiovisual outputs, or model configs.
+    """
+    try:
+        from models import model_metadata
+
+        main_outputs = model_metadata.infer_main_outputs(model_def)
+        outputs = model_metadata.infer_outputs(model_def)
+        inputs = model_metadata.infer_inputs(model_def)
+        media_inputs = model_metadata.infer_media_inputs(model_def)
+        capabilities = model_metadata.infer_capabilities(
+            model_def, main_outputs, outputs, inputs, media_inputs
+        )
+        setting_values = model_metadata.infer_setting_values(model_def)
+    except Exception:
+        capability = _capability_from_def(model_def, str(model_def.get("architecture") or ""))
+        main_outputs = [capability.split("-", 1)[0]]
+        outputs = list(main_outputs)
+        inputs = ["text"]
+        media_inputs = {}
+        capabilities = {}
+        setting_values = {}
+
+    configs = model_def.get("configs") or {}
+    config_choices = []
+    if isinstance(configs, dict):
+        for value, config_def in configs.items():
+            if str(value).startswith("_") or not isinstance(config_def, dict):
+                continue
+            config_choices.append({
+                "value": str(value),
+                "label": str(config_def.get("name") or value),
+            })
+
+    return {
+        "main_outputs": main_outputs,
+        "outputs": outputs,
+        "inputs": inputs,
+        "media_inputs": media_inputs,
+        "capabilities": capabilities,
+        "setting_values": setting_values,
+        "config_label": str(configs.get("_name") or "Config") if isinstance(configs, dict) else "Config",
+        "config_choices": config_choices,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public: rebuild & accessors
 # ---------------------------------------------------------------------------
@@ -330,6 +380,7 @@ def _build_one_model(
             "defaults": defaults,
             "applicable_settings": [],
             "resolution_choices": _resolution_choices(merged),
+            "api_metadata": _model_api_metadata(merged),
             "handler_loaded": False,
         }
     model_def = _merge_model_def(model_dict, handler, arch)
@@ -360,6 +411,7 @@ def _build_one_model(
         "defaults": defaults,
         "applicable_settings": _applicable_settings(model_def),
         "resolution_choices": _resolution_choices(model_def),
+        "api_metadata": _model_api_metadata(model_def),
         "handler_loaded": True,
     }
 
@@ -487,6 +539,7 @@ def public_entry(entry: dict[str, Any], *, include_model_def: bool = True) -> di
         "preload_urls": list(entry["preload_urls"]),
         "quant_variants": list(entry["quant_variants"]),
         "resolution_choices": entry["resolution_choices"],
+        "api_metadata": _make_json_safe(entry.get("api_metadata") or {}),
         "applicable_settings": entry["applicable_settings"],
         "defaults": _make_json_safe(entry["defaults"]),
         "handler_loaded": entry["handler_loaded"],

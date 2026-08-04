@@ -20,6 +20,7 @@ GET    /api/loras?model_type=...          — lora files for a model
 GET    /api/settings                      — global default settings template
 GET    /api/settings/schema               — typed settings schema (registered + freeform)
 POST   /api/settings/validate             — dry-run validate a request without queueing it
+POST   /api/uploads                       — upload an image/video/audio input for generation
 GET    /api/file?path=...                 — download a file (constrained to outputs root)
 
 POST   /api/jobs                          — create a job (returns immediately, validated)
@@ -76,7 +77,7 @@ curl http://192.168.1.199:8100/api/health
 ```json
 {
   "status": "ok",
-  "version": "0.3.1",
+  "version": "0.6.0",
   "uptime_seconds": 1234,
   "queue": {"running": 0, "queued": 0},
   "current_job_id": null,
@@ -107,6 +108,31 @@ There is no per-user identity, no rotation, no scopes. This is a LAN gate.
 ---
 
 ## Async job lifecycle (recommended)
+
+### Upload reference media
+
+Remote jobs reference files by their server-side paths. Upload local images,
+videos, or audio first, then use the returned `path` in the job payload:
+
+```bash
+curl -X POST http://192.168.1.199:8100/api/uploads \
+  -H 'Authorization: Bearer mysecret' \
+  -F 'file=@person.png'
+```
+
+```json
+{
+  "upload_id": "u_...",
+  "filename": "person.png",
+  "path": "/media/peter/AI/Wan2GP/outputs/uploads/u_.../person.png",
+  "bytes": 248193,
+  "mime_type": "image/png"
+}
+```
+
+Uploads are authenticated, limited to common image/video/audio extensions,
+stored below `WAN2GP_OUTPUTS_ROOT/uploads`, and capped at 1 GB by default.
+Set `WAN2GP_UPLOAD_MAX_BYTES` to change that cap.
 
 ### 1. Create a job
 
@@ -212,7 +238,86 @@ Then poll `/api/jobs/{id}` until `status: "completed"` and download via
 
 ---
 
-## New upstream models and Ideogram 4
+## WanGP v12.41 models
+
+The v0.6 API exposes normalized `inputs`, `outputs`, `media_inputs`,
+`capabilities`, and text-encoder `config_choices` for all models. These are
+derived from WanGP's own model metadata rather than a separate hard-coded API
+list.
+
+Important v12.41 model IDs:
+
+| Family | Model IDs | API notes |
+| --- | --- | --- |
+| MiniMax H3 FL2VA | `minimax_h3_fl2va`, `minimax_h3_fl2va_pruned` | Text/start/end image to video with native stereo audio. |
+| MiniMax H3 Ref2VA | `minimax_h3_ref2va`, `minimax_h3_ref2va_pruned` | Up to 9 image, 2 video, and 2 audio references. |
+| Krea 2 Edit | `krea2_raw_edit`, `krea2_turbo_edit` | Reference editing, masks, inpainting, and outpainting. |
+| LTX-2 MSR V2 | `ltx2_22B_msr_v2` | Supply 2–5 reference images; background first. |
+| Joy Echo Surgical | `joyai_echo_surgical` | Connected audiovisual shots with Joy memory commands. |
+| Shotplan | `shotplan_t2v`, `shotplan_t2v_2_2` | Prompt-relay ranges define planned shots. |
+
+### MiniMax H3 FL2VA payload
+
+```json
+{
+  "model_type": "minimax_h3_fl2va",
+  "prompt": "A cinematic jazz performance with synchronized dialogue and room sound.",
+  "resolution": "832x480",
+  "num_inference_steps": 20,
+  "video_length": 124,
+  "image_start": "/server/path/start.png",
+  "image_end": "/server/path/end.png",
+  "image_prompt_type": "SE",
+  "config": "int8"
+}
+```
+
+Valid H3 text-encoder configs are `bf16`, `int8`, `nvfp4_awq`,
+`gguf_q2_k`, and `gguf_q4_k_m`.
+
+### MiniMax H3 Ref2VA payload
+
+```json
+{
+  "model_type": "minimax_h3_ref2va_pruned",
+  "prompt": "Use the referenced person, motion, and voice in a new cinematic shot.",
+  "resolution": "832x480",
+  "num_inference_steps": 20,
+  "video_length": 124,
+  "image_refs": ["/server/path/person.png"],
+  "video_prompt_type": "IVG",
+  "video_guide": "/server/path/motion.mp4",
+  "audio_prompt_type": "A",
+  "audio_guide": "/server/path/voice.wav"
+}
+```
+
+Use `audio_prompt_type: "K"` to reuse the soundtrack of the reference
+video instead of supplying separate audio. Reference clips must satisfy the
+duration/count constraints returned by the model detail endpoint.
+
+### Krea 2 Edit and LTX MSR
+
+Krea 2 Identity Edit accepts reference images through `image_refs` and enables
+them with `video_prompt_type: "I"` or `"KI"`. For inpainting, also provide
+`image_guide`, `image_mask`, and an appropriate `model_mode` returned by
+`GET /api/models/{model_type}`.
+
+LTX MSR V2 uses:
+
+```json
+{
+  "model_type": "ltx2_22B_msr_v2",
+  "prompt": "The referenced subjects together in the referenced environment.",
+  "image_refs": ["background.png", "person.png"],
+  "video_prompt_type": "KI",
+  "resolution": "1280x720",
+  "video_length": 145,
+  "num_inference_steps": 8
+}
+```
+
+## Other upstream models and Ideogram 4
 
 Network nodes should not hard-code the old model list. After updating a node,
 call `GET /api/models` or `GET /api/models/{model_type}` and build the UI or
@@ -322,6 +427,14 @@ curl -H 'Authorization: Bearer mysecret' \
   http://192.168.1.199:8100/api/models
 ```
 
+Filter server-side with `family`, `capability`, `input`, and `output` query
+parameters. Values may be comma-separated:
+
+```bash
+curl -H 'Authorization: Bearer mysecret' \
+  'http://192.168.1.199:8100/api/models?input=image&output=video'
+```
+
 Every field below is **auto-derived**: from `defaults/<model_type>.json`,
 the family handler's `query_model_def()` feature flags, and a HEAD-cached
 HuggingFace lookup for `size_bytes`. Adding a new model is zero-work —
@@ -344,6 +457,13 @@ drop a new `defaults/<x>.json` and it appears here on next call.
       "size_bytes": 12309879106,
       "size_status": null,
       "quant_variants": ["bf16", "int8"],
+      "main_outputs": ["image"],
+      "outputs": ["image"],
+      "inputs": ["text"],
+      "media_inputs": {"image": {"reference": false}, "video": {}, "audio": {}},
+      "capabilities": {"text_to_image": true, "reference_images": false},
+      "config_label": "Config",
+      "config_choices": [],
       "applicable_settings_count": 3,
       "url_count": 2
     },
@@ -373,6 +493,9 @@ drop a new `defaults/<x>.json` and it appears here on next call.
 - `size_bytes`: HEAD-resolved size of the primary safetensors file. The first call to `/api/models` blocks briefly (≤4 s) to populate the cache; later calls are instant. Persisted to `~/.wan2gp/model_sizes.json` (override via `WAN2GP_SIZE_CACHE`).
 - `size_status`: `null` if cached cleanly, `"pending"` if still resolving, or an HTTP error string.
 - `quant_variants`: detected from filenames (`bf16`, `fp16`, `int8`, `fp4`, `q4_k_m`, etc.).
+- `inputs` / `outputs`: normalized media modalities used to build model pickers.
+- `media_inputs` / `capabilities`: detailed start/end/reference/control and generation-mode support.
+- `config_choices`: selectable checkpoint components such as H3 quantized text encoders or PrunaAI VAE.
 - `applicable_settings_count`: how many bounded/typed settings apply to this model. Use `GET /api/models/{model_type}` for the full list.
 
 ### Single model detail (`GET /api/models/{model_type}`)
@@ -398,6 +521,14 @@ that wants the precise schema of valid inputs for a specific model:
   "preload_urls": [],
   "quant_variants": ["bf16", "int8"],
   "resolution_choices": null,
+  "api_metadata": {
+    "main_outputs": ["image"],
+    "outputs": ["image"],
+    "inputs": ["text"],
+    "media_inputs": {},
+    "capabilities": {"text_to_image": true},
+    "config_choices": []
+  },
   "primary_size_bytes": 12309879106,
   "sizes": [
     {"url": "...", "bytes": 12309879106, "etag": "...", "fetched_at": "..."},
@@ -482,6 +613,24 @@ from agent_api import WanGPAgent
 
 agent = WanGPAgent(url="http://192.168.1.199:8100", token="mysecret")
 
+# Discover only models that accept images and produce video.
+models = agent.discover_models(input_modality="image", output_modality="video")
+
+# Upload references from the client machine.
+person = agent.upload_file("person.png")["path"]
+motion = agent.upload_file("motion.mp4")["path"]
+voice = agent.upload_file("voice.wav")["path"]
+
+# First-class MiniMax H3 helper.
+h3 = agent.generate_minimax_h3(
+    prompt="Use the referenced person, movement, and voice in a new shot.",
+    model="minimax_h3_ref2va_pruned",
+    reference_images=[person],
+    reference_videos=[motion],
+    reference_audios=[voice],
+    text_encoder_config="int8",
+)
+
 # Async job API
 job = agent.submit_job({
     "model_type": "z_image",
@@ -493,8 +642,8 @@ final = agent.wait_for_job(job["job_id"])
 if final["status"] == "completed":
     agent.download_file(final["files"][0], "fox.jpg")
 
-# Convenience wrappers (use legacy sync /api/generate under the hood,
-# now annotated with Deprecation: true)
+# Convenience wrappers submit through the asynchronous job API and wait for
+# the terminal job record.
 result = agent.generate_image(
     prompt="A sunset",
     model="z_image",
@@ -538,6 +687,7 @@ via `WAN2GP_JOB_DB`). On restart, jobs that were in `running` are marked
 | `WAN2GP_LOG_PROMPTS`  | _(unset)_                            | "1" to include prompt text in JSON logs.                     |
 | `WAN2GP_CORS_ORIGINS` | _(unset)_                            | Comma-separated origin allow-list, or `*`. Empty = CORS off. |
 | `WAN2GP_SIZE_CACHE`   | `~/.wan2gp/model_sizes.json`         | Persisted HEAD cache of model file sizes.                    |
+| `WAN2GP_UPLOAD_MAX_BYTES` | `1073741824` (1 GB)             | Maximum size accepted by `POST /api/uploads`.                |
 
 CLI flags on `agent_api.py serve` mirror the env vars: `--host`, `--port`,
 `--profile`, `--attention`, `--token`, `--outputs-root`, `--history-limit`,
@@ -549,6 +699,9 @@ CLI flags on `agent_api.py serve` mirror the env vars: `--host`, `--port`,
 
 - **One generation at a time** — the GPU is single-tenant; jobs queue rather
   than run in parallel.
+- **Uploaded inputs persist** — `/api/uploads` stores inputs below
+  `WAN2GP_OUTPUTS_ROOT/uploads`; remove old upload directories as part of the
+  node's normal storage-retention policy.
 - **No HTTPS** — terminate TLS in a reverse proxy if you ever expose this off
   LAN.
 - **Local in-process mode and the Gradio web UI cannot coexist** — either

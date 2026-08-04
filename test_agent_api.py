@@ -200,6 +200,32 @@ def test_image_settings():
     check("duration present", "duration_seconds" in result)
 
 
+def test_image_media_settings():
+    """Image helpers expose v12.41 references, controls, masks, and configs."""
+    print("\n--- Image Media Settings ---")
+    from agent_api import WanGPAgent
+
+    agent = WanGPAgent(verbose=False)
+    session = FakeSession()
+    agent._session = session
+    agent.generate_image(
+        prompt="Edit the subject",
+        model="krea2_raw_edit",
+        reference_images=["subject.png", "style.png"],
+        control_image="source.png",
+        mask_image="mask.png",
+        model_mode=2,
+        config="int8",
+    )
+    settings = session.submitted_tasks[-1]
+    check("image refs forwarded", settings["image_refs"] == ["subject.png", "style.png"])
+    check("image control forwarded", settings["image_guide"] == "source.png")
+    check("image mask forwarded", settings["image_mask"] == "mask.png")
+    check("image prompt flags inferred", all(flag in settings["video_prompt_type"] for flag in "IVAG"))
+    check("image model mode forwarded", settings["model_mode"] == 2)
+    check("image config forwarded", settings["config"] == "int8")
+
+
 def test_video_settings():
     """Test that generate_video assembles correct settings."""
     print("\n--- Video Settings ---")
@@ -238,6 +264,7 @@ def test_video_settings():
     check("force_fps as string", s["force_fps"] == "16")
     check("image_start", s["image_start"] == "/tmp/start.png")
     check("image_end", s["image_end"] == "/tmp/end.png")
+    check("start/end prompt flags", s["image_prompt_type"] == "SE")
     check("negative_prompt", s["negative_prompt"] == "blurry")
     check("duration_seconds default", s["duration_seconds"] == 0)
     check("result success", result["success"] is True)
@@ -389,6 +416,66 @@ def test_extra_settings():
     check("batch_size forwarded", s.get("batch_size") == 2)
 
 
+def test_minimax_h3_settings():
+    """MiniMax H3 helper builds FL2VA and Ref2VA canonical WanGP settings."""
+    print("\n--- MiniMax H3 Settings ---")
+    from agent_api import WanGPAgent
+
+    agent = WanGPAgent(verbose=False)
+    session = FakeSession()
+    agent._session = session
+
+    agent.generate_minimax_h3(
+        prompt="Boundary test",
+        start_image="start.png",
+        end_image="end.png",
+        text_encoder_config="gguf_q4_k_m",
+    )
+    fl2va = session.submitted_tasks[-1]
+    check("H3 FL2VA model", fl2va["model_type"] == "minimax_h3_fl2va")
+    check("H3 FL2VA native fps", fl2va["force_fps"] == "24")
+    check("H3 FL2VA start/end", fl2va["image_prompt_type"] == "SE")
+    check("H3 text encoder config", fl2va["config"] == "gguf_q4_k_m")
+
+    agent.generate_minimax_h3(
+        prompt="Reference test",
+        model="minimax_h3_ref2va_pruned",
+        reference_images=["person.png"],
+        reference_videos=["motion.mp4"],
+        reference_audios=["voice.wav"],
+    )
+    ref2va = session.submitted_tasks[-1]
+    check("H3 Ref2VA model", ref2va["model_type"] == "minimax_h3_ref2va_pruned")
+    check("H3 reference image", ref2va["image_refs"] == ["person.png"])
+    check("H3 reference video", ref2va["video_guide"] == "motion.mp4")
+    check("H3 reference audio", ref2va["audio_guide"] == "voice.wav")
+    check("H3 video reference flags", all(flag in ref2va["video_prompt_type"] for flag in "VGI"))
+    check("H3 audio reference flags", ref2va["audio_prompt_type"] == "A")
+
+    agent.generate_minimax_h3(
+        prompt="Soundtrack test",
+        model="minimax_h3_ref2va",
+        reference_videos=["clip.mp4"],
+        use_reference_video_soundtracks=True,
+    )
+    soundtrack = session.submitted_tasks[-1]
+    check("H3 soundtrack mode", soundtrack["audio_prompt_type"] == "K")
+
+    invalid_cases = [
+        {"model": "z_image"},
+        {"model": "minimax_h3_fl2va", "reference_images": ["x.png"]},
+        {"model": "minimax_h3_ref2va"},
+        {"model": "minimax_h3_ref2va", "reference_audios": ["voice.wav"]},
+    ]
+    for index, kwargs in enumerate(invalid_cases, 1):
+        try:
+            agent.generate_minimax_h3(prompt="invalid", **kwargs)
+        except ValueError:
+            check(f"H3 invalid case {index}", True)
+        else:
+            check(f"H3 invalid case {index}", False)
+
+
 def test_verbose_progress(capsys=None):
     """Test that verbose mode processes progress events without error."""
     print("\n--- Verbose Progress ---")
@@ -501,11 +588,14 @@ def test_settings_keys_match_api():
         "model_type", "prompt", "resolution", "num_inference_steps",
         "seed", "guidance_scale", "negative_prompt", "image_mode",
         "activated_loras", "loras_multipliers", "output_filename",
+        "image_refs", "image_guide", "image_mask", "video_prompt_type",
+        "model_mode", "config",
     }
     # Keys that generate_video adds
     video_keys = image_keys | {
         "video_length", "duration_seconds", "flow_shift", "force_fps",
-        "image_start", "image_end",
+        "image_start", "image_end", "image_prompt_type", "video_guide",
+        "video_guide2", "audio_guide", "audio_guide2", "audio_prompt_type",
     }
     # Keys that generate_audio uses
     audio_keys = {"model_type", "prompt", "seed", "output_filename", "audio_source"}
@@ -555,6 +645,32 @@ def test_capability_classification():
         _capability_from_def({"audio_only": True, "returns_audio": True}, "tts")
         == "audio-generation",
     )
+
+
+def test_api_model_metadata():
+    """Discovery metadata describes multimodal inputs, outputs, and configs."""
+    print("\n--- API Model Metadata ---")
+    from agent_api_introspect import _model_api_metadata
+
+    metadata = _model_api_metadata({
+        "architecture": "minimax_h3_ref2va",
+        "returns_audio": True,
+        "multimedia_generation": True,
+        "any_audio_prompt": True,
+        "image_ref_choices": {"choices": [("References", "I")]},
+        "guide_custom_choices": {"choices": [("Reference Video", "VG")]},
+        "configs": {
+            "_name": "Text Encoder",
+            "int8": {"name": "Qwen3-VL Quanto INT8"},
+            "gguf_q4_k_m": {"name": "Qwen3-VL GGUF Q4_K_M"},
+        },
+    })
+    check("metadata inputs", set(metadata["inputs"]) == {"text", "image", "video", "audio"})
+    check("metadata audiovisual outputs", metadata["outputs"] == ["video", "audio"])
+    check("metadata reference images", metadata["capabilities"]["reference_images"] is True)
+    check("metadata control/reference video", metadata["capabilities"]["control_video"] is True)
+    check("metadata config label", metadata["config_label"] == "Text Encoder")
+    check("metadata config choices", [c["value"] for c in metadata["config_choices"]] == ["int8", "gguf_q4_k_m"])
 
 
 # ------------------------------------------------------------------ #
@@ -611,6 +727,62 @@ def test_serve_importable():
     check("serve callable", callable(serve))
 
 
+def test_upload_route():
+    """The real upload handler accepts authenticated media and stores it safely."""
+    print("\n--- Upload Route ---")
+    import tempfile
+    import threading
+    import time as _time
+    import urllib.error
+    from unittest.mock import MagicMock
+    from agent_api import WanGPAgent
+    from agent_api_server import _Server, _build_handler
+
+    previous_root = os.environ.get("WAN2GP_OUTPUTS_ROOT")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        os.environ["WAN2GP_OUTPUTS_ROOT"] = tmp_dir
+        handler = _build_handler(
+            agent=MagicMock(),
+            store=MagicMock(),
+            worker=MagicMock(),
+            token="upload-secret",
+            started_at=_time.time(),
+            cors_allowed=set(),
+            cors_wildcard=False,
+        )
+        server = _Server(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            source = Path(tmp_dir) / "source.png"
+            source.write_bytes(b"reference-bytes")
+            agent = WanGPAgent(
+                url=f"http://127.0.0.1:{server.server_port}",
+                token="upload-secret",
+            )
+            uploaded = agent.upload_file(source)
+            uploaded_path = Path(uploaded["path"])
+            check("upload id", uploaded["upload_id"].startswith("u_"))
+            check("upload stored below root", Path(tmp_dir).resolve() in uploaded_path.parents)
+            check("upload bytes preserved", uploaded_path.read_bytes() == b"reference-bytes")
+
+            unsupported = Path(tmp_dir) / "bad.txt"
+            unsupported.write_text("not media")
+            try:
+                agent.upload_file(unsupported)
+            except urllib.error.HTTPError as error:
+                check("upload rejects unsupported type", error.code == 415)
+            else:
+                check("upload rejects unsupported type", False)
+        finally:
+            server.shutdown()
+            server.server_close()
+    if previous_root is None:
+        os.environ.pop("WAN2GP_OUTPUTS_ROOT", None)
+    else:
+        os.environ["WAN2GP_OUTPUTS_ROOT"] = previous_root
+
+
 def test_remote_roundtrip():
     """Start a mock server, connect a remote client, exercise all endpoints."""
     print("\n--- Remote Roundtrip ---")
@@ -626,11 +798,15 @@ def test_remote_roundtrip():
             if p == '/api/health':
                 self._ok({"status": "ok"})
             elif p == '/api/models':
-                self._ok({"TestFamily": ["test_model"]})
+                self._ok({"models": [{"model_type": "test_model"}], "families": {"TestFamily": ["test_model"]}})
+            elif p == '/api/models/test_model':
+                self._ok({"model_type": "test_model", "inputs": ["text"]})
             elif p == '/api/loras':
                 self._ok(["lora1.safetensors"])
             elif p == '/api/settings':
                 self._ok({"prompt": "", "seed": -1})
+            elif p == '/api/settings/schema':
+                self._ok({"registered": [], "freeform": []})
             elif p == '/api/jobs/mock-job':
                 self._ok({
                     "job_id": "mock-job",
@@ -645,9 +821,21 @@ def test_remote_roundtrip():
         def do_POST(self):
             p = self.path.split('?')[0]
             n = int(self.headers.get('Content-Length', 0))
-            body = json.loads(self.rfile.read(n)) if n else {}
+            raw = self.rfile.read(n) if n else b""
+            if p == '/api/uploads':
+                self._ok({
+                    "upload_id": "u_mock",
+                    "filename": "reference.png",
+                    "path": "/tmp/uploads/u_mock/reference.png",
+                    "bytes": len(raw),
+                    "mime_type": "image/png",
+                })
+                return
+            body = json.loads(raw) if raw else {}
             if p == '/api/jobs':
                 self._ok({"job_id": "mock-job", "status": "queued", "request": body})
+            elif p == '/api/settings/validate':
+                self._ok({"valid": bool(body.get("model_type"))})
             elif p == '/api/batch':
                 count = len(body) if isinstance(body, list) else 1
                 self._ok({
@@ -696,15 +884,28 @@ def test_remote_roundtrip():
 
         health = agent._remote_get('/api/health')
         check("health", health == {"status": "ok"})
+        check("health helper", agent.get_health() == {"status": "ok"})
 
         models = agent.list_models()
-        check("list_models", models == {"TestFamily": ["test_model"]})
+        check("list_models", models["families"] == {"TestFamily": ["test_model"]})
+        discovered = agent.discover_models(input_modality="image", output_modality="video")
+        check("discover_models", discovered["models"][0]["model_type"] == "test_model")
+        check("get_model", agent.get_model("test_model")["model_type"] == "test_model")
+        check("settings schema", agent.get_settings_schema() == {"registered": [], "freeform": []})
+        check("validate settings", agent.validate_settings({"model_type": "test_model"})["valid"] is True)
 
         loras = agent.list_loras("z_image")
         check("list_loras", loras == ["lora1.safetensors"])
 
         settings = agent.get_default_settings()
         check("settings", "prompt" in settings)
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            upload_source = Path(tmp_dir) / "reference.png"
+            upload_source.write_bytes(b"fake-png")
+            uploaded = agent.upload_file(upload_source)
+        check("upload file", uploaded["path"] == "/tmp/uploads/u_mock/reference.png")
 
         r = agent.generate_image(prompt="test")
         check("generate_image success", r["success"] is True)
@@ -744,6 +945,7 @@ if __name__ == "__main__":
 
     test_construction()
     test_image_settings()
+    test_image_media_settings()
     test_video_settings()
     test_video_no_images()
     test_audio_settings()
@@ -752,6 +954,7 @@ if __name__ == "__main__":
     test_server_edit_validation()
     test_batch()
     test_extra_settings()
+    test_minimax_h3_settings()
     test_verbose_progress()
     test_error_result()
     test_close_resets_session()
@@ -759,11 +962,13 @@ if __name__ == "__main__":
     test_default_settings_file()
     test_settings_keys_match_api()
     test_capability_classification()
+    test_api_model_metadata()
     test_remote_construction()
     test_remote_ensure_session_noop()
     test_remote_close_noop()
     test_download_file_local()
     test_serve_importable()
+    test_upload_route()
     test_remote_roundtrip()
 
     print("\n" + "=" * 60)

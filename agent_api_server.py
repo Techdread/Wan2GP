@@ -14,6 +14,7 @@ Async-job HTTP layer in front of the in-process WanGP runtime. Provides:
   - GET    /api/models            — model_type entries with capability hints
   - GET    /api/loras             — loras for a model_type
   - GET    /api/settings          — default settings template
+  - POST   /api/uploads           — upload image/video/audio inputs for jobs
   - POST   /api/release           — release VRAM
   - GET    /api/file              — download (constrained to outputs root)
   - POST   /api/transcribe        — submit audio for Whisper transcription (multipart)
@@ -28,6 +29,7 @@ Configuration (env vars):
   WAN2GP_JOB_DB         — SQLite job log path (default: ~/.wan2gp/jobs.sqlite).
   WAN2GP_LOG_PROMPTS    — "1" to include prompt text in logs (default: off).
   WAN2GP_JOB_HISTORY    — number of jobs to retain in DB (default: 200).
+  WAN2GP_UPLOAD_MAX_BYTES — maximum input upload size (default: 1 GB).
   WHISPER_BIN           — path to the whisper CLI (default: "whisper").
 """
 
@@ -56,7 +58,7 @@ from typing import Any
 
 
 WANGP_ROOT = Path(__file__).resolve().parent
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
 
 # Auto-derived schema + size cache live in their own modules so this file
 # stays focused on HTTP plumbing.
@@ -153,6 +155,12 @@ WHISPER_MODEL_TYPES = tuple(f"whisper-{m}" for m in WHISPER_MODEL_NAMES)
 WHISPER_BIN = os.environ.get("WHISPER_BIN", "whisper")
 TRANSCRIPTION_FORMATS = ("txt", "json", "srt", "vtt", "tsv")
 TRANSCRIPTION_CAPABILITY = "transcription"
+UPLOAD_MAX_BYTES = int(os.environ.get("WAN2GP_UPLOAD_MAX_BYTES", 1024 * 1024 * 1024))
+UPLOAD_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif",
+    ".mp4", ".mov", ".mkv", ".webm", ".avi",
+    ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac",
+}
 EDIT_MODE_CAPABILITIES = {
     "edit_postprocessing": "media-postprocessing",
     "edit_remux": "audio-remux",
@@ -179,7 +187,7 @@ def capability_for_model_type(model_type: str) -> str:
     except Exception:
         pass
     mt = model_type.lower()
-    if any(tag in mt for tag in ("t2v", "i2v", "v2v", "video", "hunyuan", "ltx", "longcat", "magi")):
+    if any(tag in mt for tag in ("t2v", "i2v", "v2v", "video", "hunyuan", "ltx", "longcat", "magi", "minimax", "shotplan")):
         return "video-generation"
     if any(tag in mt for tag in ("tts", "audio", "ace_step", "heartmula", "kugel", "chatterbox")):
         return "audio-generation"
@@ -1199,7 +1207,13 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
                 # populated on the cold-cache path. After that the size cache
                 # is warm and resolves instantly.
                 wait = 4.0 if not _api_models_warmed.is_set() else 0.0
-                self._json(200, _models_payload(wait_for_sizes=wait))
+                self._json(200, _models_payload(
+                    wait_for_sizes=wait,
+                    family=qs.get("family"),
+                    capability=qs.get("capability"),
+                    input_modality=qs.get("input"),
+                    output_modality=qs.get("output"),
+                ))
                 _api_models_warmed.set()
                 return 200
             if path.startswith("/api/models/"):
@@ -1282,6 +1296,8 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
                 return 200
             if path == "/api/transcribe":
                 return self._route_transcribe()
+            if path == "/api/uploads":
+                return self._route_upload()
             if path == "/api/generate":
                 return self._legacy_generate()
             if path == "/api/batch":
@@ -1417,6 +1433,58 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
             store.assign_queue_positions()
             self._json(202, store.get(rec.job_id).to_dict())
             return 202
+
+        def _route_upload(self) -> int:
+            """Store a media input below the constrained outputs root."""
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.lower().startswith("multipart/form-data"):
+                self._json(400, {"error": "expected multipart/form-data"})
+                return 400
+            n = int(self.headers.get("Content-Length", 0))
+            if n <= 0:
+                self._json(400, {"error": "empty body"})
+                return 400
+            if n > UPLOAD_MAX_BYTES:
+                self._json(413, {"error": f"upload too large ({UPLOAD_MAX_BYTES} byte cap)"})
+                return 413
+            try:
+                fields, files = _parse_multipart(content_type, self.rfile.read(n))
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+                return 400
+            file_part = files.get("file")
+            if not file_part:
+                self._json(400, {"error": "missing 'file' field"})
+                return 400
+            safe_name = _safe_filename(fields.get("filename") or file_part["filename"])
+            if Path(safe_name).suffix.casefold() not in UPLOAD_EXTENSIONS:
+                self._json(415, {"error": "unsupported media file type"})
+                return 415
+            upload_id = f"u_{uuid.uuid4().hex}"
+            upload_dir = outputs_root / "uploads" / upload_id
+            try:
+                upload_dir.mkdir(parents=True, exist_ok=False)
+                upload_path = upload_dir / safe_name
+                upload_path.write_bytes(file_part["data"])
+            except Exception as exc:
+                self._json(500, {"error": f"could not store upload: {exc}"})
+                return 500
+            payload = {
+                "upload_id": upload_id,
+                "filename": safe_name,
+                "path": str(upload_path.resolve()),
+                "bytes": len(file_part["data"]),
+                "mime_type": file_part.get("mime_type"),
+            }
+            log_event(
+                "media_uploaded",
+                request_id=self._current_request_id,
+                upload_id=upload_id,
+                filename=safe_name,
+                bytes=payload["bytes"],
+            )
+            self._json(201, payload)
+            return 201
 
         def _serve_file(self, qs: dict[str, str]) -> int:
             fp = qs.get("path", "")
@@ -1638,6 +1706,7 @@ def _legacy_payload(rec: JobRecord | None) -> dict[str, Any]:
 def _summary_entry(entry: dict[str, Any], size_lookup: dict[str, dict[str, Any] | None]) -> dict[str, Any]:
     """Compact per-model entry for the /api/models list response."""
     defaults = entry.get("defaults") or {}
+    api_metadata = entry.get("api_metadata") or {}
     primary_url = entry["urls"][0] if entry["urls"] else None
     size_info = size_lookup.get(primary_url) if primary_url else None
     return {
@@ -1654,6 +1723,13 @@ def _summary_entry(entry: dict[str, Any], size_lookup: dict[str, dict[str, Any] 
         "size_bytes": (size_info or {}).get("bytes") if size_info else None,
         "size_status": (size_info or {}).get("error") if size_info else "pending",
         "quant_variants": entry["quant_variants"],
+        "main_outputs": api_metadata.get("main_outputs") or [],
+        "outputs": api_metadata.get("outputs") or [],
+        "inputs": api_metadata.get("inputs") or [],
+        "media_inputs": api_metadata.get("media_inputs") or {},
+        "capabilities": api_metadata.get("capabilities") or {},
+        "config_label": api_metadata.get("config_label") or "Config",
+        "config_choices": api_metadata.get("config_choices") or [],
         "applicable_settings_count": len(entry.get("applicable_settings") or []),
         "url_count": len(entry["urls"]),
     }
@@ -1667,7 +1743,22 @@ def _families_legacy(index: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
     return families
 
 
-def _models_payload(*, wait_for_sizes: float = 0.0) -> dict[str, Any]:
+def _filter_values(value: str | None) -> set[str]:
+    return {
+        part.strip().casefold()
+        for part in str(value or "").replace("|", ",").split(",")
+        if part.strip()
+    }
+
+
+def _models_payload(
+    *,
+    wait_for_sizes: float = 0.0,
+    family: str | None = None,
+    capability: str | None = None,
+    input_modality: str | None = None,
+    output_modality: str | None = None,
+) -> dict[str, Any]:
     """Build the /api/models response, with a brief HEAD-cache warm-up on
     first call so size_bytes is populated when cheap to obtain."""
     index_data = agent_api_introspect.build_index()
@@ -1675,10 +1766,28 @@ def _models_payload(*, wait_for_sizes: float = 0.0) -> dict[str, Any]:
     all_primary_urls = [e["urls"][0] for e in index.values() if e["urls"]]
     size_lookup = agent_api_sizes.resolve_sizes(all_primary_urls, wait_seconds=wait_for_sizes)
     models_list = [_summary_entry(entry, size_lookup) for entry in index.values()]
+    family_filter = _filter_values(family)
+    capability_filter = _filter_values(capability)
+    input_filter = _filter_values(input_modality)
+    output_filter = _filter_values(output_modality)
+    if family_filter:
+        models_list = [m for m in models_list if str(m["family"]).casefold() in family_filter]
+    if capability_filter:
+        models_list = [m for m in models_list if str(m["capability"]).casefold() in capability_filter]
+    if input_filter:
+        models_list = [m for m in models_list if input_filter.intersection(str(v).casefold() for v in m["inputs"])]
+    if output_filter:
+        models_list = [m for m in models_list if output_filter.intersection(str(v).casefold() for v in m["outputs"])]
     models_list.sort(key=lambda m: (m["family"], m["model_type"]))
     return {
         "models": models_list,
-        "families": _families_legacy(index),
+        "families": _families_legacy({m["model_type"]: index[m["model_type"]] for m in models_list}),
+        "filters": {
+            "family": sorted(family_filter),
+            "capability": sorted(capability_filter),
+            "input": sorted(input_filter),
+            "output": sorted(output_filter),
+        },
         "errors": index_data.get("errors") or [],
     }
 
