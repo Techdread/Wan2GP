@@ -673,6 +673,57 @@ def test_api_model_metadata():
     check("metadata config choices", [c["value"] for c in metadata["config_choices"]] == ["int8", "gguf_q4_k_m"])
 
 
+def test_transcription_runtime_failures():
+    """Whisper discovery is explicit and one failed job cannot kill the worker."""
+    print("\n--- Transcription Runtime Failures ---")
+    import tempfile
+    import time
+    import agent_api_server as server
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        fake_whisper = Path(tmp_dir) / ("whisper.exe" if os.name == "nt" else "whisper")
+        fake_whisper.write_bytes(b"")
+        with patch.dict(os.environ, {"WHISPER_BIN": str(fake_whisper)}):
+            check("configured Whisper resolved", server._resolve_whisper_bin() == str(fake_whisper.resolve()))
+
+        rec = server.JobRecord(
+            job_id="j_test_transcription_failure",
+            capability=server.TRANSCRIPTION_CAPABILITY,
+            model_type="whisper-turbo",
+            request_id="req_transcription_failure",
+            request={"model_type": "whisper-turbo"},
+            created_at="2026-01-01T00:00:00Z",
+        )
+
+        class MemoryStore:
+            def get(self, job_id):
+                return rec if job_id == rec.job_id else None
+
+            def update(self, job_id, **fields):
+                if job_id != rec.job_id:
+                    return None
+                for key, value in fields.items():
+                    setattr(rec, key, value)
+                return rec
+
+            def assign_queue_positions(self):
+                pass
+
+        store = MemoryStore()
+        with patch.object(server.JobWorker, "_run_transcription", side_effect=FileNotFoundError("missing test binary")):
+            worker = server.JobWorker(agent=MagicMock(), store=store)
+            worker.submit(rec.job_id)
+            deadline = time.time() + 2
+            while time.time() < deadline and store.get(rec.job_id).status != "failed":
+                time.sleep(0.01)
+
+            failed_rec = store.get(rec.job_id)
+            check("launch failure marks job failed", failed_rec.status == "failed", failed_rec.status)
+            check("launch failure is reported", "missing test binary" in (failed_rec.error or ""))
+            check("worker survives launch failure", worker._thread.is_alive())
+            worker._queue.join()
+
+
 # ------------------------------------------------------------------ #
 #  Remote mode tests
 # ------------------------------------------------------------------ #
@@ -963,6 +1014,7 @@ if __name__ == "__main__":
     test_settings_keys_match_api()
     test_capability_classification()
     test_api_model_metadata()
+    test_transcription_runtime_failures()
     test_remote_construction()
     test_remote_ensure_session_noop()
     test_remote_close_noop()

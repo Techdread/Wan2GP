@@ -41,6 +41,7 @@ import os
 import queue
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -152,7 +153,6 @@ def make_request_id() -> str:
 
 WHISPER_MODEL_NAMES = ("tiny", "base", "small", "medium", "large", "turbo")
 WHISPER_MODEL_TYPES = tuple(f"whisper-{m}" for m in WHISPER_MODEL_NAMES)
-WHISPER_BIN = os.environ.get("WHISPER_BIN", "whisper")
 TRANSCRIPTION_FORMATS = ("txt", "json", "srt", "vtt", "tsv")
 TRANSCRIPTION_CAPABILITY = "transcription"
 UPLOAD_MAX_BYTES = int(os.environ.get("WAN2GP_UPLOAD_MAX_BYTES", 1024 * 1024 * 1024))
@@ -170,6 +170,49 @@ EDIT_MODE_CAPABILITIES = {
 
 def is_transcription_model_type(model_type: str) -> bool:
     return isinstance(model_type, str) and model_type.startswith("whisper-")
+
+
+def _resolve_whisper_bin() -> str:
+    """Resolve the Whisper CLI without requiring a machine-wide PATH entry."""
+    configured = str(os.environ.get("WHISPER_BIN") or "").strip()
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if configured_path.is_file():
+            return str(configured_path.resolve())
+        resolved = shutil.which(configured)
+        if resolved:
+            return resolved
+        raise FileNotFoundError(f"WHISPER_BIN does not point to an executable: {configured}")
+
+    executable_name = "whisper.exe" if os.name == "nt" else "whisper"
+    candidates = (
+        Path(sys.executable).resolve().parent / executable_name,
+        WANGP_ROOT / "venv" / ("Scripts" if os.name == "nt" else "bin") / executable_name,
+        WANGP_ROOT / ".python311" / ("Scripts" if os.name == "nt" else "bin") / executable_name,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+
+    resolved = shutil.which("whisper")
+    if resolved:
+        return resolved
+    raise FileNotFoundError(
+        "Whisper CLI not found. Install openai-whisper in the API environment "
+        "or set WHISPER_BIN to its executable path."
+    )
+
+
+def _prepare_transcription_environment() -> str:
+    """Ensure Wan2GP's FFmpeg binaries are on PATH and return the Whisper CLI."""
+    from shared.ffmpeg_setup import download_ffmpeg
+
+    download_ffmpeg()
+    if not shutil.which("ffmpeg"):
+        raise FileNotFoundError(
+            "FFmpeg not found after Wan2GP setup. Check the ffmpeg_bins directory."
+        )
+    return _resolve_whisper_bin()
 
 
 def capability_for_model_type(model_type: str) -> str:
@@ -506,13 +549,47 @@ class JobWorker:
     def _run_loop(self) -> None:
         while True:
             job_id = self._queue.get()
-            rec = self._store.get(job_id)
-            if rec is None or rec.status != "queued":
-                continue
-            if rec.capability == TRANSCRIPTION_CAPABILITY:
-                self._run_transcription(rec)
-            else:
-                self._run_one(rec)
+            rec = None
+            try:
+                rec = self._store.get(job_id)
+                if rec is None or rec.status != "queued":
+                    continue
+                if rec.capability == TRANSCRIPTION_CAPABILITY:
+                    self._run_transcription(rec)
+                else:
+                    self._run_one(rec)
+            except Exception as exc:
+                # A single bad launch or runtime failure must never kill the
+                # serial worker and leave this and all later jobs stranded.
+                if rec is not None:
+                    duration = None
+                    if rec.started_at:
+                        try:
+                            started_at = datetime.fromisoformat(rec.started_at.replace("Z", "+00:00"))
+                            duration = round((datetime.now(timezone.utc) - started_at).total_seconds(), 2)
+                        except Exception:
+                            pass
+                    self._store.update(
+                        rec.job_id,
+                        status="failed",
+                        completed_at=_now_iso(),
+                        duration_seconds=duration,
+                        error=f"worker error: {type(exc).__name__}: {exc}",
+                    )
+                    log_event(
+                        "job_failed",
+                        level="error",
+                        job_id=rec.job_id,
+                        request_id=rec.request_id,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+            finally:
+                with self._lock:
+                    if self._current_job_id == job_id:
+                        self._current_job_id = None
+                        self._current_session_job = None
+                self._store.assign_queue_positions()
+                self._queue.task_done()
 
     def _run_transcription(self, rec: JobRecord) -> None:
         """Run a Whisper CLI subprocess for a transcription job.
@@ -562,8 +639,9 @@ class JobWorker:
         duration_sec = float(request.get("duration_sec") or 0)
         job_dir = Path(audio_path).parent
 
+        whisper_bin = _prepare_transcription_environment()
         cmd = [
-            WHISPER_BIN,
+            whisper_bin,
             audio_path,
             "--model", model_name,
             "--output_dir", str(job_dir),
