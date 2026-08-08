@@ -213,6 +213,9 @@ curl -L -H 'Authorization: Bearer mysecret' -o fox.jpg \
 `/api/file` rejects anything outside `WAN2GP_OUTPUTS_ROOT`
 (default `/media/peter/AI/Wan2GP/outputs`). Symlink escapes and `..`
 traversal are checked via `realpath` and return `403`.
+Responses use the file's media type (`audio/wav`, `audio/mpeg`,
+`video/mp4`, and so on), allowing authenticated browser clients to turn the
+downloaded Blob into an inline image, video, or audio preview.
 
 ---
 

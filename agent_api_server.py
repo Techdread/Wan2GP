@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import mimetypes
 import os
 import queue
 import re
@@ -60,6 +61,27 @@ from typing import Any
 
 WANGP_ROOT = Path(__file__).resolve().parent
 SERVER_VERSION = "0.6.0"
+
+_MEDIA_MIME_TYPES = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".oga": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".weba": "audio/webm",
+}
+
+
+def _content_type_for_path(path: Path) -> str:
+    """Return a browser-playable MIME type for generated media."""
+    return (
+        _MEDIA_MIME_TYPES.get(path.suffix.casefold())
+        or mimetypes.guess_type(path.name)[0]
+        or "application/octet-stream"
+    )
 
 # Auto-derived schema + size cache live in their own modules so this file
 # stays focused on HTTP plumbing.
@@ -1585,10 +1607,11 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
             try:
                 size = real.stat().st_size
                 self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Type", _content_type_for_path(real))
                 self.send_header("Content-Length", str(size))
                 self.send_header("Content-Disposition",
                                  f'attachment; filename="{real.name}"')
+                self.send_header("X-Content-Type-Options", "nosniff")
                 for key, value in self._cors_headers().items():
                     self.send_header(key, value)
                 self.end_headers()
