@@ -60,7 +60,17 @@ from typing import Any
 
 
 WANGP_ROOT = Path(__file__).resolve().parent
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.7.0"
+
+
+def _wangp_version() -> str | None:
+    """Read the installed core version without initializing CUDA or models."""
+    try:
+        source = (WANGP_ROOT / "wgp.py").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(r'^WanGP_version\s*=\s*[\'"]([^\'"]+)[\'"]', source, re.MULTILINE)
+    return match.group(1) if match else None
 
 _MEDIA_MIME_TYPES = {
     ".wav": "audio/wav",
@@ -1434,6 +1444,7 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
             payload: dict[str, Any] = {
                 "status": "ok",
                 "version": SERVER_VERSION,
+                "wangp_version": _wangp_version(),
                 "uptime_seconds": int(time.time() - started_at),
                 "queue": {
                     "running": 1 if running is not None else 0,

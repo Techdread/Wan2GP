@@ -542,10 +542,10 @@ class WanGPAgent:
         output_filename: str = "",
         **extra_settings: Any,
     ) -> dict[str, Any]:
-        """Generate native-audio video with a MiniMax H3 v12.41 model.
+        """Generate native-audio video with a MiniMax H3 model.
 
-        FL2VA accepts optional start/end boundary images. Ref2VA instead
-        accepts up to nine images, two videos, and two audio references.
+        Both modes accept optional start/end boundary images. Ref2VA also
+        accepts up to nine images, three videos, and three audio references.
         Paths are interpreted on the WanGP server when using remote mode.
         """
         if model not in MINIMAX_H3_MODELS:
@@ -562,14 +562,12 @@ class WanGPAgent:
             if images or videos or audios or use_reference_video_soundtracks:
                 raise ValueError("MiniMax H3 references require a Ref2VA model")
         else:
-            if start_image is not None or end_image is not None:
-                raise ValueError("MiniMax H3 Ref2VA does not accept start/end boundary images")
             if len(images) > 9:
                 raise ValueError("MiniMax H3 Ref2VA accepts at most 9 reference images")
-            if len(videos) > 2:
-                raise ValueError("MiniMax H3 Ref2VA accepts at most 2 reference videos")
-            if len(audios) > 2:
-                raise ValueError("MiniMax H3 Ref2VA accepts at most 2 audio references")
+            if len(videos) > 3:
+                raise ValueError("MiniMax H3 Ref2VA accepts at most 3 reference videos")
+            if len(audios) > 3:
+                raise ValueError("MiniMax H3 Ref2VA accepts at most 3 audio references")
             if use_reference_video_soundtracks and audios:
                 raise ValueError("reference audio and reference-video soundtrack modes are mutually exclusive")
             if use_reference_video_soundtracks and not videos:
@@ -579,16 +577,16 @@ class WanGPAgent:
             if audio_count > visual_count:
                 raise ValueError("MiniMax H3 requires at least as many visual references as audio references")
             file_count = visual_count + (0 if use_reference_video_soundtracks else len(audios))
-            if file_count == 0:
-                raise ValueError("MiniMax H3 Ref2VA requires at least one reference")
             if file_count > 12:
                 raise ValueError("MiniMax H3 Ref2VA accepts at most 12 reference files")
 
         video_prompt_type = ""
         if len(videos) == 1:
-            video_prompt_type = "VG"
+            video_prompt_type = "V-U"
         elif len(videos) == 2:
-            video_prompt_type = "V+G"
+            video_prompt_type = "V+-U"
+        elif len(videos) == 3:
+            video_prompt_type = "V+*-U"
         audio_prompt_type = ""
         if use_reference_video_soundtracks:
             audio_prompt_type = "K"
@@ -596,15 +594,21 @@ class WanGPAgent:
             audio_prompt_type = "A"
         elif len(audios) == 2:
             audio_prompt_type = "AB"
+        elif len(audios) == 3:
+            audio_prompt_type = "ABD"
 
         if videos:
             extra_settings["video_guide"] = videos[0]
         if len(videos) > 1:
             extra_settings["video_guide2"] = videos[1]
+        if len(videos) > 2:
+            extra_settings["video_guide3"] = videos[2]
         if audios:
             extra_settings["audio_guide"] = audios[0]
         if len(audios) > 1:
             extra_settings["audio_guide2"] = audios[1]
+        if len(audios) > 2:
+            extra_settings["audio_guide3"] = audios[2]
         if audio_prompt_type:
             extra_settings["audio_prompt_type"] = audio_prompt_type
 

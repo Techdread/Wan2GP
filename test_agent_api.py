@@ -449,7 +449,7 @@ def test_minimax_h3_settings():
     check("H3 reference image", ref2va["image_refs"] == ["person.png"])
     check("H3 reference video", ref2va["video_guide"] == "motion.mp4")
     check("H3 reference audio", ref2va["audio_guide"] == "voice.wav")
-    check("H3 video reference flags", all(flag in ref2va["video_prompt_type"] for flag in "VGI"))
+    check("H3 video reference flags", ref2va["video_prompt_type"] == "V-UI")
     check("H3 audio reference flags", ref2va["audio_prompt_type"] == "A")
 
     agent.generate_minimax_h3(
@@ -461,11 +461,34 @@ def test_minimax_h3_settings():
     soundtrack = session.submitted_tasks[-1]
     check("H3 soundtrack mode", soundtrack["audio_prompt_type"] == "K")
 
+    for count, flags in [(2, "V+-U"), (3, "V+*-U")]:
+        agent.generate_minimax_h3(
+            prompt="Multiple references", model="minimax_h3_ref2va",
+            reference_videos=[f"clip{i}.mp4" for i in range(count)],
+            reference_audios=[f"voice{i}.wav" for i in range(count)],
+        )
+        settings = session.submitted_tasks[-1]
+        check(f"H3 {count} video flags", settings["video_prompt_type"] == flags)
+        check(f"H3 {count} audio flags", settings["audio_prompt_type"] == ("AB" if count == 2 else "ABD"))
+        check(f"H3 video {count} path", settings[f"video_guide{count}"] == f"clip{count-1}.mp4")
+        check(f"H3 audio {count} path", settings[f"audio_guide{count}"] == f"voice{count-1}.wav")
+
+    agent.generate_minimax_h3(prompt="Text only", model="minimax_h3_ref2va")
+    check("H3 Ref2VA text only", session.submitted_tasks[-1]["model_type"] == "minimax_h3_ref2va")
+    agent.generate_minimax_h3(
+        prompt="Boundary references", model="minimax_h3_ref2va",
+        start_image="start.png", end_image="end.png",
+    )
+    check("H3 Ref2VA boundaries", session.submitted_tasks[-1]["image_prompt_type"] == "SE")
+
     invalid_cases = [
         {"model": "z_image"},
         {"model": "minimax_h3_fl2va", "reference_images": ["x.png"]},
-        {"model": "minimax_h3_ref2va"},
         {"model": "minimax_h3_ref2va", "reference_audios": ["voice.wav"]},
+        {"model": "minimax_h3_ref2va", "reference_videos": ["x.mp4"] * 4},
+        {"model": "minimax_h3_ref2va", "reference_images": ["x.png"] * 4, "reference_audios": ["x.wav"] * 4},
+        {"model": "minimax_h3_ref2va", "reference_images": ["x.png"] * 10},
+        {"model": "minimax_h3_ref2va", "reference_images": ["x.png"] * 9, "reference_videos": ["x.mp4"] * 3, "reference_audios": ["x.wav"]},
     ]
     for index, kwargs in enumerate(invalid_cases, 1):
         try:
