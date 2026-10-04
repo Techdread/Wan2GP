@@ -45,6 +45,7 @@ from .wanmove.trajectory import replace_feature, create_pos_feature_map
 from .alpha.utils import load_gauss_mask, apply_alpha_shift
 from shared.utils.audio_video import save_video
 from shared.utils.text_encoder_cache import TextEncoderCache
+from shared.utils.phase_progress import control_video_encoding, generation_progress, text_encoding_prompts
 from shared.utils.self_refiner import PnPHandler, create_self_refiner_handler
 from mmgp import safetensors2
 from shared.utils import files_locator as fl 
@@ -411,8 +412,10 @@ class WanAny2V:
 
         return mocha_latents, (torch.cat(cos_parts, dim=0), torch.cat(sin_parts, dim=0))
 
+    @generation_progress
     def generate(self,
         input_prompt,
+        alt_prompt="",
         input_frames= None,
         input_frames2= None,
         input_masks = None,
@@ -552,7 +555,10 @@ class WanAny2V:
         if self._interrupt:
             return None
         # Text Encoder
-        kiwi_edit = model_type in ["kiwi_edit"]        
+        kiwi_edit = model_type in ["kiwi_edit"]
+        animate2 = model_def.get("animate2", False)
+        animate2_kv_cache = custom_settings.get("animate2_kv_cache", "Disabled") if animate2 and isinstance(custom_settings, dict) else "Disabled"
+        if animate2_kv_cache == "Enabled": animate2_kv_cache = "GPU"
         bernini = model_def.get("bernini_class", False)
         shotplan = model_def.get("shotplan", False)
         if n_prompt == "":
@@ -574,19 +580,33 @@ class WanAny2V:
             from .kiwi.embedders import build_kiwi_conditions
             kiwi_ref_images = original_input_ref_images[0] if original_input_ref_images is not None and len(original_input_ref_images) else None
             kiwi_state = build_kiwi_conditions(vae=self.vae, source_frames=input_frames, ref_images=kiwi_ref_images, width=width, height=height, batch_size=batch_size, device=self.device, dtype=self.dtype, source_embedder_file=self.kiwi_source_embedder_file, ref_embedder_file=self.kiwi_ref_embedder_file, vae_tile_size=VAE_tile_size)
-            context = self.kiwi_mllm.encode_from_inputs(input_prompt, input_frames, kiwi_ref_images, use_ref_image=self.kiwi_ref_embedder_file is not None, max_frames=16)
-            context = [context]
-            if any_guidance_at_all or NAG_scale > 1:
-                context_null = self.kiwi_mllm.encode_from_inputs(n_prompt, input_frames, kiwi_ref_images, use_ref_image=self.kiwi_ref_embedder_file is not None, max_frames=16)
-                context_null = [context_null]
+            with text_encoding_prompts(2 if any_guidance_at_all or NAG_scale > 1 else 1):
+                context = self.kiwi_mllm.encode_from_inputs(input_prompt, input_frames, kiwi_ref_images, use_ref_image=self.kiwi_ref_embedder_file is not None, max_frames=16)
+                context = [context]
+                if any_guidance_at_all or NAG_scale > 1:
+                    context_null = self.kiwi_mllm.encode_from_inputs(n_prompt, input_frames, kiwi_ref_images, use_ref_image=self.kiwi_ref_embedder_file is not None, max_frames=16)
+                    context_null = [context_null]
         else:
             text_len = self.model.text_len
             encode_fn = lambda prompts: self.text_encoder(prompts, self.device)
-            context = self.text_encoder_cache.encode(encode_fn, [input_prompt], device=self.device)[0].to(self.dtype)
+            prompts = [input_prompt]
+            if NAG_scale > 1 or any_guidance_at_all:
+                prompts.append(n_prompt)
+            if animate2:
+                prompts.append(alt_prompt.strip() or model_def["animate2_ref_prompt"])
+            contexts = iter(self.text_encoder_cache.encode(encode_fn, prompts, device=self.device))
+            context = next(contexts).to(self.dtype)
             context = torch.cat([context, context.new_zeros(text_len -context.size(0), context.size(1)) ]).unsqueeze(0)
             if NAG_scale > 1 or any_guidance_at_all:      
-                context_null = self.text_encoder_cache.encode(encode_fn, [n_prompt], device=self.device)[0].to(self.dtype)
+                context_null = next(contexts).to(self.dtype)
                 context_null = torch.cat([context_null, context_null.new_zeros(text_len -context_null.size(0), context_null.size(1)) ]).unsqueeze(0)
+            if animate2:
+                animate2_ref_context = next(contexts).to(self.dtype)
+                animate2_ref_context = torch.cat([animate2_ref_context, animate2_ref_context.new_zeros(text_len - animate2_ref_context.size(0), animate2_ref_context.size(1))]).unsqueeze(0)
+            del contexts
+
+        if set_progress_status is not None:
+            set_progress_status("Preparing Image and Video Conditioning")
 
         # NAG_prompt =  "static, low resolution, blurry"
         # context_NAG = self.text_encoder([NAG_prompt], self.device)[0]
@@ -629,7 +649,7 @@ class WanAny2V:
         trim_frames = 0
         post_decode_pre_trim = 0
         last_latent_preview = False
-        extended_overlapped_latents = clip_image_start = clip_image_end = image_mask_latents = latent_slice = freqs = post_freqs = None
+        extended_overlapped_latents = clip_image_start = clip_image_end = animate2_clip_image_ref = image_mask_latents = latent_slice = freqs = post_freqs = None
         use_extended_overlapped_latents = True
         # SCAIL uses a fixed ref latent frame that should not be noised.
         no_noise_latents_injection = infinitetalk or scail or scail2
@@ -640,7 +660,7 @@ class WanAny2V:
         extended_input_dim = 0
         ref_images_before = False            
         # image2video 
-        if model_def.get("i2v_class", False) and not (animate or scail or scail2):
+        if model_def.get("i2v_class", False) and not (animate or animate2 or scail or scail2):
             any_end_frame = False
             if infinitetalk:
                 new_shot = "0" in video_prompt_type
@@ -803,9 +823,11 @@ class WanAny2V:
             ref_c = torch.concat([ref_c, msk_c, ref_c])
             kwargs.update({ 'steadydancer_ref_x': ref_x, 'steadydancer_ref_c': ref_c})
             # conditions, w/o msk
-            conditions = self.vae.encode([input_frames])[0].unsqueeze(0)
+            with control_video_encoding("V" in video_prompt_type):
+                conditions = self.vae.encode([input_frames])[0].unsqueeze(0)
             # conditions_null, w/o msk
-            conditions_null = self.vae.encode([input_frames2])[0].unsqueeze(0)
+            with control_video_encoding("V" in video_prompt_type):
+                conditions_null = self.vae.encode([input_frames2])[0].unsqueeze(0)
             inner_latent_frames = 2
 
         # Chrono Edit
@@ -821,7 +843,8 @@ class WanAny2V:
             pose_pixels = input_frames * input_masks
             input_masks = 1. - input_masks
             pose_pixels -= input_masks
-            pose_latents = self.vae.encode([pose_pixels], VAE_tile_size)[0].unsqueeze(0)
+            with control_video_encoding("V" in video_prompt_type):
+                pose_latents = self.vae.encode([pose_pixels], VAE_tile_size)[0].unsqueeze(0)
             input_frames = input_frames * input_masks
             if not "X" in video_prompt_type: input_frames += input_masks - 1 # masked area should black (-1) in background frames
             # input_frames = input_frames[:, :1].expand(-1, input_frames.shape[1], -1, -1)
@@ -837,7 +860,9 @@ class WanAny2V:
             msk = torch.concat([msk_ref, msk_control], dim=1)
             image_ref = input_ref_images[0].to(self.device)
             clip_image_start = image_ref.squeeze(1)
-            lat_y = torch.concat(self.vae.encode([image_ref, input_frames.to(self.device)], VAE_tile_size), dim=1)
+            lat_y = self.vae.encode([image_ref], VAE_tile_size)[0]
+            with control_video_encoding("V" in video_prompt_type):
+                lat_y = torch.cat([lat_y, self.vae.encode([input_frames.to(self.device)], VAE_tile_size)[0]], dim=1)
             y = torch.concat([msk, lat_y])
             kwargs.update({ 'y': y, 'pose_latents': pose_latents})
             face_pixel_values = input_faces.unsqueeze(0)
@@ -845,6 +870,30 @@ class WanAny2V:
             ref_images_before = True
             ref_images_count = 1
             lat_frames = int((input_frames.shape[1] - 1) // self.vae_stride[0]) + 1
+
+        # Animate 2
+        if animate2:
+            input_frames = input_frames[:, :frame_num].to(device=self.device, dtype=self.VAE_dtype)
+            if not input_ref_images:
+                input_ref_images = [image_start if image_start is not None else convert_image_to_tensor(pre_video_frame)]
+            image_ref = input_ref_images[0].to(device=self.device, dtype=self.VAE_dtype)
+            image_ref = image_ref.unsqueeze(1) if image_ref.ndim == 3 else image_ref
+            color_reference_frame = image_ref.clone()
+            clip_image_start = image_ref[:, 0]
+            animate2_clip_image_ref = input_frames[:, 0]
+            with control_video_encoding("V" in video_prompt_type):
+                driving_latents = self.vae.encode([input_frames], VAE_tile_size)[0]
+            lat_frames, lat_h, lat_w = driving_latents.shape[1:]
+            identity_latents = self.vae.encode([image_ref], VAE_tile_size)[0]
+            output_pixels = torch.zeros_like(input_frames)
+            if prefix_frames_count > 0: output_pixels[:, :prefix_frames_count] = input_video[:, :prefix_frames_count].to(output_pixels)
+            output_latents = self.vae.encode([output_pixels], VAE_tile_size)[0]
+            y = torch.cat([torch.cat([self.get_i2v_mask(lat_h, lat_w, 1, lat_t=1, device=self.device), self.get_i2v_mask(lat_h, lat_w, prefix_frames_count, lat_t=lat_frames, device=self.device)], dim=1), torch.cat([identity_latents, output_latents], dim=1)])
+            grid_h, grid_w = lat_h // ps_h, lat_w // ps_w
+            animate2_ref_freqs = get_nd_rotary_pos_embed((1, 0, grid_w), (1 + lat_frames, grid_h, 2 * grid_w), (lat_frames, grid_h, grid_w), L_test=lat_frames, enable_riflex=False)
+            kwargs.update({"y": y, "animate2_ref_x": driving_latents.unsqueeze(0), "animate2_ref_y": torch.cat([self.get_i2v_mask(lat_h, lat_w, frame_num, lat_t=lat_frames, device=self.device), driving_latents]).unsqueeze(0), "animate2_ref_context": animate2_ref_context, "animate2_ref_freqs": animate2_ref_freqs, "animate2_log_scale": model_def["animate2_log_scale"], "animate2_kv_cache": animate2_kv_cache})
+            ref_images_before, ref_images_count = True, 1
+            identity_latents = output_latents = output_pixels = None
 
         # SCAIL - 3D pose-guided character animation
         if scail:
@@ -874,7 +923,8 @@ class WanAny2V:
             # Downsample pose video by 0.5x before VAE encoding (matches `smpl_downsample` in upstream configs)
             pose_pixels_ds = pose_pixels.permute(1, 0, 2, 3)
             pose_pixels_ds = F.interpolate( pose_pixels_ds, size=(max(1, pose_pixels.shape[-2] // 2), max(1, pose_pixels.shape[-1] // 2)), mode="bilinear", align_corners=False, ).permute(1, 0, 2, 3)
-            pose_latents = self.vae.encode([pose_pixels_ds], VAE_tile_size)[0].unsqueeze(0)
+            with control_video_encoding("V" in video_prompt_type):
+                pose_latents = self.vae.encode([pose_pixels_ds], VAE_tile_size)[0].unsqueeze(0)
 
             clip_image_start = image_ref.squeeze(1)
             kwargs.update({"y": y, "scail_pose_latents": pose_latents, "ref_images_count": 1})
@@ -921,6 +971,10 @@ class WanAny2V:
                 clip_context = self.clip.visual([clip_image_start[:, None, :, :]])
             clip_image_start = clip_image_end = None
             kwargs.update({'clip_fea': clip_context})
+            if animate2:
+                animate2_clip_image_ref = resize_lanczos(animate2_clip_image_ref, clip_image_size, clip_image_size)
+                kwargs["animate2_ref_clip_fea"] = self.clip.visual([animate2_clip_image_ref[:, None, :, :]])
+                animate2_clip_image_ref = None
             if steadydancer:
                 kwargs['steadydancer_clip_fea_c'] = self.clip.visual([input_frames[:, :1]])
 
@@ -930,7 +984,8 @@ class WanAny2V:
             lat_frames = int((frame_num - 1) // self.vae_stride[0]) + 1
             frame_num = (lat_frames -1) * self.vae_stride[0] + 1
             input_frames = input_frames[:, :frame_num].to(dtype=self.dtype , device=self.device)
-            extended_latents = self.vae.encode([input_frames])[0].unsqueeze(0) #.to(dtype=self.dtype, device=self.device)
+            with control_video_encoding("V" in video_prompt_type):
+                extended_latents = self.vae.encode([input_frames])[0].unsqueeze(0) #.to(dtype=self.dtype, device=self.device)
             extended_input_dim = 2 if recam else 1
             del input_frames
 
@@ -953,7 +1008,8 @@ class WanAny2V:
             if input_frames is not None and "V" in video_prompt_type:
                 height, width = input_frames.shape[-2:]
                 color_reference_frame = input_frames[:, :1].clone()
-                video_latents = self.vae.encode([input_frames.to(self.device)], VAE_tile_size)[0].unsqueeze(0)
+                with control_video_encoding("V" in video_prompt_type):
+                    video_latents = self.vae.encode([input_frames.to(self.device)], VAE_tile_size)[0].unsqueeze(0)
                 bernini_video_latents = [video_latents]
                 if prefix_frames_count > 0:
                     overlapped_latents_frames_num = int(1 + (prefix_frames_count - 1) // self.vae_stride[0])
@@ -968,7 +1024,8 @@ class WanAny2V:
         # Video 2 Video
         if "G" in video_prompt_type and input_frames != None:
             height, width = input_frames.shape[-2:]
-            source_latents = self.vae.encode([input_frames])[0].unsqueeze(0)
+            with control_video_encoding("V" in video_prompt_type):
+                source_latents = self.vae.encode([input_frames])[0].unsqueeze(0)
             injection_denoising_step = 0
             inject_from_start = False
             if input_frames != None and denoising_strength < 1 :
@@ -1098,7 +1155,8 @@ class WanAny2V:
             input_ref_images = None if input_ref_images is None else [ u.to(self.device) for u in input_ref_images]
             input_ref_masks = None if input_ref_masks is None else [ None if u is None else u.to(self.device) for u in input_ref_masks]
             ref_images_before = True
-            z0 = self.vace_encode_frames(input_frames, input_ref_images, masks=input_masks, tile_size = VAE_tile_size, overlapped_latents = overlapped_latents )
+            with control_video_encoding("V" in video_prompt_type):
+                z0 = self.vace_encode_frames(input_frames, input_ref_images, masks=input_masks, tile_size = VAE_tile_size, overlapped_latents = overlapped_latents )
             m0 = self.vace_encode_masks(input_masks, input_ref_images)
             if input_ref_masks is not None and len(input_ref_masks) > 0 and input_ref_masks[0] is not None:
                 color_reference_frame = input_ref_images[0].clone()
@@ -1121,7 +1179,8 @@ class WanAny2V:
 
         # Mocha
         if mocha:
-            extended_latents, freqs = self._build_mocha_latents( input_frames, input_masks,  input_ref_images[:2], frame_num, lat_frames, lat_h, lat_w, VAE_tile_size )
+            with control_video_encoding("V" in video_prompt_type):
+                extended_latents, freqs = self._build_mocha_latents( input_frames, input_masks,  input_ref_images[:2], frame_num, lat_frames, lat_h, lat_w, VAE_tile_size )
             extended_input_dim = 2
 
         # shotplan
@@ -1384,7 +1443,7 @@ class WanAny2V:
 
         offload.shared_state["_radial"] =  offload.shared_state["_attention"]=="radial"
         radial = offload.shared_state.get("_radial", False)        
-        if radial:
+        if radial and not animate2:
             radial_cache = get_cache("radial")
             from shared.radial_attention.attention import fill_radial_cache
             fill_radial_cache(radial_cache, len(self.model.blocks), *target_shape[1:])
@@ -1517,6 +1576,11 @@ class WanAny2V:
                         # "face_pixel_values": [face_pixel_values, None]
                         "face_pixel_values": [face_pixel_values, face_pixel_values] # seems to look better this way
                     }
+                elif animate2:
+                    gen_args = {
+                        "x": [latent_model_input, latent_model_input],
+                        "context": [context, context_null],
+                    }
                 elif wanmove:
                     gen_args = {
                         "x" : [latent_model_input, latent_model_input],
@@ -1588,7 +1652,9 @@ class WanAny2V:
                         "context": [context, context_null]
                     }
 
-                if joint_pass and any_guidance:
+                latent_model_input = None
+                run_joint_pass = joint_pass or animate2 and any_guidance
+                if run_joint_pass and any_guidance:
                     ret_values = trans( **gen_args , **kwargs)
                     if self._interrupt:
                         return clear()               
@@ -1597,10 +1663,12 @@ class WanAny2V:
                     ret_values = [None] * size
                     for x_id in range(size):
                         sub_gen_args = {k : [v[x_id]] for k, v in gen_args.items() }
+                        gen_args["x"][x_id] = None
                         ret_values[x_id] = trans( **sub_gen_args, x_id= x_id , **kwargs)[0]
                         if self._interrupt:
                             return clear()         
                     sub_gen_args = None
+                gen_args = None
                 if bernini:
                     noise_pred = ret_values[0] if bernini_coeffs[0] == 1 else ret_values[0] * bernini_coeffs[0]
                     for pred, coeff in zip(ret_values[1:], bernini_coeffs[1:]):
@@ -1778,7 +1846,12 @@ class WanAny2V:
                 BGRA_frames = None
             if videos.dtype != torch.uint8:
                 videos = videos.clamp_(-1, 1).add_(1.0).mul_(127.5).round_().clamp_(0, 255).to(torch.uint8)
-            if BGRA_frames is not None: ret["BGRA_frames"] =  BGRA_frames
+            if BGRA_frames is not None:
+                from io import BytesIO
+                from .alpha.utils import write_zip_file
+                with BytesIO() as stream:
+                    write_zip_file(stream, BGRA_frames)
+                    ret["side_files"] = {".zip": stream.getvalue()}
         return ret
 
     def get_loras_transformer(self, get_model_recursive_prop, base_model_type, model_type, video_prompt_type, model_mode, **kwargs):

@@ -8,6 +8,7 @@ import torch
 from mmgp import offload
 from safetensors import safe_open
 from shared.utils import files_locator as fl
+from shared.utils.cancellation import check_cancelled
 
 from .florence2 import Florence2Config, Florence2ForConditionalGeneration, Florence2Processor
 from .florence2.image_processing_florence2 import Florence2ImageProcessorLite
@@ -23,6 +24,8 @@ from .assets import (
     LLAMAJOY_FOLDER,
     PROMPT_ENHANCER_REPO,
 )
+from shared.deepy.config import resolve_deepy_kv_cache_quantization
+from .config import resolve_prompt_enhancer_speculative_decoding, speculative_decoding_runtime
 
 
 @dataclass(slots=True)
@@ -36,7 +39,7 @@ class PromptEnhancerRuntime:
     co_tenants: dict[str, list[str]] = field(default_factory=dict)
 
 
-def ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled: int, qwen_backend: str = "quanto_int8"):
+def ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled: int, qwen_backend: str = "quanto_int8", speculative_decoding: bool = False):
     enhancer_enabled = int(enhancer_enabled)
     if enhancer_enabled == 1:
         process_files_def(
@@ -58,13 +61,15 @@ def ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled: int, qwen
             ],
         )
         return
-    if enhancer_enabled in (3, 4):
+    if enhancer_enabled in (3, 4, 5, 6):
         from .qwen35_vl import ensure_qwen35_prompt_enhancer_assets, get_qwen35_prompt_enhancer_variant
 
-        ensure_qwen35_prompt_enhancer_assets(process_files_def, backend=qwen_backend, variant=get_qwen35_prompt_enhancer_variant(enhancer_enabled))
+        speculative_decoding = resolve_prompt_enhancer_speculative_decoding(enhancer_enabled, speculative_decoding, qwen_backend=qwen_backend)[0]
+        speculative_decoding, _ = speculative_decoding_runtime(speculative_decoding)
+        ensure_qwen35_prompt_enhancer_assets(process_files_def, backend=qwen_backend, variant=get_qwen35_prompt_enhancer_variant(enhancer_enabled), speculative_decoding=speculative_decoding)
 
 
-def download_prompt_enhancer_assets(enhancer_enabled: int, qwen_backend: str = "quanto_int8", send_cmd=None, progress=None, status_text="Downloading Prompt Enhancer model files..."):
+def download_prompt_enhancer_assets(enhancer_enabled: int, qwen_backend: str = "quanto_int8", speculative_decoding: bool = False, send_cmd=None, progress=None, status_text="Downloading Prompt Enhancer model files...", gen=None):
     enhancer_enabled = int(enhancer_enabled)
     if enhancer_enabled <= 0:
         return False
@@ -83,9 +88,9 @@ def download_prompt_enhancer_assets(enhancer_enabled: int, qwen_backend: str = "
                 progress(0, status_text)
             download_status_text = status_text
             status_sent = True
-        downloaded = process_files_def_if_needed(download_def, send_cmd=send_cmd, status_text=download_status_text) or downloaded
+        downloaded = process_files_def_if_needed(download_def, send_cmd=send_cmd, status_text=download_status_text, gen=gen) or downloaded
 
-    ensure_prompt_enhancer_assets(process_download_def, enhancer_enabled=enhancer_enabled, qwen_backend=qwen_backend)
+    ensure_prompt_enhancer_assets(process_download_def, enhancer_enabled=enhancer_enabled, qwen_backend=qwen_backend, speculative_decoding=speculative_decoding)
     return downloaded
 
 
@@ -143,36 +148,66 @@ def _load_joycaption_prompt_enhancer():
     return llm_model, llm_tokenizer, 10000
 
 
-def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, lm_decoder_engine: str = "", qwen_backend: str = "quanto_int8") -> PromptEnhancerRuntime:
+def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, lm_decoder_engine: str = "", qwen_backend: str = "quanto_int8", speculative_decoding: bool = False, deepy_kv_cache_quantization: str = "") -> PromptEnhancerRuntime:
     enhancer_enabled = int(enhancer_enabled)
     runtime = PromptEnhancerRuntime()
     if enhancer_enabled <= 0:
         return runtime
 
-    ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled=enhancer_enabled, qwen_backend=qwen_backend)
+    ensure_prompt_enhancer_assets(process_files_def, enhancer_enabled=enhancer_enabled, qwen_backend=qwen_backend, speculative_decoding=speculative_decoding)
 
-    if enhancer_enabled in (3, 4):
+    if enhancer_enabled in (3, 4, 5, 6):
+        speculative_decoding, speculative_decoding_message = resolve_prompt_enhancer_speculative_decoding(enhancer_enabled, speculative_decoding, qwen_backend=qwen_backend)
+        speculative_decoding, speculative_tokens = speculative_decoding_runtime(speculative_decoding)
+        deepy_kv_cache_quantization, kv_cache_message = resolve_deepy_kv_cache_quantization(deepy_kv_cache_quantization)
+        if speculative_decoding_message:
+            print(f"[Prompt Enhancer / Deepy] {speculative_decoding_message}")
+        if kv_cache_message:
+            print(f"[Prompt Enhancer / Deepy] {kv_cache_message}")
         from .qwen35_text import load_qwen35_text_prompt_enhancer
         from .qwen35_vl import (
+            enhancer_quantization_GGUF,
+            enhancer_quantization_GGUF_Q3,
+            enhancer_quantization_GGUF_Q2,
+            enhancer_quantization_GGUF_PTQ1,
+            enhancer_quantization_GGUF_Q8,
             enhancer_quantization_QUANTO_INT8,
             alias_qwen35_text_embedding_for_mmgp,
             get_qwen35_assets_dir_name,
             get_qwen35_prompt_enhancer_variant,
+            get_qwen35_quantization,
+            get_qwen35_text_gguf_path,
+            get_qwen35_variant_spec,
             load_qwen35_vl_prompt_enhancer,
         )
 
-        backend = qwen_backend or enhancer_quantization_QUANTO_INT8
         qwen35_variant = get_qwen35_prompt_enhancer_variant(enhancer_enabled)
+        spec = get_qwen35_variant_spec(qwen35_variant)
+        quantization = get_qwen35_quantization(qwen_backend or enhancer_quantization_QUANTO_INT8, variant=qwen35_variant)
+        backend = enhancer_quantization_GGUF if quantization in (enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_Q8) else quantization
         assets_dir_name = get_qwen35_assets_dir_name(qwen35_variant)
         assets_dir = fl.locate_folder(assets_dir_name, error_if_none=False) or fl.get_download_location(assets_dir_name)
+        if backend == enhancer_quantization_GGUF:
+            from shared.qtypes.gguf import get_gguf_compute_dtype
+            default_dtype = get_gguf_compute_dtype()
+        else:
+            default_dtype = torch.bfloat16
+        text_model_path = get_qwen35_text_gguf_path(assets_dir, variant=qwen35_variant, backend=quantization) if backend == enhancer_quantization_GGUF else None
         runtime.llm_model = load_qwen35_text_prompt_enhancer(
+            model_path=text_model_path,
             assets_dir=assets_dir,
-            default_dtype=torch.bfloat16 if backend == enhancer_quantization_QUANTO_INT8 else torch.float16,
+            default_dtype=default_dtype,
             backend=backend,
             attn_implementation="sdpa",
             requested_lm_engine=lm_decoder_engine,
             variant=qwen35_variant,
+            speculative_decoding=speculative_decoding,
+            kv_cache_int8=deepy_kv_cache_quantization == "int8",
         )
+        if speculative_tokens is not None:
+            speculative_tokens = min(speculative_tokens, getattr(runtime.llm_model, "_block_draft_max_tokens", speculative_tokens))
+            runtime.llm_model._prompt_enhancer_speculative_tokens = speculative_tokens
+            runtime.llm_model._prompt_enhancer_speculative_sampling_tokens = speculative_tokens
         runtime.llm_tokenizer = getattr(runtime.llm_model, "_prompt_enhancer_tokenizer", None)
         runtime.llm_model.eval()
         caption_embedding_model = alias_qwen35_text_embedding_for_mmgp(runtime.llm_model)
@@ -189,9 +224,9 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, lm_de
         runtime.pipe_models["prompt_enhancer_image_caption_vision_tower_model"] = vision_tower_model
         runtime.pipe_models["prompt_enhancer_image_caption_embedding_model"] = caption_embedding_model
         runtime.pipe_models["prompt_enhancer_llm_model"] = runtime.llm_model
-        runtime.budgets["prompt_enhancer_image_caption_vision_tower_model"] = 3000
-        runtime.budgets["prompt_enhancer_image_caption_embedding_model"] = 2000
-        runtime.budgets["prompt_enhancer_llm_model"] = 10000
+        runtime.budgets["prompt_enhancer_image_caption_vision_tower_model"] = spec.get("vision_budget", 3000)
+        runtime.budgets["prompt_enhancer_image_caption_embedding_model"] = spec.get("embedding_budget", 2000)
+        runtime.budgets["prompt_enhancer_llm_model"] = spec.get("llm_budget", 10000)
         runtime.co_tenants["prompt_enhancer_image_caption_vision_tower_model"] = ["prompt_enhancer_image_caption_embedding_model"]
         runtime.co_tenants["prompt_enhancer_image_caption_embedding_model"] = ["prompt_enhancer_image_caption_vision_tower_model"]
         return runtime
@@ -210,10 +245,12 @@ def load_prompt_enhancer_runtime(process_files_def, enhancer_enabled: int, lm_de
 
 
 def _load_state_dict(weights_path: Path) -> dict:
+    check_cancelled()
     if weights_path.suffix == ".safetensors":
         state_dict = {}
         with safe_open(str(weights_path), framework="pt", device="cpu") as f:
             for key in f.keys():
+                check_cancelled()
                 state_dict[key] = f.get_tensor(key)
         return state_dict
     return torch.load(str(weights_path), map_location="cpu")
@@ -249,9 +286,12 @@ def load_florence2(
     weights_path = _resolve_weights_path(model_path)
     state_dict = _load_state_dict(weights_path)
 
+    check_cancelled()
     model = Florence2ForConditionalGeneration(config)
+    check_cancelled()
     load_info = model.load_state_dict(state_dict, strict=False)
     del state_dict
+    check_cancelled()
     if load_info.missing_keys:
         allowed_missing = {
             "language_model.model.encoder.embed_tokens.weight",

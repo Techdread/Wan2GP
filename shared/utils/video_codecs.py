@@ -1,5 +1,6 @@
 SDR_VIDEO_CODEC_CHOICES = [
-    ("x265 CRF 28 (Balanced)", "libx265_28"),
+    ("x265 CRF 28 (Small)", "libx265_28"),
+    ("x265 CRF 18 (Balanced)", "libx265_18"),
     ("x264 Level 8 (Balanced)", "libx264_8"),
     ("x265 CRF 8 (High Quality)", "libx265_8"),
     ("x264 Level 10 (High Quality)", "libx264_10"),
@@ -18,6 +19,11 @@ SUPPORTED_VIDEO_CONTAINERS = {"mkv", "mov", "mp4"}
 CONFIG_VIDEO_CONTAINERS = {value for _, value in VIDEO_CONTAINER_CHOICES}
 PROFESSIONAL_VIDEO_CODECS = {"prores_422", "dnxhr_hq"}
 QUICKTIME_AUDIO_CODEC_KEYS = {"aac_128", "aac_192", "aac_256", "aac_320", "alac"}
+# ffmpeg muxes FLAC into MP4 and Matroska, but refuses it in MOV.
+CONTAINER_AUDIO_CODEC_KEYS = {
+    "mp4": QUICKTIME_AUDIO_CODEC_KEYS | {"flac"},
+    "mov": QUICKTIME_AUDIO_CODEC_KEYS,
+}
 
 
 def normalize_video_container(container: str | None) -> str:
@@ -37,48 +43,38 @@ def get_video_container_extension(container: str | None) -> str:
     return f".{container}" if container in SUPPORTED_VIDEO_CONTAINERS else ".mp4"
 
 
-def get_video_encode_args(codec_key: str | None, container: str | None) -> list[str]:
+def _get_video_codec_spec(codec_key: str | None, container: str | None) -> tuple[str, str, list[str]]:
     codec_key = normalize_video_codec(codec_key)
     container = normalize_video_container(container)
     if codec_key == "libx264_8":
-        return ["-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p"]
+        return "libx264", "yuv420p", ["-crf", "10"]
     if codec_key == "libx264_10":
-        return ["-c:v", "libx264", "-crf", "21", "-pix_fmt", "yuv420p"]
+        return "libx264", "yuv420p", ["-crf", "0"]
     if codec_key == "libx265_28":
-        return ["-c:v", "libx265", "-crf", "28", "-pix_fmt", "yuv420p", "-x265-params", "log-level=none"]
+        return "libx265", "yuv420p", ["-crf", "28", "-x265-params", "log-level=none"]
+    if codec_key == "libx265_18":
+        return "libx265", "yuv420p", ["-crf", "18", "-x265-params", "log-level=none"]
     if codec_key == "libx265_8":
-        return ["-c:v", "libx265", "-crf", "8", "-pix_fmt", "yuv420p", "-x265-params", "log-level=none"]
+        return "libx265", "yuv420p", ["-crf", "8", "-x265-params", "log-level=none"]
     if codec_key == "libx264_lossless":
         if container == "mkv":
-            return ["-c:v", "ffv1", "-pix_fmt", "rgb24"]
-        return ["-c:v", "libx264", "-crf", "0", "-pix_fmt", "yuv444p"]
+            return "ffv1", "rgb24", []
+        return "libx264", "yuv444p", ["-crf", "0"]
     if codec_key == "prores_422":
-        return ["-c:v", "prores_ks", "-profile:v", "2", "-pix_fmt", "yuv422p10le"]
+        return "prores_ks", "yuv422p10le", ["-profile:v", "2"]
     if codec_key == "dnxhr_hq":
-        return ["-c:v", "dnxhd", "-profile:v", "dnxhr_hq", "-pix_fmt", "yuv422p"]
-    return ["-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p"]
+        return "dnxhd", "yuv422p", ["-profile:v", "dnxhr_hq"]
+    return "libx264", "yuv420p", ["-crf", "10"]
+
+
+def get_video_encode_args(codec_key: str | None, container: str | None) -> list[str]:
+    codec, pixel_format, output_params = _get_video_codec_spec(codec_key, container)
+    return ["-c:v", codec, *output_params, "-pix_fmt", pixel_format]
 
 
 def get_imageio_codec_params(codec_key: str | None, container: str | None) -> dict:
-    codec_key = normalize_video_codec(codec_key)
-    container = normalize_video_container(container)
-    if codec_key == "libx264_8":
-        return {"codec": "libx264", "quality": 8, "pixelformat": "yuv420p"}
-    if codec_key == "libx264_10":
-        return {"codec": "libx264", "quality": 10, "pixelformat": "yuv420p"}
-    if codec_key == "libx265_28":
-        return {"codec": "libx265", "pixelformat": "yuv420p", "output_params": ["-crf", "28", "-x265-params", "log-level=none", "-hide_banner", "-nostats"]}
-    if codec_key == "libx265_8":
-        return {"codec": "libx265", "pixelformat": "yuv420p", "output_params": ["-crf", "8", "-x265-params", "log-level=none", "-hide_banner", "-nostats"]}
-    if codec_key == "libx264_lossless":
-        if container == "mkv":
-            return {"codec": "ffv1", "pixelformat": "rgb24"}
-        return {"codec": "libx264", "output_params": ["-crf", "0"], "pixelformat": "yuv444p"}
-    if codec_key == "prores_422":
-        return {"codec": "prores_ks", "pixelformat": "yuv422p10le", "output_params": ["-profile:v", "2", "-hide_banner", "-nostats"]}
-    if codec_key == "dnxhr_hq":
-        return {"codec": "dnxhd", "pixelformat": "yuv422p", "output_params": ["-profile:v", "dnxhr_hq", "-hide_banner", "-nostats"]}
-    return {"codec": "libx264", "pixelformat": "yuv420p"}
+    codec, pixel_format, output_params = _get_video_codec_spec(codec_key, container)
+    return {"codec": codec, "quality": None, "pixelformat": pixel_format, "output_params": [*output_params, "-hide_banner", "-nostats"]}
 
 
 def validate_video_output_settings(video_codec: str | None, video_container: str | None, audio_codec: str | None = None, width: int | None = None, height: int | None = None, *, allowed_containers: set[str] | None = None) -> str | None:
@@ -90,7 +86,8 @@ def validate_video_output_settings(video_codec: str | None, video_container: str
         return f"Unsupported video container: {video_container}."
     if video_codec in PROFESSIONAL_VIDEO_CODECS and video_container not in {"mkv", "mov"}:
         return "ProRes 422 and DNxHR HQ require the MOV / QuickTime or MKV container."
-    if video_container in {"mp4", "mov"} and audio_codec not in QUICKTIME_AUDIO_CODEC_KEYS:
+    allowed_audio_codecs = CONTAINER_AUDIO_CODEC_KEYS.get(video_container)
+    if allowed_audio_codecs is not None and audio_codec not in allowed_audio_codecs:
         return f"{video_container.upper()} output does not support audio codec setting '{audio_codec}'."
     if video_codec == "dnxhr_hq" and width is not None and height is not None and (int(width) < 256 or int(height) < 120):
         return "DNxHR HQ output requires a resolution of at least 256x120."

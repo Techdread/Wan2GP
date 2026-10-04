@@ -523,7 +523,7 @@ class CLIPModel:
         # self.model.load_state_dict(
         #     torch.load(checkpoint_path, map_location='cpu'), assign= True)
 
-        offload.load_model_data(self.model, checkpoint_path.replace(".pth", "-bf16.safetensors"), writable_tensors= False)
+        offload.load_model_data(self.model, checkpoint_path.replace(".pth", "-bf16.safetensors"), writable_tensors=False, default_dtype=None)
 
         # init tokenizer
         self.tokenizer = HuggingfaceTokenizer(
@@ -532,6 +532,8 @@ class CLIPModel:
             clean='whitespace')
 
     def visual(self, videos,):
+        from shared.utils.phase_progress import set_phase_status
+        set_phase_status("Encoding Image Features")
         # preprocess
         size = (self.model.image_size,) * 2
         videos = torch.cat([

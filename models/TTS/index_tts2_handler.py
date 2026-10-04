@@ -12,6 +12,9 @@ from .prompt_enhancers import TTS_MONOLOGUE_PROMPT, TTS_QWEN3_DIALOGUE_PROMPT
 INDEX_TTS2_REPO_ID = "DeepBeepMeep/TTS"
 INDEX_TTS2_FOLDER = "index_tts2"
 INDEX_TTS2_MAIN_GPT_FILENAME = "index_tts2_gpt_fp16.safetensors"
+INDEX_TTS25_ARCHITECTURE = "index_tts25"
+INDEX_TTS25_FOLDER = "index_tts25"
+INDEX_TTS25_MAIN_GPT_FILENAME = "IndexTTS25_GPT_bf16.safetensors"
 INDEX_TTS2_QWEN_EMO_FOLDER = "qwen0.6bemo4-merge"
 INDEX_TTS2_BIGVGAN_FOLDER = "bigvgan_v2_22khz_80band_256x"
 INDEX_TTS2_W2V_BERT_FOLDER = "w2v-bert-2.0"
@@ -49,29 +52,61 @@ INDEX_TTS2_QWEN_EMO_FILES = [
 ]
 INDEX_TTS2_DURATION_SLIDER = {
     "label": "Max duration (seconds)",
+    "name": "Max Duration",
     "min": 1,
     "max": 600,
     "increment": 1,
     "default": 25,
 }
 INDEX_TTS2_AUDIO_PROMPT_TYPES = {
-    "selection": ["A", "AB", "AB2"],
+    "selection": ["A", "AB", "AB2", "ABD2"],
     "labels": {
         "A": "Voice cloning (1 reference audio)",
         "AB": "Voice + emotion (2 reference audios)",
         "AB2": "Dialogue (2 speaker reference audios)",
+        "ABD2": "Dialogue (3 speaker reference audios)",
     },
-    "letters_filter": "AB2",
+    "letters_filter": "ABD2",
     "default": "A",
 }
 INDEX_TTS2_AUTO_SPLIT_SETTING_ID = "auto_split_every_s"
 INDEX_TTS2_AUTO_SPLIT_MIN_SECONDS = 5.0
 INDEX_TTS2_AUTO_SPLIT_MAX_SECONDS = 90.0
 INDEX_TTS2_CUSTOM_SETTINGS = []
+INDEX_TTS25_CUSTOM_SETTINGS = [
+    {
+        "id": "speech_speed",
+        "label": "Speech Speed (0.5-2.0)",
+        "name": "Speech Speed",
+        "type": "float",
+        "default": 1.0,
+        "min": 0.5,
+        "max": 2.0,
+        "inc": 0.05,
+    },
+    {
+        "id": "text_normalization",
+        "label": "Text Normalization",
+        "name": "Text Normalization",
+        "type": "dropdown",
+        "default": "Yes",
+        "choices": [("Yes", "Yes"), ("No", "No")],
+    },
+]
+INDEX_TTS25_ROOT_FILES = [
+    "feat1.pt",
+    "feat2.pt",
+    "index_tts25_codec_fp32.safetensors",
+    "index_tts25_s2mel_fp32.safetensors",
+    "multilingual_zh_ja_yue_char_del.tiktoken",
+    "wav2vec2bert_stats.pt",
+    "campplus_cn_common.bin",
+]
 
 
-def _get_index_tts2_model_def():
-    return {
+def _get_index_tts2_model_def(base_model_type):
+    is_v25 = base_model_type == INDEX_TTS25_ARCHITECTURE
+    model_def = {
         "audio_only": True,
         "image_outputs": False,
         "sliding_window": False,
@@ -83,18 +118,19 @@ def _get_index_tts2_model_def():
         "top_k_slider": True,
         "image_prompt_types_allowed": "",
         "supports_early_stop": True,
-        "profiles_dir": ["index_tts2"],
+        "profiles_dir": [base_model_type],
         "duration_slider": dict(INDEX_TTS2_DURATION_SLIDER),
         "any_audio_prompt": True,
         "audio_prompt_choices": True,
         "audio_prompt_type_sources": dict(INDEX_TTS2_AUDIO_PROMPT_TYPES),
-        "custom_settings": [one.copy() for one in INDEX_TTS2_CUSTOM_SETTINGS],
+        "custom_settings": [one.copy() for one in (INDEX_TTS25_CUSTOM_SETTINGS if is_v25 else INDEX_TTS2_CUSTOM_SETTINGS)],
         "preserve_empty_prompt_lines": True,
         "pause_between_sentences": True,
         "audio_guide_label": "Speaker reference voice",
         "audio_guide2_label": "Speaker 2 voice / emotion reference (optional)",
+        "audio_guide3_label": "Speaker 3 voice reference",
         "alt_prompt": {
-            "label": "Default Emotion Instruction (if none, emotion will be detected or set manually for each sentence)",
+            "label": "Default Emotion Instruction (empty preserves emotion from the speaker reference; [] overrides per segment)",
             "name": "Default Emotion Instruction",
             "placeholder": "happy,angry,sad,afraid,disgusted,melancholic,surprised,calm",
             "lines": 2,
@@ -115,9 +151,60 @@ def _get_index_tts2_model_def():
         "lm_engines": ["legacy", "cg", "vllm"],
         "compile": False,
     }
+    if not is_v25:
+        model_def.update({
+            "deepy_infos": "`prompt` = speech; `audio_guide` = required speaker sample. `audio_prompt_type`: `A` uses its voice/emotion; `AB` adds emotion from `audio_guide2`; `AB2` uses that second sample as speaker 2; `ABD2` adds `audio_guide3` as speaker 3. `alt_prompt` sets default emotion. Max duration caps output.",
+            "deepy_prompt_infos": "Write exact English/Chinese speech. Inline cues persist until replaced: '[happy] Hello. [calm] We have time.' `alt_prompt` applies where no inline cue exists; text emotion overrides audio emotion. Keep delivery directions in cues or `alt_prompt`. For `AB2` / `ABD2`, label dialogue `Speaker 1:` / `Speaker 2:` / `Speaker 3:` matching sample order.",
+            "infos": "Generate speech from Text Prompt (`prompt`) and a required Speaker reference voice (`audio_guide`). In audio mode `A`, the sample supplies the speaker and emotion. Mode `AB` uses the second sample (`audio_guide2`) as an emotion reference; `AB2` uses it as a second speaker for dialogue, and `ABD2` adds a third speaker (`audio_guide3`). Default Emotion Instruction (`alt_prompt`) and inline emotion cues control delivery separately from the spoken words. Max duration caps the assembled audio.",
+            "prompt_infos": 'Write the exact words to speak, with natural punctuation, in English or Chinese. WanGP reads `[happy] Hello there. [calm] We have time.` as emotion cues followed by speech; each cue stays active until replaced. `alt_prompt` supplies the default emotion where no inline cue applies. Keep directions inside these cues or the emotion field. For `AB2` / `ABD2` dialogue, use `Speaker 1:`, `Speaker 2:` (and `Speaker 3:`) sections matching the samples. Inline/text emotion overrides the audio emotion for that segment.',
+        })
+    if is_v25:
+        model_def.update({
+            "model_modes": {
+                "label": "Language",
+                "choices": [("English", "EN"), ("Chinese", "ZH"), ("Chinese / English Mixed", "ZHEN"), ("Japanese", "JA"), ("Spanish", "ES"), ("Arabic", "AR")],
+                "default": "EN",
+            },
+            "infos": (
+                "### Improvements over IndexTTS 2.0\n\n"
+                "- Supports **Chinese, English, Japanese, Spanish, and Arabic**.\n"
+                "- Supports **cross-lingual voice cloning**.\n"
+                "- Uses a faster **25 Hz semantic-token path**.\n"
+                "- Adds native speech-speed control and Pinyin, CMU phoneme, and Kana pronunciation annotations.\n\n"
+                "### Language\n\n"
+                "Language is required by IndexTTS 2.5 because it conditions both the text prefix and a learned "
+                "language embedding. Select the language matching the text; **EN** is the default.\n\n"
+                "### Emotion control\n\n"
+                "- Put an emotion instruction in square brackets immediately before the text it controls, for "
+                "example: `[happy]` or `[calm and reassuring]`.\n"
+                "- An inline emotion remains active until another bracketed instruction appears.\n"
+                "- **Default Emotion Instruction** applies to segments without an inline emotion.\n"
+                "- If neither is provided, WanGP preserves emotion from the speaker reference.\n\n"
+                "### Speech Speed\n\n"
+                "- **1.0** is normal speed.\n"
+                "- Values above **1.0** speak faster.\n"
+                "- Values below **1.0** speak slower.\n\n"
+                "### Text Normalization\n\n"
+                "Text Normalization expands supported written forms such as numbers and symbols before tokenization. "
+                "Disable it when the prompt is already written exactly as it should be spoken or when testing precise "
+                "pronunciation markup."
+            ),
+            "prompt_infos": (
+                "Emotion example: [fear] I heard something outside. [calm] It was only the wind. "
+                "Pronunciation syntax: Chinese <行|XING2>, English <minute|M IH1 . N AH0 T>, Japanese <上手|じょうず>."
+            ),
+        })
+    return model_def
 
 
-def _get_index_tts2_download_def():
+def _get_index_tts2_download_def(base_model_type):
+    if base_model_type == INDEX_TTS25_ARCHITECTURE:
+        qwen_files = [name for name in INDEX_TTS2_QWEN_EMO_FILES if name != "model.safetensors"] + ["model_int8_convrot.safetensors"]
+        return {
+            "repoId": INDEX_TTS2_REPO_ID,
+            "sourceFolderList": [INDEX_TTS25_FOLDER, INDEX_TTS2_QWEN_EMO_FOLDER, INDEX_TTS2_BIGVGAN_FOLDER, INDEX_TTS2_W2V_BERT_FOLDER],
+            "fileList": [INDEX_TTS25_ROOT_FILES, qwen_files, INDEX_TTS2_BIGVGAN_FILES, INDEX_TTS2_W2V_BERT_FILES],
+        }
     return {
         "repoId": INDEX_TTS2_REPO_ID,
         # IndexTTS2 configs are bundled with source code in models/TTS/index_tts2/configs.
@@ -178,7 +265,7 @@ def _ensure_w2v_bert_fp16_file():
 class family_handler:
     @staticmethod
     def query_supported_types():
-        return ["index_tts2"]
+        return ["index_tts2", INDEX_TTS25_ARCHITECTURE]
 
     @staticmethod
     def query_family_maps():
@@ -193,25 +280,18 @@ class family_handler:
         return {"tts": (2200, "TTS")}
 
     @staticmethod
-    def register_lora_cli_args(parser, lora_root):
-        parser.add_argument(
-            "--lora-dir-index-tts2",
-            type=str,
-            default=None,
-            help=f"Path to a directory that contains IndexTTS2 settings (default: {os.path.join(lora_root, 'index_tts2')})",
-        )
-
-    @staticmethod
-    def get_lora_dir(base_model_type, args, lora_root):
-        return getattr(args, "lora_dir_index_tts2", None) or os.path.join(lora_root, "index_tts2")
+    def get_lora_dir(base_model_type):
+        if base_model_type == INDEX_TTS25_ARCHITECTURE:
+            return INDEX_TTS25_ARCHITECTURE
+        return "index_tts2"
 
     @staticmethod
     def query_model_def(base_model_type, model_def):
-        return _get_index_tts2_model_def()
+        return {**_get_index_tts2_model_def(base_model_type), "specialities": [{"name": name} for name in ("expressive speech", "emotion transfer", "two-speaker dialogue")]}
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
-        return _get_index_tts2_download_def()
+        return _get_index_tts2_download_def(base_model_type)
 
     @staticmethod
     def load_model(
@@ -233,6 +313,8 @@ class family_handler:
     ):
         from .index_tts2.pipeline import IndexTTS2Pipeline
 
+        is_v25 = base_model_type == INDEX_TTS25_ARCHITECTURE
+        main_gpt_filename = INDEX_TTS25_MAIN_GPT_FILENAME if is_v25 else INDEX_TTS2_MAIN_GPT_FILENAME
         # _ensure_w2v_bert_fp16_file()
         weights_candidate = None
         if isinstance(model_filename, (list, tuple)):
@@ -244,7 +326,7 @@ class family_handler:
         if weights_candidate:
             gpt_weights_path = fl.locate_file(weights_candidate, error_if_none=False) or weights_candidate
         if gpt_weights_path is None:
-            gpt_weights_path = fl.locate_file(INDEX_TTS2_MAIN_GPT_FILENAME, error_if_none=False)
+            gpt_weights_path = fl.locate_file(main_gpt_filename, error_if_none=False)
         if gpt_weights_path is not None:
             gpt_name = os.path.basename(gpt_weights_path)
             if "_quanto_" in gpt_name:
@@ -254,7 +336,7 @@ class family_handler:
                     gpt_weights_path = non_quanto_path
         if gpt_weights_path is None:
             raise FileNotFoundError(
-                f"IndexTTS2 main transformer file '{INDEX_TTS2_MAIN_GPT_FILENAME}' is missing. "
+                f"IndexTTS main transformer file '{main_gpt_filename}' is missing. "
                 "It must be provided in defaults model.URLs."
             )
 
@@ -265,6 +347,7 @@ class family_handler:
             gpt_weights_path=gpt_weights_path,
             show_load_logs=INDEX_TTS2_SHOW_LOAD_LOGS,
             lm_decoder_engine=lm_decoder_engine,
+            architecture=base_model_type,
         )
         if torch.cuda.is_available():
             pipeline.model.device = "cuda:0"
@@ -277,6 +360,8 @@ class family_handler:
             "campplus_model": pipeline.model.campplus_model,
             "qwen_emo_model": pipeline.model.qwen_emo.model,
         }
+        if is_v25:
+            pipe["semantic_codec"] = pipeline.model.semantic_codec
         if str(lm_decoder_engine).strip().lower() in ("cg", "cudagraph", "vllm"):
             pipe["transformer"]._budget = 0
 
@@ -288,21 +373,10 @@ class family_handler:
             load_def["budgets"] = {"transformer2": 250}
 
         if save_quantized and gpt_weights_path:
-            from mmgp import offload
+            from wgp import save_quantized_model
 
-            quant_filename = os.path.basename(gpt_weights_path)
-            if "quanto" not in quant_filename:
-                if "_fp16" in quant_filename:
-                    quant_filename = quant_filename.replace("_fp16", "_quanto_fp16_int8")
-                else:
-                    dot_pos = quant_filename.rfind(".")
-                    if dot_pos >= 0:
-                        quant_filename = f"{quant_filename[:dot_pos]}_quanto_int8{quant_filename[dot_pos:]}"
-                    else:
-                        quant_filename = f"{quant_filename}_quanto_int8.safetensors"
-            if fl.locate_file(quant_filename, error_if_none=False) is None:
-                quant_path = os.path.join(fl.get_download_location(), quant_filename)
-                offload.save_model(pipeline.model.gpt, quant_path, do_quantize=True, config_file_path=None)
+            gpt_config_path = os.path.join(pipeline.model_dir, "configs", "gpt_runtime_config.json")
+            save_quantized_model(pipeline.model.gpt, model_type, gpt_weights_path, dtype or torch.float16, gpt_config_path, submodel_no=1)
 
         return pipeline, load_def
 
@@ -313,6 +387,8 @@ class family_handler:
         defaults = {
             "audio_prompt_type": "A",
         }
+        if base_model_type == INDEX_TTS25_ARCHITECTURE:
+            defaults["model_mode"] = "EN"
         for key, value in defaults.items():
             ui_defaults.setdefault(key, value)
 
@@ -336,6 +412,15 @@ class family_handler:
                 "multi_prompts_gen_type": "FG",
             }
         )
+        if base_model_type == INDEX_TTS25_ARCHITECTURE:
+            ui_defaults.update({
+                "model_mode": "EN",
+                "prompt": "[fear] At the very beginning I was so afraid to speak.\n"
+                "[sadness] Nobody would talk to me. I felt so alone.\n"
+                "[disgust] They would just ignore me and pretend that I didnt exist\n"
+                "[happy] By chance I discovered this wonderful App, and now everything is different.\n"
+                "[anger] I have a new voice and now everybody will have no choice but to listen to my words !!!",
+            })
 
     @staticmethod
     def validate_generative_prompt(base_model_type, model_def, inputs, one_prompt):
@@ -357,23 +442,24 @@ class family_handler:
         if audio_prompt_type == "AB" and inputs.get("audio_guide2") is None:
             return "Emotion mode requires a second reference audio file."
         if audio_prompt_type == "2":
-            if inputs.get("audio_guide2") is None:
-                return "Two-speaker mode requires a second speaker reference audio file."
+            speaker_count = 3 if "D" in raw_audio_prompt_type else 2
+            if any(inputs.get(key) is None for key in ("audio_guide2", "audio_guide3")[:speaker_count - 1]):
+                return f"{speaker_count}-speaker mode requires {speaker_count} speaker reference audio files."
             speaker_matches = list(re.finditer(r"Speaker\s*(\d+)\s*:", prompt_text, flags=re.IGNORECASE))
             if not speaker_matches:
                 return (
-                    "Two-speaker mode requires prompt lines using Speaker 1: and Speaker 2: "
-                    "(or any two numeric speaker IDs). For headless settings, keep "
+                    f"{speaker_count}-speaker mode requires prompt lines using Speaker 1: to Speaker {speaker_count}: "
+                    f"(or any {speaker_count} numeric speaker IDs). For headless settings, keep "
                     "'multi_prompts_gen_type' = 'FG' so dialogue lines stay in one prompt."
                 )
             speaker_ids = sorted({int(match.group(1)) for match in speaker_matches})
-            if len(speaker_ids) != 2:
+            if len(speaker_ids) != speaker_count:
                 return (
-                    "Two-speaker mode requires exactly two speaker IDs. Use Speaker 1: and Speaker 2:. "
+                    f"{speaker_count}-speaker mode requires exactly {speaker_count} speaker IDs. Use Speaker 1: to Speaker {speaker_count}:. "
                     "For headless settings, keep 'multi_prompts_gen_type' = 'FG'."
                 )
         elif has_speaker_syntax:
-            return "Speaker-tag dialogue requires two-speaker mode (set audio prompt mode to Dialogue)."
+            return "Speaker-tag dialogue requires a Dialogue audio prompt mode."
         return None
 
     @staticmethod
@@ -386,6 +472,21 @@ class family_handler:
         if duration <= 0:
             return "Max duration must be greater than 0."
         custom_settings = inputs.get("custom_settings", None)
+        if base_model_type == INDEX_TTS25_ARCHITECTURE:
+            if not isinstance(custom_settings, dict):
+                return "IndexTTS 2.5 custom settings are missing."
+            language = str(inputs.get("model_mode", "EN") or "EN").upper()
+            if language not in ("EN", "ZH", "ZHEN", "JA", "ES", "AR"):
+                return "Unsupported IndexTTS 2.5 language."
+            try:
+                speech_speed = float(custom_settings.get("speech_speed", 1.0))
+            except Exception:
+                return "Speech Speed must be a number between 0.5 and 2.0."
+            if speech_speed < 0.5 or speech_speed > 2.0:
+                return "Speech Speed must be between 0.5 and 2.0."
+            normalization = str(custom_settings.get("text_normalization", "Yes"))
+            if normalization not in ("Yes", "No"):
+                return "Text Normalization must be Yes or No."
         if custom_settings is None:
             return None
         if not isinstance(custom_settings, dict):

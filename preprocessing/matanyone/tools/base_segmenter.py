@@ -121,6 +121,10 @@ class BaseSegmenter:
         SAM_checkpoint: path of SAM checkpoint
         model_type: vit_b, vit_l, vit_h
         """
+        from preprocessing.matanyone.utils.model_assets import query_sam_download_def
+        from shared.utils.download import process_files_def_if_needed
+
+        process_files_def_if_needed(query_sam_download_def())
         print(f"Initializing BaseSegmenter to {device}")
         assert model_type in ['vit_b', 'vit_l', 'vit_h'], 'model_type must be vit_b, vit_l, or vit_h'
 
@@ -139,7 +143,7 @@ class BaseSegmenter:
         # self.model.to(torch.float16)
         # offload.save_model(self.model, "ckpts/mask/sam_vit_h_4b8939_fp16.safetensors")
         
-        offload.load_model_data(self.model, fl.locate_file("mask/sam_vit_h_4b8939_fp16.safetensors"), writable_tensors=False)
+        offload.load_model_data(self.model, fl.locate_file("mask/sam_vit_h_4b8939_fp16.safetensors"), writable_tensors=False, default_dtype=None)
         self.model.to(torch.float32) # need to be optimized, if not f32 crappy precision
         self.model.to(device=self.device)
         self.predictor = SamPredictor(self.model)

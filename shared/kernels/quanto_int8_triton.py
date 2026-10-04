@@ -11,7 +11,7 @@ import torch
 try:
     import triton
     import triton.language as tl
-    from triton.language.extra.cuda import libdevice as tl_libdevice
+    from triton.language.extra import libdevice as tl_libdevice
 
     _TRITON_AVAILABLE = True
 except Exception:  # pragma: no cover
@@ -34,8 +34,9 @@ _ENV_AUTOTUNE_VALIDATE = "WAN2GP_QUANTO_INT8_AUTOTUNE_VALIDATE"
 _ENV_AUTOTUNE_MAX_ABS_ERR = "WAN2GP_QUANTO_INT8_AUTOTUNE_MAX_ABS_ERR"
 _ENV_AUTOTUNE_MAX_REL_ERR = "WAN2GP_QUANTO_INT8_AUTOTUNE_MAX_REL_ERR"
 _ENV_AUTOTUNE_LOCK_FUSED_BLOCK_K = "WAN2GP_QUANTO_INT8_AUTOTUNE_LOCK_FUSED_BLOCK_K"
-_IS_AVAILABLE = None
+_IS_AVAILABLE = {}
 _CONFIG_LEN = 5
+_CONVROT_KINDS = ("convrot", "convrot_bias")
 _AUTOTUNE_CACHE_VERSION = 2
 _AUTOTUNE_CACHE_LOADED = False
 _AUTOTUNE_CACHE_DIRTY = False
@@ -70,6 +71,7 @@ _TRITON_TINY_M_SHAPE_CONFIGS = {
     (2, 8192, 3072): (4, 128, 64, 4, 4),
     (4, 8192, 3072): (2, 128, 128, 8, 4),
 }
+_TRITON_TINY_M_RUNTIME_CONFIGS = {}
 _TRITON_TINY_M_PAIR_CONFIGS = {
     (3072, 3072): (2, 128, 64, 8, 4),
     (3072, 1024): (2, 256, 128, 8, 4),
@@ -128,6 +130,17 @@ def _is_stream_capturing() -> bool:
         return False
 
 
+def _autotune_is_blocked() -> bool:
+    return torch.compiler.is_compiling() or _is_stream_capturing()
+
+
+def _use_cg_autotune(device_index: int) -> bool:
+    props = torch.cuda.get_device_properties(device_index)
+    # Benchmark the same graph-replay regime on all supported NVIDIA tensor-core
+    # targets. The device fingerprint separates these results from event timing.
+    return torch.version.hip is None and props.major >= 8
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)))
@@ -156,11 +169,11 @@ def set_autotune_debug(enabled: Optional[bool] = None) -> None:
     _AUTOTUNE_DEBUG_OVERRIDE = None if enabled is None else bool(enabled)
 
 
-def _runtime_compatible() -> bool:
+def _runtime_compatible(device=None) -> bool:
     if not (_TRITON_AVAILABLE and torch.cuda.is_available()):
         return False
     try:
-        cc_major, _ = torch.cuda.get_device_capability()
+        cc_major, _ = torch.cuda.get_device_capability(device)
     except Exception:
         return False
 
@@ -176,16 +189,37 @@ def _runtime_compatible() -> bool:
     return True
 
 
-def is_available() -> bool:
-    global _IS_AVAILABLE
-    if _IS_AVAILABLE is None:
-        _IS_AVAILABLE = bool(_runtime_compatible() and _env_flag(_ENV_ENABLE, "1"))
-    return _IS_AVAILABLE
+def is_available(device=None) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    device_index = torch.cuda.current_device() if device is None else torch.device(device).index
+    device_index = torch.cuda.current_device() if device_index is None else device_index
+    if device_index not in _IS_AVAILABLE:
+        _IS_AVAILABLE[device_index] = bool(_runtime_compatible(device) and _env_flag(_ENV_ENABLE, "1"))
+    return _IS_AVAILABLE[device_index]
+
+
+def configure_tiny_m_shape_overrides(configs=None) -> None:
+    global _TRITON_TINY_M_RUNTIME_CONFIGS
+    configs = configs or {}
+    parsed = {}
+    for shape, config in configs.items():
+        if not isinstance(shape, (tuple, list)) or len(shape) != 3 or not isinstance(config, (tuple, list)) or len(config) != _CONFIG_LEN:
+            raise ValueError("Triton tiny-M overrides require (M, K, N) keys and five-value configs")
+        shape, config = tuple(int(value) for value in shape), tuple(int(value) for value in config)
+        if shape[0] > 4 or min(shape) <= 0 or min(config) <= 0:
+            raise ValueError(f"Invalid Triton tiny-M override: shape={shape}, config={config}")
+        parsed[shape] = config
+    _TRITON_TINY_M_RUNTIME_CONFIGS = parsed
+
+
+def _tiny_m_shape_config(m: int, k: int, n: int):
+    return _TRITON_TINY_M_RUNTIME_CONFIGS.get((m, k, n)) or _TRITON_TINY_M_SHAPE_CONFIGS.get((m, k, n))
 
 
 def _select_static_triton_int8_config(m: int, k: int, n: int) -> tuple[int, int, int, int, int]:
     if m <= 4:
-        cfg = _TRITON_TINY_M_SHAPE_CONFIGS.get((m, k, n))
+        cfg = _tiny_m_shape_config(m, k, n)
         if cfg is not None:
             return cfg
         cfg = _TRITON_TINY_M_PAIR_CONFIGS.get((k, n))
@@ -231,7 +265,7 @@ def _dedup_shapes(shapes: tuple[tuple[int, int, int], ...]) -> tuple[tuple[int, 
 def _resolve_autotune_slot(m: int, k: int, n: int) -> tuple[str, tuple[tuple[int, int, int], ...]]:
     baseline = _select_static_triton_int8_config(m, k, n)
     if m <= 4:
-        if (m, k, n) in _TRITON_TINY_M_SHAPE_CONFIGS:
+        if _tiny_m_shape_config(m, k, n) is not None:
             slot_id = f"tiny_shape|m={m}|k={k}|n={n}"
             reps = ((m, k, n),)
         elif (k, n) in _TRITON_TINY_M_PAIR_CONFIGS:
@@ -333,10 +367,11 @@ def _device_index(device: Optional[torch.device]) -> int:
 def _device_fingerprint(device_index: int) -> str:
     props = torch.cuda.get_device_properties(device_index)
     triton_ver = getattr(triton, "__version__", "0.0")
-    return (
+    fingerprint = (
         f"{props.name}|cc={props.major}.{props.minor}|sm={props.multi_processor_count}|"
         f"torch={torch.__version__}|triton={triton_ver}|wan2gp_int8_cache_v={_AUTOTUNE_CACHE_VERSION}"
     )
+    return fingerprint + ("|bench=cg-v1" if _use_cg_autotune(device_index) else "")
 
 
 def _autotune_slot_cache_key(device_index: int, kernel_kind: str, slot_id: str) -> str:
@@ -400,6 +435,8 @@ def _config_compatible_with_baseline(
     baseline: tuple[int, int, int, int, int],
     cfg: tuple[int, int, int, int, int],
 ) -> bool:
+    if kind in _CONVROT_KINDS:
+        return cfg[2] == 64
     if baseline == _LOW_SHARED_MEMORY_CONFIG and cfg == _HIGH_SHARED_MEMORY_CONFIG:
         return False
     if kind == "fused" and _env_flag(_ENV_AUTOTUNE_LOCK_FUSED_BLOCK_K, "1"):
@@ -415,6 +452,8 @@ def _runtime_probe_shape(
     n: int,
     baseline: tuple[int, int, int, int, int],
 ) -> tuple[int, int, int, tuple[int, int, int, int, int]]:
+    if kind in _CONVROT_KINDS:
+        return m, k, min(n, _RUNTIME_PROBE_MAX_N), baseline
     if n <= _RUNTIME_PROBE_MAX_N:
         return m, k, n, baseline
     probe_candidates = []
@@ -457,7 +496,7 @@ def _candidate_configs(
                 (8, 128, 64, 4, 4),
             ]
         )
-        shape_cfg = _TRITON_TINY_M_SHAPE_CONFIGS.get((m, k, n))
+        shape_cfg = _tiny_m_shape_config(m, k, n)
         if shape_cfg is not None:
             out.append(shape_cfg)
         pair_cfg = _TRITON_TINY_M_PAIR_CONFIGS.get((k, n))
@@ -465,6 +504,8 @@ def _candidate_configs(
             out.append(pair_cfg)
     elif m <= 16:
         out.extend([(8, 128, 64, 4, 4), (8, 256, 64, 8, 4), (16, 128, 64, 8, 4), (16, 256, 64, 8, 4), (32, 128, 64, 8, 4)])
+    if kind in _CONVROT_KINDS:
+        out.extend((bm, bn, bk, warps, stages) for bm, bn, bk, warps, _ in tuple(out) for stages in (1, 2))
     dedup: list[tuple[int, int, int, int, int]] = []
     seen = set()
     for cfg in out:
@@ -508,6 +549,8 @@ def _compile_recovery_candidates(
     raw = [preferred]
     raw.extend(_candidate_configs(baseline, m, k, n, kind=kind))
     raw.extend(conservative_large_tiles)
+    # Larger tiles need fewer buffered stages on GPUs with limited shared memory.
+    raw.extend((bm, bn, bk, warps, stages) for bm, bn, bk, warps, _ in conservative_large_tiles for stages in (1, 2))
 
     dedup: list[tuple[int, int, int, int, int]] = []
     seen = set()
@@ -536,6 +579,11 @@ def _compile_recovery_candidates(
 def _launch_candidate(kind: str, cfg: tuple[int, int, int, int, int], tensors: tuple[torch.Tensor, ...], m: int, n: int, k: int) -> None:
     block_m, block_n, block_k, num_warps, num_stages = cfg
     grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
+    if kind in _CONVROT_KINDS:
+        from shared.kernels.convrot_int8_triton import convrot_int8_mm
+        x, weight, scale, bias, out = tensors
+        convrot_int8_mm(x, weight, scale, out, bias, cfg)
+        return
     if kind == "fused":
         x_mm_c, qweight_c, b_scale_c, out = tensors
         _fused_dynamic_int8_blockscale_gemm_kernel[grid](
@@ -584,11 +632,14 @@ def _launch_candidate(kind: str, cfg: tuple[int, int, int, int, int], tensors: t
 
 
 def _create_bench_tensors(kind: str, device: torch.device, m: int, k: int, n: int) -> tuple[torch.Tensor, ...]:
-    if kind == "fused":
+    if kind == "fused" or kind in _CONVROT_KINDS:
         x_mm_c = torch.randn((m, k), device=device, dtype=torch.bfloat16)
         qweight_c = torch.randint(-128, 128, (n, k), device=device, dtype=torch.int8)
         b_scale_c = torch.rand((n,), device=device, dtype=torch.float32).add_(1e-4)
         out = torch.empty((m, n), device=device, dtype=torch.bfloat16)
+        if kind in _CONVROT_KINDS:
+            bias = torch.randn(n, device=device, dtype=torch.bfloat16) if kind == "convrot_bias" else None
+            return (x_mm_c, qweight_c, b_scale_c, bias, out)
         return (x_mm_c, qweight_c, b_scale_c, out)
     a_int8_c = torch.randint(-128, 128, (m, k), device=device, dtype=torch.int8)
     b_int8_c = torch.randint(-128, 128, (n, k), device=device, dtype=torch.int8)
@@ -607,6 +658,12 @@ def _run_candidate_once_with_error(
     n: int,
 ) -> tuple[Optional[torch.Tensor], Optional[Exception]]:
     try:
+        if kind in _CONVROT_KINDS:
+            x, weight, scale, bias, _ = tensors
+            out = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
+            _launch_candidate(kind, cfg, (x, weight, scale, bias, out), m, n, k)
+            torch.cuda.synchronize(x.device)
+            return out, None
         if kind == "fused":
             x_mm_c, qweight_c, b_scale_c, _ = tensors
             out = torch.empty((m, n), device=x_mm_c.device, dtype=torch.bfloat16)
@@ -639,6 +696,8 @@ def _ensure_compile_compatible_config(
     n: int,
     rep_shapes: tuple[tuple[int, int, int], ...],
 ) -> tuple[tuple[int, int, int, int, int], Optional[Exception]]:
+    if _autotune_is_blocked():
+        return preferred, None
     device = torch.device("cuda", device_index)
     _ = rep_shapes
     probe_m, probe_k, probe_n, _ = _runtime_probe_shape(kind, m, k, n, baseline)
@@ -672,6 +731,8 @@ def _ensure_compile_compatible_config(
                 )
             return cfg, None
 
+    if kind in _CONVROT_KINDS:
+        raise RuntimeError(f"No compatible Triton {kind} configuration for shape=({m},{k},{n})") from last_error
     if last_error is not None:
         _autotune_debug(
             f"compile recovery failed for {kind} slot={slot_id} shape=({m},{k},{n}); "
@@ -735,23 +796,45 @@ def _validate_config(
 
 
 def _benchmark_config_ms(kind: str, cfg: tuple[int, int, int, int, int], tensors: tuple[torch.Tensor, ...], device: torch.device, m: int, k: int, n: int) -> Optional[float]:
+    if _autotune_is_blocked():
+        return None
     warmup = max(1, _env_int(_ENV_AUTOTUNE_WARMUP, 2))
     iters = max(1, _env_int(_ENV_AUTOTUNE_ITERS, 5))
+    graph = None
     try:
-        for _ in range(warmup):
-            _launch_candidate(kind, cfg, tensors, m, n, k)
-        torch.cuda.synchronize(device)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iters):
-            _launch_candidate(kind, cfg, tensors, m, n, k)
-        end.record()
-        end.synchronize()
-        return float(start.elapsed_time(end)) / float(iters)
+        with torch.cuda.device(device):
+            for _ in range(warmup):
+                _launch_candidate(kind, cfg, tensors, m, n, k)
+            torch.cuda.synchronize(device)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            if _use_cg_autotune(_device_index(device)):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    for _ in range(iters):
+                        _launch_candidate(kind, cfg, tensors, m, n, k)
+                graph.replay()
+                torch.cuda.synchronize(device)
+                timings = []
+                for _ in range(3):
+                    start.record()
+                    graph.replay()
+                    end.record()
+                    end.synchronize()
+                    timings.append(float(start.elapsed_time(end)) / iters)
+                return sorted(timings)[1]
+            start.record()
+            for _ in range(iters):
+                _launch_candidate(kind, cfg, tensors, m, n, k)
+            end.record()
+            end.synchronize()
+            return float(start.elapsed_time(end)) / float(iters)
     except Exception as exc:
         _autotune_debug(f"benchmark failed for {kind} shape=({m},{k},{n}) cfg={cfg}: {exc}")
         return None
+    finally:
+        if graph is not None:
+            graph.reset()
 
 
 def _can_tune_slot(slot_key: tuple[int, str, str]) -> bool:
@@ -771,11 +854,12 @@ def _benchmark_slot_config_ms(
     cfg: tuple[int, int, int, int, int],
     device: torch.device,
     rep_shapes: tuple[tuple[int, int, int], ...],
+    baseline: tuple[int, int, int, int, int],
 ) -> Optional[float]:
     total = 0.0
     count = 0
     for rep_m, rep_k, rep_n in rep_shapes:
-        rep_baseline = _select_static_triton_int8_config(rep_m, rep_k, rep_n)
+        rep_baseline = baseline if kind in _CONVROT_KINDS else _select_static_triton_int8_config(rep_m, rep_k, rep_n)
         if not _validate_config(kind, device, rep_m, rep_k, rep_n, rep_baseline, cfg):
             return None
         tensors = _create_bench_tensors(kind, device, rep_m, rep_k, rep_n)
@@ -799,6 +883,8 @@ def _autotune_config(
     slot_id: str,
     rep_shapes: tuple[tuple[int, int, int], ...],
 ) -> tuple[int, int, int, int, int]:
+    if _autotune_is_blocked():
+        return baseline
     device = torch.device("cuda", device_index)
     cached = _get_cached_config(device_index, kind, slot_id, m, k, n)
     if cached is not None:
@@ -812,15 +898,17 @@ def _autotune_config(
         return baseline
 
     rep_m, rep_k, rep_n = rep_shapes[0]
-    rep_baseline = _select_static_triton_int8_config(rep_m, rep_k, rep_n)
+    rep_baseline = baseline if kind in _CONVROT_KINDS else _select_static_triton_int8_config(rep_m, rep_k, rep_n)
     candidate_seed = rep_baseline if _config_compatible_with_baseline(kind, baseline, rep_baseline) else baseline
     candidates = _candidate_configs(candidate_seed, rep_m, rep_k, rep_n, kind=kind)
+    if _use_cg_autotune(device_index) and rep_m <= 4 and baseline[2] == 64:
+        candidates.append((4, 64, 64, 4, 4))
     if baseline not in candidates:
         candidates = [baseline, *candidates]
 
     results: dict[tuple[int, int, int, int, int], float] = {}
     for cfg in candidates:
-        ms = _benchmark_slot_config_ms(kind, cfg, device, rep_shapes)
+        ms = _benchmark_slot_config_ms(kind, cfg, device, rep_shapes, baseline)
         if ms is not None:
             results[cfg] = ms
     baseline_ms = results.get(baseline)
@@ -869,6 +957,13 @@ def _select_triton_int8_config(
     kernel_kind: str = "fused",
 ) -> tuple[int, int, int, int, int]:
     baseline = _select_static_triton_int8_config(m, k, n)
+    convrot = kernel_kind in _CONVROT_KINDS
+    if convrot:
+        baseline = (*baseline[:2], 64, *baseline[3:])
+    if torch.compiler.is_compiling():
+        return _LOW_SHARED_MEMORY_CONFIG if baseline == _HIGH_SHARED_MEMORY_CONFIG else baseline
+    if not convrot and (m, k, n) in _TRITON_TINY_M_RUNTIME_CONFIGS:
+        return baseline
     if not is_available() or not torch.cuda.is_available():
         return baseline
     try:
@@ -881,15 +976,20 @@ def _select_triton_int8_config(
         if limit > 0 and limit < _HIGH_SHARED_MEMORY_CONFIG_BYTES:
             baseline = _LOW_SHARED_MEMORY_CONFIG
     slot_id, rep_shapes = _resolve_autotune_slot(m, k, n)
+    if convrot:
+        slot_id = f"shape_{m}_{k}_{n}"
+        rep_shapes = ((m, k, min(n, _RUNTIME_PROBE_MAX_N)),)
     session_key = (device_index, kernel_kind, slot_id)
     cached = _AUTOTUNE_SESSION_CACHE.get(session_key)
     if cached is not None:
         if _config_compatible_with_baseline(kernel_kind, baseline, cached):
             return cached
         _AUTOTUNE_SESSION_CACHE.pop(session_key, None)
+    if convrot and _autotune_is_blocked():
+        raise RuntimeError("ConvRot INT8 requires eager warmup before CUDA graph capture")
     cached_cfg = _get_cached_config(device_index, kernel_kind, slot_id, m, k, n)
     if cached_cfg is not None and _config_compatible_with_baseline(kernel_kind, baseline, cached_cfg):
-        if not _is_stream_capturing():
+        if not _autotune_is_blocked():
             compile_safe, _ = _ensure_compile_compatible_config(
                 kernel_kind,
                 device_index,
@@ -907,10 +1007,15 @@ def _select_triton_int8_config(
             return compile_safe
         _AUTOTUNE_SESSION_CACHE[session_key] = cached_cfg
         return cached_cfg
-    if _is_stream_capturing():
+    if _autotune_is_blocked():
         # During graph capture we must avoid autotune/probing allocations. Do not populate
         # session cache with the baseline fallback, so a later non-capture call can autotune.
         return baseline
+
+    if convrot:
+        # The ordinary INT8 baseline may not fit ConvRot. Validate the actual
+        # kernel before using its output as the reference for candidate timing.
+        baseline, _ = _ensure_compile_compatible_config(kernel_kind, device_index, slot_id, baseline, baseline, m, k, n, rep_shapes)
 
     autotune_enabled = _env_flag(_ENV_AUTOTUNE_ENABLE, "1")
     max_m = _env_int(_ENV_AUTOTUNE_MAX_M, -1)
@@ -999,7 +1104,7 @@ if _TRITON_AVAILABLE:
             ).to(tl.float32)
             a = a * row_inv_scale[:, None]
             # Match torch.round behavior (ties-to-even) used by quanto::quantize_symmetric.
-            a = tl_libdevice.rint(a)
+            a = tl_libdevice.nearbyint(a)
             a = tl.maximum(tl.minimum(a, 127.0), -128.0).to(tl.int8)
 
             # Weight is [N, K]; load as [K, N] tile for dot.
@@ -1055,7 +1160,7 @@ if _TRITON_AVAILABLE:
             row_scale = row_amax / 127.0
             row_scale = tl.where(row_scale > 0.0, row_scale, 1.0)
             a = a / row_scale[:, None]
-            a = tl_libdevice.rint(a)
+            a = tl_libdevice.nearbyint(a)
             a = tl.maximum(tl.minimum(a, 127.0), -128.0).to(tl.int8)
 
             b = tl.load(
@@ -1283,6 +1388,7 @@ def scaled_int8_mm(
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
     out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if not is_available():
         raise RuntimeError("Triton backend not available")
@@ -1312,7 +1418,10 @@ def scaled_int8_mm(
         b_scale = b_scale.contiguous()
 
     out_dtype = out_dtype or torch.bfloat16
-    out = torch.empty((m, n), device=a_int8.device, dtype=out_dtype)
+    if out is None:
+        out = torch.empty((m, n), device=a_int8.device, dtype=out_dtype)
+    elif out.shape != (m, n) or out.device != a_int8.device or out.dtype != out_dtype:
+        raise RuntimeError(f"Invalid scaled_int8_mm output tensor: expected {(m, n)} {out_dtype} on {a_int8.device}, got {tuple(out.shape)} {out.dtype} on {out.device}")
     a_int8_c = a_int8 if a_int8.is_contiguous() else a_int8.contiguous()
     b_int8_c = b_int8 if b_int8.is_contiguous() else b_int8.contiguous()
     a_scale_c = a_scale if a_scale.is_contiguous() else a_scale.contiguous()

@@ -21,7 +21,7 @@ def _is_mps_available():
 
 
 def _check_triton_runtime_smoke():
-    global _TRITON_SMOKE_CACHE
+    global _TRITON_SMOKE_CACHE, tl  # Older Triton resolves kernel names from function globals.
     if _TRITON_SMOKE_CACHE is not None:
         return _TRITON_SMOKE_CACHE
     try:
@@ -44,6 +44,9 @@ def _check_triton_runtime_smoke():
         n_elements = 128
         block_size = 128
         device = torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.get_device_capability(device) == (12, 0) and tuple(map(int, triton.__version__.split(".")[:2])) < (3, 3):
+            _TRITON_SMOKE_CACHE = (False, "RTX50xx requires Triton 3.3 or newer; the installed compiler cannot compile SM120 reductions")
+            return _TRITON_SMOKE_CACHE
         x = torch.arange(n_elements, dtype=torch.float32, device=device)
         y = torch.empty_like(x)
         grid = (triton.cdiv(n_elements, block_size),)
@@ -68,6 +71,8 @@ def _check_triton():
         import triton.language as tl  # noqa: F401
     except Exception as exc:
         return False, f"Triton import failed: {exc}"
+    from shared.kernels.triton_compilation_log import install_triton_compilation_logger
+    install_triton_compilation_logger()
     if _env_enabled("WGP_VLLM_TRITON_SMOKE", default=True):
         smoke_ok, smoke_msg = _check_triton_runtime_smoke()
         if not smoke_ok:
@@ -123,12 +128,16 @@ def probe_vllm_runtime(force=False):
     return result
 
 
-def resolve_lm_decoder_engine(requested_engine, engines_available = []):
+def resolve_lm_decoder_engine(requested_engine, engines_available = [], require_flash_attention=True):
     requested_engine = str(requested_engine or "").strip().lower()
     if _is_mps_available():
         return "legacy"
+    if requested_engine in ("legacy", "cg"):
+        return requested_engine if "cg" in engines_available else "legacy"
     probe_result = probe_vllm_runtime()
-    supported = bool(probe_result.get("supported", False))
+    checks = probe_result.get("checks", {})
+    triton_supported = bool(checks.get("triton", {}).get("ok", False))
+    supported = bool(probe_result.get("supported", False)) if require_flash_attention else triton_supported
     cg_available = "cg" in engines_available
     vllm_available= "vllm" in engines_available
     default_engine = "cg" if cg_available else "legacy"
@@ -141,10 +150,11 @@ def resolve_lm_decoder_engine(requested_engine, engines_available = []):
         else:
             global _WARNED_REQUESTED_VLLM_NOT_SUPPORTED
             if not _WARNED_REQUESTED_VLLM_NOT_SUPPORTED:
-                checks = probe_result.get("checks", {})
                 reasons = []
                 if isinstance(checks, dict):
                     for check_name, check_data in checks.items():
+                        if check_name == "flash_attention_2" and not require_flash_attention:
+                            continue
                         if isinstance(check_data, dict) and not check_data.get("ok", False):
                             msg = str(check_data.get("message", "failed")).replace("\n", " ").strip()
                             if len(msg) > 220:
@@ -152,7 +162,8 @@ def resolve_lm_decoder_engine(requested_engine, engines_available = []):
                             reasons.append(f"{check_name}={msg}")
                 reason_text = "; ".join(reasons) if len(reasons) > 0 else "unknown reason"
                 # print(f"[LM] Requested decoder engine 'vllm' is not supported at startup ({reason_text}).")
-                print(f"[LM] Requested decoder engine 'vllm' is not supported (triton & flash attention 2 are needed).")
+                requirement = "Triton and FlashAttention 2 are needed" if require_flash_attention else "Triton is needed"
+                print(f"[LM] Requested decoder engine 'vllm' is not supported ({requirement}).")
                 _WARNED_REQUESTED_VLLM_NOT_SUPPORTED = True
             return default_engine
     if requested_engine == "":
@@ -165,29 +176,17 @@ def resolve_lm_decoder_engine(requested_engine, engines_available = []):
     return "legacy"
 
 
-def _clear_inductor_cuda_pools():
-    try:
-        from torch._inductor import cudagraph_trees as cgt
-    except Exception:
-        return
-
-    clear_cublass_cache = getattr(cgt, "clear_cublass_cache", None)
-    if callable(clear_cublass_cache):
-        try:
-            clear_cublass_cache()
-        except Exception:
-            pass
-
-
 class NanoVllmTextEngine:
     keep_loaded_for_phase2 = True
 
-    def __init__(self, model, model_path: str, tokenizer, enforce_eager: bool = False, graph_pool_handle=None):
+    def __init__(self, model, model_path: str, tokenizer, enforce_eager: bool = False, graph_pool_handle=None, kv_cache_int8: bool = False):
         self.model = model
         self.model_path = model_path
         self.tokenizer = tokenizer
         self.enforce_eager = bool(enforce_eager)
         self.graph_pool_handle = graph_pool_handle
+        self.kv_cache_int8 = bool(kv_cache_int8)
+        self._kv_cache_options = {}
         self.hf_config = getattr(model, "config", None)
         self._llm = None
         self._sampling_params_cls = None
@@ -232,14 +231,14 @@ class NanoVllmTextEngine:
         self._max_num_batched_tokens_hint = max_num_batched_tokens
         self.close()
 
-    def reserve_runtime(self, prompt_len: int, max_tokens: int, cfg_scale: float, num_seqs: int = 1):
+    def reserve_runtime(self, prompt_len: int, max_tokens: int, cfg_scale: float, num_seqs: int = 1, min_model_len: int | None = None):
         req_model_len, req_num_seqs, req_num_batched = self._compute_runtime_hints(
             prompt_len=prompt_len,
             max_tokens=max_tokens,
             cfg_scale=cfg_scale,
             num_seqs=num_seqs,
         )
-        req_model_len = max(req_model_len, self._get_min_model_len_hint())
+        req_model_len = max(req_model_len, self._get_min_model_len_hint() if min_model_len is None else int(min_model_len))
         req_num_batched = max(req_num_batched, req_model_len * req_num_seqs)
         self._ensure_runtime_capacity(req_model_len, req_num_seqs, req_num_batched)
 
@@ -280,6 +279,8 @@ class NanoVllmTextEngine:
             tokenizer=self.tokenizer,
             model_object=self.model,
             graph_pool_handle=self.graph_pool_handle,
+            kv_cache_int8=self.kv_cache_int8,
+            **self._kv_cache_options,
         )
         self._sampling_params_cls = SamplingParams
 
@@ -325,7 +326,13 @@ class NanoVllmTextEngine:
                 pass
         self._sampling_params_cls = None
         try:
-            _clear_inductor_cuda_pools()
+            import torch
+            # DO NOT add `from torch._inductor import cudagraph_trees` here.
+            # Its import registers borrowed Python objects in native TLS on PyTorch
+            # 2.10, causing use-after-free and process crashes when a worker exits.
+            # Call the same cleanup as its clear_cublass_cache() helper directly.
+            # Our CUDA graphs use torch.cuda.CUDAGraph, not Inductor's graph trees.
+            torch._C._cuda_clearCublasWorkspaces()
         except Exception:
             pass
 
@@ -485,6 +492,7 @@ class NanoVllmTextEngine:
         ignore_eos: bool = False,
         position_offset: int = 0,
         repetition_penalty: float = 1.0,
+        stream_callback=None,
     ):
         results = self.generate_embedded_batch(
             [{"prompt_token_ids": prompt_token_ids, "prompt_embeds": prompt_embeds, "prompt_position_ids": prompt_position_ids, "position_offset": position_offset}],
@@ -498,6 +506,7 @@ class NanoVllmTextEngine:
             release_vram_after=release_vram_after,
             ignore_eos=ignore_eos,
             repetition_penalty=repetition_penalty,
+            stream_callback=stream_callback,
         )
         return None if not results else results[0]
 
@@ -515,6 +524,7 @@ class NanoVllmTextEngine:
         release_vram_after: bool = True,
         ignore_eos: bool = False,
         repetition_penalty: float = 1.0,
+        stream_callback=None,
     ):
         """Run several independent embedded prompts concurrently (batched prefill + decode).
 
@@ -568,6 +578,7 @@ class NanoVllmTextEngine:
                 position_offsets=[int(request.get("position_offset", 0) or 0) for request in requests],
                 sampling_params=sampling_params,
                 use_tqdm=use_tqdm,
+                stream_callback=stream_callback,
             )
             for output in outputs or []:
                 text, token_ids = self._extract_text_and_tokens(output)

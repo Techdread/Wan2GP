@@ -24,9 +24,13 @@ _QWEN_EMO_FOLDER = "qwen0.6bemo4-merge"
 _W2V_BERT_FOLDER = "w2v-bert-2.0"
 _CONFIGS_SUBDIR = "configs"
 _BASE_CFG_NAME = "config.yaml"
+_V25_CFG_NAME = "config_2_5.yaml"
 _RUNTIME_CFG_NAME = "config_runtime.yaml"
 _SOURCE_CONFIGS_DIR = Path(__file__).resolve().parent / _CONFIGS_SUBDIR
 _AUTO_SPLIT_SETTING_ID = "auto_split_every_s"
+_LANGUAGE_SETTING_ID = "language"
+_SPEECH_SPEED_SETTING_ID = "speech_speed"
+_TEXT_NORMALIZATION_SETTING_ID = "text_normalization"
 _AUTO_SPLIT_TOKENS_PER_SECOND = 6.0
 _MEL_TOKENS_PER_SOUND_TOKEN = 1.72
 _MIN_CG_SOUND_SECONDS = 10.0
@@ -69,12 +73,15 @@ class IndexTTS2Pipeline:
         gpt_weights_path: Optional[str | Path] = None,
         show_load_logs: bool = False,
         lm_decoder_engine: Optional[str] = None,
+        architecture: str = "index_tts2",
     ) -> None:
         self._interrupt = False
         self._early_stop = False
         self.device = device or torch.device("cpu")
         self.show_load_logs = bool(show_load_logs)
         self.lm_decoder_engine = str(lm_decoder_engine or "legacy").strip().lower()
+        self.architecture = str(architecture)
+        self.is_v25 = self.architecture == "index_tts25"
         if self.lm_decoder_engine == "cudagraph":
             self.lm_decoder_engine = "cg"
         if self.lm_decoder_engine not in ("legacy", "cg", "vllm"):
@@ -94,6 +101,7 @@ class IndexTTS2Pipeline:
             cfg_path=str(runtime_cfg_path),
             model_dir=str(self.model_dir),
             use_fp16=False,
+            use_bf16=self.is_v25,
             device=device_str,
             use_cuda_kernel=False,
             use_deepspeed=False,
@@ -118,7 +126,7 @@ class IndexTTS2Pipeline:
         self._mark_model_dtypes()
 
     def _resolve_config_path(self) -> Path:
-        cfg_path = _SOURCE_CONFIGS_DIR / _BASE_CFG_NAME
+        cfg_path = _SOURCE_CONFIGS_DIR / (_V25_CFG_NAME if self.is_v25 else _BASE_CFG_NAME)
         if cfg_path.is_file():
             return cfg_path
         raise FileNotFoundError(
@@ -127,14 +135,15 @@ class IndexTTS2Pipeline:
         )
 
     def _resolve_model_dir(self) -> Path:
-        located = fl.locate_folder("index_tts2", error_if_none=False)
+        folder_name = "index_tts25" if self.is_v25 else "index_tts2"
+        located = fl.locate_folder(folder_name, error_if_none=False)
         if located is not None:
             return Path(located)
-        fallback = self.ckpt_root / "index_tts2"
+        fallback = self.ckpt_root / folder_name
         if fallback.is_dir():
             return fallback
         raise FileNotFoundError(
-            "IndexTTS2 checkpoint folder not found. Expected 'index_tts2' under the WanGP checkpoints root."
+            f"IndexTTS checkpoint folder not found. Expected '{folder_name}' under the WanGP checkpoints root."
         )
 
     def _resolve_bigvgan_dir(self) -> Path:
@@ -156,7 +165,7 @@ class IndexTTS2Pipeline:
             )
         return bigvgan_dir
 
-    def _resolve_qwen_emo_dir(self) -> Path:
+    def _resolve_qwen_emo_dir(self, weights_filename="model.safetensors") -> Path:
         located = fl.locate_folder(_QWEN_EMO_FOLDER, error_if_none=False)
         if located is None:
             local_fallback = self.ckpt_root / _QWEN_EMO_FOLDER
@@ -167,7 +176,7 @@ class IndexTTS2Pipeline:
                 f"IndexTTS2 Qwen emotion folder '{_QWEN_EMO_FOLDER}' is missing in checkpoints root."
             )
         qwen_dir = Path(located)
-        required = ("config.json", "model.safetensors", "tokenizer.json")
+        required = ("config.json", weights_filename, "tokenizer.json")
         missing_files = [name for name in required if not (qwen_dir / name).is_file()]
         if missing_files:
             raise FileNotFoundError(
@@ -209,11 +218,11 @@ class IndexTTS2Pipeline:
             gpt_safetensor = self.model_dir / "gpt.safetensors"
             if gpt_safetensor.is_file():
                 cfg.gpt_checkpoint = gpt_safetensor.name
-        s2mel_safetensor = self.model_dir / "s2mel.safetensors"
+        s2mel_safetensor = self.model_dir / str(cfg.s2mel_checkpoint)
         if s2mel_safetensor.is_file():
             cfg.s2mel_checkpoint = s2mel_safetensor.name
         cfg.vocoder.name = str(self._resolve_bigvgan_dir())
-        cfg.qwen_emo_path = str(self._resolve_qwen_emo_dir().resolve())
+        cfg.qwen_emo_path = str(self._resolve_qwen_emo_dir(str(cfg.get("qwen_emo_filename", "model.safetensors"))).resolve())
         cfg.w2v_bert_path = str(self._resolve_w2v_bert_dir().resolve())
         runtime_cfg_path = self.model_dir / _CONFIGS_SUBDIR / _RUNTIME_CFG_NAME
         runtime_cfg_path.parent.mkdir(parents=True, exist_ok=True)
@@ -277,8 +286,7 @@ class IndexTTS2Pipeline:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
-    def _resolve_auto_split_seconds(self, kwargs: dict) -> Optional[float]:
-        custom_settings = kwargs.get("custom_settings", None)
+    def _resolve_auto_split_seconds(self, custom_settings) -> Optional[float]:
         if not isinstance(custom_settings, dict):
             return None
         raw_value = custom_settings.get(_AUTO_SPLIT_SETTING_ID, None)
@@ -393,14 +401,15 @@ class IndexTTS2Pipeline:
         except Exception:
             mel_sr = 22050.0
             mel_hop = 256.0
-        sound_tokens_per_second = max(1.0, (mel_sr / max(1.0, mel_hop)) / _MEL_TOKENS_PER_SOUND_TOKEN)
+        sound_tokens_per_second = max(1.0, (mel_sr / max(1.0, mel_hop)) / (_MEL_TOKENS_PER_SOUND_TOKEN * (2 if self.is_v25 else 1)))
         min_cg_sound_tokens = int(math.ceil(_MIN_CG_SOUND_SECONDS * sound_tokens_per_second))
         duration_sound_tokens = int(math.ceil(duration_seconds * sound_tokens_per_second)) if duration_seconds > 0 else int(max_mel_tokens)
-        longest_segment_estimated_sound_tokens = int(math.ceil(max_segment_text_tokens * _CG_SOUND_TOKENS_PER_TEXT_TOKEN))
+        longest_segment_estimated_sound_tokens = int(math.ceil(max_segment_text_tokens * _CG_SOUND_TOKENS_PER_TEXT_TOKEN / (2 if self.is_v25 else 1)))
         capped_segment_sound_tokens = max(1, min(int(duration_sound_tokens), int(longest_segment_estimated_sound_tokens)))
         segment_generation_tokens = max(min_cg_sound_tokens, capped_segment_sound_tokens)
         segment_generation_tokens = max(1, min(int(max_mel_tokens), int(segment_generation_tokens)))
-        prompt_budget = int(getattr(self.model.gpt, "cond_num", 32) + max_segment_text_tokens + 3)
+        conditioning_tokens = 3 if self.is_v25 else int(getattr(self.model.gpt, "cond_num", 32))
+        prompt_budget = conditioning_tokens + max_segment_text_tokens + 3
         cg_max_total_tokens = int(prompt_budget + max(1, int(segment_generation_tokens)))
         return {"cg_max_total_tokens": cg_max_total_tokens, "cg_segment_generation_tokens": int(segment_generation_tokens)}
 
@@ -411,6 +420,7 @@ class IndexTTS2Pipeline:
         two_speaker: bool,
         default_emotion: str,
         auto_split_tokens: Optional[int],
+        speaker_count: int = 2,
     ) -> list[dict]:
         normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
         normalized = re.sub(r"\n(?:[ \t]*\n)+", "\n\n", normalized)
@@ -446,9 +456,9 @@ class IndexTTS2Pipeline:
                     "(or any two numeric speaker IDs)."
                 )
             speaker_ids = sorted({speaker_id for speaker_id, _ in raw_chunks})
-            if len(speaker_ids) != 2:
-                raise ValueError("Two-speaker mode requires exactly two speaker IDs. Use Speaker 1: and Speaker 2:.")
-            speaker_id_to_slot = {speaker_ids[0]: 1, speaker_ids[1]: 2}
+            if len(speaker_ids) != speaker_count:
+                raise ValueError(f"{speaker_count}-speaker mode requires exactly {speaker_count} speaker IDs. Use Speaker 1: to Speaker {speaker_count}:.")
+            speaker_id_to_slot = {speaker_id: index + 1 for index, speaker_id in enumerate(speaker_ids)}
         else:
             speaker_id_to_slot = {1: 1}
             for block in blocks:
@@ -513,12 +523,17 @@ class IndexTTS2Pipeline:
         *,
         alt_prompt: Optional[str] = None,
         audio_guide2: Optional[str] = None,
+        audio_guide3: Optional[str] = None,
         audio_prompt_type: str = "A",
         duration_seconds: float = 0.0,
         pause_seconds: float = 0.0,
         temperature: float = 0.8,
         top_p: float = 0.8,
         top_k: int = 30,
+        language: str = "EN",
+        speech_speed: float = 1.0,
+        text_normalization: bool = True,
+        custom_settings=None,
         set_progress_status=None,
         callback=None,
         **kwargs,
@@ -531,12 +546,17 @@ class IndexTTS2Pipeline:
                     audio_guide,
                     alt_prompt=alt_prompt,
                     audio_guide2=audio_guide2,
+                    audio_guide3=audio_guide3,
                     audio_prompt_type=audio_prompt_type,
                     duration_seconds=duration_seconds,
                     pause_seconds=pause_seconds,
                     temperature=temperature,
                     top_p=top_p,
                     top_k=top_k,
+                    language=language,
+                    speech_speed=speech_speed,
+                    text_normalization=text_normalization,
+                    custom_settings=custom_settings,
                     set_progress_status=set_progress_status,
                     callback=callback,
                     **kwargs,
@@ -548,6 +568,8 @@ class IndexTTS2Pipeline:
         text = _read_text_or_file(input_prompt, "Prompt").strip()
         if len(text) == 0:
             raise ValueError("Prompt text cannot be empty for IndexTTS2.")
+        if self.is_v25:
+            language = str(model_mode or language)
 
         if audio_guide is None or not os.path.isfile(str(audio_guide)):
             raise ValueError("IndexTTS2 requires one reference audio file.")
@@ -573,6 +595,17 @@ class IndexTTS2Pipeline:
         temperature = _to_float(temperature, 0.8)
         pause_seconds = _to_float(pause_seconds, 0.0)
         pause_seconds = max(0.0, min(10.0, pause_seconds))
+        if isinstance(custom_settings, dict):
+            language = custom_settings.get(_LANGUAGE_SETTING_ID, language)
+            speech_speed = custom_settings.get(_SPEECH_SPEED_SETTING_ID, speech_speed)
+            text_normalization = custom_settings.get(_TEXT_NORMALIZATION_SETTING_ID, text_normalization)
+        language = str(language).strip().upper()
+        speech_speed = max(0.5, min(2.0, _to_float(speech_speed, 1.0)))
+        duration_factor = 1.0 / speech_speed
+        if isinstance(text_normalization, str):
+            text_normalization = text_normalization.strip().lower() in ("yes", "true", "1", "enabled")
+        else:
+            text_normalization = bool(text_normalization)
         pause_transition_ms = int(round(pause_seconds * 1000.0))
         last_progress_status = None
 
@@ -604,7 +637,7 @@ class IndexTTS2Pipeline:
             # No explicit duration: use a generous budget tied to split limit.
             global_max_mel_tokens = int(math.ceil(max_text_tokens_per_segment * 24.0))
         global_max_mel_tokens = max(1500, min(12000, global_max_mel_tokens))
-        auto_split_seconds = self._resolve_auto_split_seconds(kwargs)
+        auto_split_seconds = self._resolve_auto_split_seconds(custom_settings)
         auto_split_tokens = (
             max(1, int(round(auto_split_seconds * _AUTO_SPLIT_TOKENS_PER_SECOND)))
             if auto_split_seconds is not None
@@ -613,26 +646,16 @@ class IndexTTS2Pipeline:
         if auto_split_tokens is not None and auto_split_tokens > 0:
             max_text_tokens_per_segment = max(20, min(max_text_tokens_per_segment, auto_split_tokens))
         default_emotion = _read_text_or_file(alt_prompt, "Default Emotion Instruction").strip()
-        auto_sentence_emotion_mode = len(default_emotion) == 0 and audio_prompt_type != "AB"
 
         def _explicit_segment_emotion(segment):
             return str(segment.get("emotion", "") or "").strip()
 
         def _effective_segment_emotion_text(segment):
-            explicit = _explicit_segment_emotion(segment)
-            if len(explicit) > 0:
-                return explicit
-            if auto_sentence_emotion_mode:
-                return str(segment.get("text", "") or "").strip()
-            return ""
+            return _explicit_segment_emotion(segment)
 
         def _emotion_progress_label(segment):
             explicit = _explicit_segment_emotion(segment)
-            if len(explicit) > 0:
-                return explicit
-            if auto_sentence_emotion_mode:
-                return "auto(text)"
-            return "default"
+            return explicit if len(explicit) > 0 else "reference audio"
 
         def _emotion_key(value):
             return re.sub(r"\s+", " ", str(value or "")).strip().lower()
@@ -649,11 +672,13 @@ class IndexTTS2Pipeline:
         if audio_prompt_type == "2":
             if audio_guide2 is None or not os.path.isfile(str(audio_guide2)):
                 raise ValueError("Two-speaker mode requires a second speaker reference audio file.")
+            speaker_audios = [str(audio_guide), str(audio_guide2)] + ([str(audio_guide3)] if "D" in raw_audio_prompt_type else [])
             segments = self._parse_segment_plan(
                 text,
                 two_speaker=True,
                 default_emotion=default_emotion,
                 auto_split_tokens=auto_split_tokens,
+                speaker_count=len(speaker_audios),
             )
             cg_shared_kwargs = self._compute_shared_cg_settings(
                 segments,
@@ -668,9 +693,9 @@ class IndexTTS2Pipeline:
                 if hasattr(self.model, "precache_emotion_texts") and unique_emo_texts:
                     self.model.precache_emotion_texts(unique_emo_texts)
                 if hasattr(self.model, "precache_reference_audio"):
-                    self.model.precache_reference_audio([str(audio_guide), str(audio_guide2)], verbose=False)
+                    self.model.precache_reference_audio(speaker_audios, verbose=False)
                 if hasattr(self.model, "precache_emotion_audio"):
-                    self.model.precache_emotion_audio([str(audio_guide), str(audio_guide2)], verbose=False)
+                    self.model.precache_emotion_audio(speaker_audios, verbose=False)
             except RuntimeError as exc:
                 if _ABORT_ERROR in str(exc) or self._abort_requested() or self._early_stop_requested():
                     self.model._clear_persistent_generation_cache()
@@ -693,7 +718,7 @@ class IndexTTS2Pipeline:
                         return None
 
                     speaker_slot = int(segment["speaker"])
-                    speaker_audio = str(audio_guide) if speaker_slot == 1 else str(audio_guide2)
+                    speaker_audio = speaker_audios[speaker_slot - 1]
                     segment_emo_text = _effective_segment_emotion_text(segment)
                     use_emo_text = len(segment_emo_text) > 0
                     segment_text = str(segment["text"]).strip()
@@ -738,6 +763,9 @@ class IndexTTS2Pipeline:
                         clear_cache_after=False,
                         defer_s2mel=True,
                         defer_bigvgan=True,
+                        lang=language,
+                        duration_factor=duration_factor,
+                        text_normalization=text_normalization,
                     )
                     if segment_output is None:
                         if self._abort_requested():
@@ -923,6 +951,9 @@ class IndexTTS2Pipeline:
                     clear_cache_after=False,
                     defer_s2mel=True,
                     defer_bigvgan=True,
+                    lang=language,
+                    duration_factor=duration_factor,
+                    text_normalization=text_normalization,
                 )
                 if segment_output is None:
                     if self._abort_requested():
