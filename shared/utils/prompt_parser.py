@@ -1,4 +1,5 @@
 import re
+from .frame_scheduler import SLASH_BLOCK_RE
 
 PROMPT_UNIT_PREFIX = "#!PROMPT!:"
 ENHANCED_PROMPT_PREFIX = "!enhanced!\n"
@@ -57,6 +58,24 @@ def split_prompt_units(prompt_text, multi_prompts_gen_type, single_prompt=False,
         return prompts
     return [one_line.strip() for one_line in prompt_text.split("\n") if one_line.strip()]
 
+def validate_sliding_window_prompt_boundaries(prompts, multi_prompts_gen_type, image_end=None):
+    if normalize_multi_prompts_mode(multi_prompts_gen_type, "FG") != "PW":
+        return ""
+    prompts = list(prompts or [])
+    command_windows = [prompt for prompt in prompts if str(prompt or "").lstrip().startswith("[/")]
+    end_frame_count = len(image_end) if isinstance(image_end, (list, tuple)) else int(bool(image_end))
+    structured_fields = ("overall_soundscape:", "non_diegetic_music:")
+    structured_extras = all(prompt in command_windows or str(prompt or "").lstrip().startswith(structured_fields) for prompt in prompts)
+    intended_count_confirmed = end_frame_count == len(command_windows) or structured_extras
+    if len(command_windows) < 2 or len(prompts) == len(command_windows) or not intended_count_confirmed:
+        return ""
+    evidence = f" and {end_frame_count} End Images" if end_frame_count == len(command_windows) else ""
+    return (
+        f"The prompt is parsed as {len(prompts)} sliding windows, but {len(command_windows)} explicit [/...] window markers{evidence} indicate {len(command_windows)} intended windows. "
+        "With 'Each Paragraph Separated by an Empty line will be used for a new Sliding Window of the same Video Generation', every blank line starts a new window. "
+        "Keep every line and labeled section belonging to one window adjacent with single newlines, and use exactly one blank line between complete windows."
+    )
+
 def serialize_prompt_units(prompt_text, prompts, multi_prompts_gen_type):
     prompt_text = prompt_text.replace("\r\n", "\n").replace("\r", "\n")
     if prompt_text.startswith(ENHANCED_PROMPT_PREFIX):
@@ -76,6 +95,12 @@ def split_prompt_original_units(prompt_text, multi_prompts_gen_type, single_prom
     def split_marker(line):
         return line[len(PROMPT_UNIT_PREFIX):].strip() if line.startswith(PROMPT_UNIT_PREFIX) else None
 
+    def original_with_commands(original, visible):
+        commands = " ".join(match.group(0) for match in SLASH_BLOCK_RE.finditer(visible))
+        original = SLASH_BLOCK_RE.sub("", original).strip()
+        separator = "\n" if "P" in multi_prompts_gen_type or multi_prompts_gen_type == "FG" else " "
+        return f"{commands}{separator}{original}".strip() if commands else original
+
     if single_prompt or multi_prompts_gen_type == "FG":
         originals, visible_lines = [], []
         for raw_line in prompt_text.split("\n"):
@@ -87,7 +112,7 @@ def split_prompt_original_units(prompt_text, multi_prompts_gen_type, single_prom
             if not raw_line.strip().startswith("#"):
                 visible_lines.append(raw_line.rstrip())
         visible_prompt = "\n".join(visible_lines).strip()
-        prompt = "\n".join(originals) if originals else visible_prompt
+        prompt = original_with_commands("\n".join(originals), visible_prompt) if originals else visible_prompt
         return [prompt] if prompt else []
 
     if "P" in multi_prompts_gen_type:
@@ -96,7 +121,7 @@ def split_prompt_original_units(prompt_text, multi_prompts_gen_type, single_prom
         def flush_paragraph():
             nonlocal current_lines, current_original
             visible_prompt = "\n".join(current_lines).strip()
-            prompt = current_original or visible_prompt
+            prompt = original_with_commands(current_original, visible_prompt) if current_original else visible_prompt
             if prompt:
                 prompts.append(prompt)
             current_lines, current_original = [], None
@@ -127,7 +152,7 @@ def split_prompt_original_units(prompt_text, multi_prompts_gen_type, single_prom
             continue
         if not raw_line.strip() or raw_line.strip().startswith("#"):
             continue
-        prompts.append(pending_original or raw_line.rstrip().strip())
+        prompts.append(original_with_commands(pending_original, raw_line) if pending_original else raw_line.rstrip().strip())
         pending_original = None
     if pending_original:
         prompts.append(pending_original)
@@ -140,9 +165,19 @@ def serialize_prompt_blocks_with_prefix(prompts, original_prompts=None):
         original_prompts = []
     for idx, prompt in enumerate(prompts, start=1):
         original_prompt = original_prompts[idx - 1] if idx - 1 < len(original_prompts) else f"Prompt {idx}"
+        original_prompt = SLASH_BLOCK_RE.sub("", str(original_prompt or ""))
         original_prompt = re.sub(r"[\r\n]+", " ", str(original_prompt or "")).strip()
         blocks.append(f"{PROMPT_UNIT_PREFIX} {original_prompt}\n{prompt}")
     return "\n\n".join(blocks)
+
+def parse_prompt_history(prompt_text, enhanced_prompt_text, multi_prompts_gen_type):
+    prompt_text = str(prompt_text or "")
+    enhanced_prompt_text = str(enhanced_prompt_text or "")
+    if enhanced_prompt_text:
+        return split_prompt_units(prompt_text, multi_prompts_gen_type, originals=True), split_prompt_units(enhanced_prompt_text, multi_prompts_gen_type)
+    if prompt_text.startswith(PROMPT_UNIT_PREFIX):
+        return split_prompt_units(prompt_text, multi_prompts_gen_type, originals=True), split_prompt_units(prompt_text, multi_prompts_gen_type)
+    return None
 
 def is_speaker_options_line(line):
     return SPEAKER_OPTIONS_LINE_RE.search(line or "") is not None

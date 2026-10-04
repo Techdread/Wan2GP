@@ -1,3 +1,4 @@
+from shared.utils.phase_progress import generation_progress
 import json
 import os
 from functools import lru_cache
@@ -142,7 +143,7 @@ class model_factory:
 
         model_class = ZImageTransformer2DModel
 
-        kwargs_light= { "writable_tensors": False, "preprocess_sd": preprocess_sd, "fused_split_map": _ZIMAGE_FUSED_SPLIT_MAP }
+        kwargs_light= { "writable_tensors": False, "default_dtype": torch.bfloat16, "preprocess_sd": preprocess_sd, "fused_split_map": _ZIMAGE_FUSED_SPLIT_MAP }
         # model_filename contains all files to load (transformer + modules merged by loader)
         import json
         import accelerate
@@ -209,7 +210,7 @@ class model_factory:
             writable_tensors=True,
             modelClass=AutoencoderKL,
             defaultConfigPath=vae_config_path,
-            default_dtype=VAE_dtype,
+            default_dtype=None,
         )
 
         # Scheduler
@@ -227,6 +228,7 @@ class model_factory:
         self.vae = vae
         self.scheduler = scheduler
 
+    @generation_progress
     def generate(
         self,
         seed: int | None = None,
@@ -285,11 +287,11 @@ class model_factory:
             if callable(set_progress_status):
                 progress_label = getattr(vae_upsampler, "progress_label", "VAE Spatial Upsampling")
                 if current_step is None or total_steps is None:
-                    set_progress_status(f"{progress_label} in progress")
+                    set_progress_status(f"{progress_label} in Progress")
                 else:
                     total_steps = int(total_steps)
                     step_no = min(int(current_step) + 1, total_steps)
-                    set_progress_status(f"{progress_label} in progress ({step_no}/{total_steps})")
+                    set_progress_status(f"{progress_label} in Progress ({step_no}/{total_steps})")
 
         images = self.pipeline(
             prompt=input_prompt,

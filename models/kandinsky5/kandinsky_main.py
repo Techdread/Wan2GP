@@ -1,3 +1,4 @@
+from shared.utils.phase_progress import generation_progress
 import os
 import json
 import torch
@@ -140,6 +141,7 @@ class model_factory:
             dit,
             model_filename,
             writable_tensors=False,
+            default_dtype=torch.bfloat16,
             preprocess_sd=_preprocess_dit_state_dict,
         )
         offload.change_dtype(dit, dtype, True)
@@ -178,6 +180,7 @@ class model_factory:
         self.text_embedder = text_embedder
         self.vae = vae
 
+    @generation_progress
     def generate(
         self,
         seed: int | None = None,
@@ -195,6 +198,7 @@ class model_factory:
         progress: bool | None = None,
         joint_pass: bool = False,
         VAE_tile_size: dict | None = None,
+        set_progress_status=None,
         **kwargs,
     ):
         if seed is not None and seed < 0:

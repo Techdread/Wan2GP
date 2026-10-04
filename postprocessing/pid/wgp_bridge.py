@@ -4,6 +4,7 @@ from typing import Any, Callable
 
 import torch
 
+from postprocessing.spatial_upsamplers import format_multiplier_value
 from postprocessing.pid.runtime import (
     PID_TEXT_ENCODER_FILES,
     PID_TEXT_ENCODER_FOLDER,
@@ -28,6 +29,7 @@ from postprocessing.pid.runtime import (
     pid_backbone_for_upsampling,
     pid_checkpoint_filename,
     pid_post_upsampling_choices,
+    pid_spatial_block_size,
     pid_version_for_upsampling,
     pid_vae_filename,
     normalize_pid_tiling_threshold,
@@ -37,13 +39,10 @@ from postprocessing.pid.runtime import (
 
 
 class PiDBridge:
-    PERSIST_UNLOAD = 1
-    PERSIST_RAM = 2
     UPSAMPLING_RATIOS = (4.0,)
     UPSAMPLING_METHODS = (PID_FLUX_POST_UPSAMPLING_METHOD, PID_FLUX2_POST_UPSAMPLING_METHOD, PID_FLUX_POST_UPSAMPLING_METHOD_V15, PID_FLUX2_POST_UPSAMPLING_METHOD_V15, PID_QWEN_POST_UPSAMPLING_METHOD, PID_FLUX_VAE_UPSAMPLING_METHOD, PID_FLUX2_VAE_UPSAMPLING_METHOD, PID_FLUX_VAE_UPSAMPLING_METHOD_V15, PID_FLUX2_VAE_UPSAMPLING_METHOD_V15, PID_QWEN_VAE_UPSAMPLING_METHOD)
     batch_image_inputs = True
     uses_image_profile = True
-    PERSISTENCE_CHOICES = [("Unload after use", PERSIST_UNLOAD), ("Persistent in RAM", PERSIST_RAM)]
 
     def __init__(self, server_config: dict[str, Any], files_locator):
         self.server_config = server_config
@@ -52,7 +51,7 @@ class PiDBridge:
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
-        return {"version": PID_VERSION_DEFAULT, "tiling_threshold": PID_TILING_THRESHOLD_DEFAULT, "persistence": cls.PERSIST_UNLOAD}
+        return {"version": PID_VERSION_DEFAULT, "tiling_threshold": PID_TILING_THRESHOLD_DEFAULT}
 
     @classmethod
     def legacy_config_keys(cls) -> tuple[str, ...]:
@@ -60,7 +59,7 @@ class PiDBridge:
 
     @classmethod
     def legacy_config(cls, config: dict[str, Any]) -> dict[str, Any]:
-        return {"tiling_threshold": config.get("pid_tiling_threshold", PID_TILING_THRESHOLD_DEFAULT), "persistence": config.get("pid_persistence", cls.PERSIST_UNLOAD)}
+        return {"tiling_threshold": config.get("pid_tiling_threshold", PID_TILING_THRESHOLD_DEFAULT)}
 
     @classmethod
     def normalize_config_section(cls, config: dict[str, Any]) -> dict[str, Any]:
@@ -68,12 +67,6 @@ class PiDBridge:
         normalized.update(config or {})
         normalized["version"] = normalize_pid_version_filter(normalized["version"])
         normalized["tiling_threshold"] = normalize_pid_tiling_threshold(normalized.get("tiling_threshold", PID_TILING_THRESHOLD_DEFAULT))
-        try:
-            normalized["persistence"] = int(normalized.get("persistence", cls.PERSIST_UNLOAD))
-        except (TypeError, ValueError):
-            normalized["persistence"] = cls.PERSIST_UNLOAD
-        if normalized["persistence"] not in (cls.PERSIST_UNLOAD, cls.PERSIST_RAM):
-            normalized["persistence"] = cls.PERSIST_UNLOAD
         return normalized
 
     def config(self) -> dict[str, Any]:
@@ -82,7 +75,9 @@ class PiDBridge:
         return upsampler_api.read_config_section(self.server_config, self)
 
     def persistent_models(self) -> bool:
-        return int(self.config()["persistence"] or self.PERSIST_UNLOAD) == self.PERSIST_RAM
+        from postprocessing import spatial_upsamplers as upsampler_api
+
+        return upsampler_api.persistent_models(self.server_config)
 
     def format_method_label(self, label: str, method: str) -> str:
         version = pid_version_for_upsampling(method)
@@ -94,6 +89,8 @@ class PiDBridge:
 
     @classmethod
     def query_upsampler_def(cls) -> dict[str, Any]:
+        post_methods = pid_post_upsampling_choices()
+        vae_methods = [("Flux VAE PiD Upsampler", PID_FLUX_VAE_UPSAMPLING_METHOD), ("Flux2 VAE PiD Upsampler", PID_FLUX2_VAE_UPSAMPLING_METHOD), ("Flux VAE PiD Upsampler", PID_FLUX_VAE_UPSAMPLING_METHOD_V15), ("Flux2 VAE PiD Upsampler", PID_FLUX2_VAE_UPSAMPLING_METHOD_V15), ("Qwen VAE PiD Upsampler", PID_QWEN_VAE_UPSAMPLING_METHOD)]
         return {
             "name": "PiD",
             "upsampler_types": ("postprocessing", "vae"),
@@ -113,10 +110,16 @@ class PiDBridge:
                 PID_FLUX2_VAE_UPSAMPLING_METHOD_V15: 41,
                 PID_QWEN_VAE_UPSAMPLING_METHOD: 42,
             },
-            "methods": pid_post_upsampling_choices(),
-            "vae_methods": [("Flux VAE PiD Upsampler", PID_FLUX_VAE_UPSAMPLING_METHOD), ("Flux2 VAE PiD Upsampler", PID_FLUX2_VAE_UPSAMPLING_METHOD), ("Flux VAE PiD Upsampler", PID_FLUX_VAE_UPSAMPLING_METHOD_V15), ("Flux2 VAE PiD Upsampler", PID_FLUX2_VAE_UPSAMPLING_METHOD_V15), ("Qwen VAE PiD Upsampler", PID_QWEN_VAE_UPSAMPLING_METHOD)],
+            "methods": post_methods,
+            "vae_methods": vae_methods,
             "multipliers": {method: cls.UPSAMPLING_RATIOS for method in cls.UPSAMPLING_METHODS},
-            "default_spatial_upsampling": "flux_pid4",
+            "default_spatial_upsampling": "flux_pid*4",
+            "postprocessing_category": "upsampler",
+            "description": "Uses a dedicated x4 diffusion upsampler for strong detail recovery.",
+            "method_descriptions": {
+                **{method: "VAE-encode the input before diffusion upscaling; tiling can reduce memory peaks on large targets." for _label, method in post_methods},
+                **{method: "Reuse the compatible generation model's existing latent, avoiding a separate input encode." for _label, method in vae_methods},
+            },
         }
 
     def is_upsampling(self, spatial_upsampling) -> bool:
@@ -130,7 +133,7 @@ class PiDBridge:
     def build_value(cls, method, scale) -> str | None:
         method = str(method or "").strip().lower()
         scale = float(scale or 4.0)
-        return f"{method}{scale:g}" if method in cls.UPSAMPLING_METHODS and scale == 4.0 else None
+        return format_multiplier_value(method, scale) if method in cls.UPSAMPLING_METHODS and scale == 4.0 else None
 
     def validate_upsampling(self, spatial_upsampling, image_mode: int) -> str:
         if not self.is_upsampling(spatial_upsampling):
@@ -177,8 +180,7 @@ class PiDBridge:
             with gr.Row():
                 version = gr.Dropdown(choices=[("PiD v1.5 only", "1.5"), ("PiD v1.0 only", "1"), ("Both PiD v1.5 and v1.0", "both")], value=config["version"], label="Visible PiD Versions", interactive=not lock_config)
                 tiling_threshold = gr.Dropdown(choices=PID_TILING_THRESHOLD_CHOICES, value=config["tiling_threshold"], label="PiD Tiling Threshold", interactive=not lock_config)
-                persistence = gr.Dropdown(choices=self.PERSISTENCE_CHOICES, value=config["persistence"], label="PiD Model Persistence", interactive=not lock_config)
-        return [("version", version), ("tiling_threshold", tiling_threshold), ("persistence", persistence)]
+        return [("version", version), ("tiling_threshold", tiling_threshold)]
 
     def validate_config_section(self, config: dict[str, Any]):
         return ""
@@ -207,12 +209,17 @@ class PiDBridge:
             process_files(**download_def)
         return True
 
-    def _prepare_sample(self, sample, device, dtype):
-        frames = sample.transpose(0, 1).contiguous().to(device=device)
+    def _prepare_sample(self, sample, device, dtype, backbone):
+        frames = sample.transpose(0, 1).contiguous()
+        block_size = pid_spatial_block_size(backbone)
+        target_height = max(block_size, round(int(frames.shape[-2]) / block_size) * block_size)
+        target_width = max(block_size, round(int(frames.shape[-1]) / block_size) * block_size)
+        if frames.shape[-2:] != (target_height, target_width):
+            frames = torch.nn.functional.interpolate(frames, size=(target_height, target_width), mode="bilinear", align_corners=False, antialias=True)
         if frames.dtype == torch.uint8:
-            frames = frames.to(dtype=dtype).div_(127.5).sub_(1.0)
+            frames = frames.to(device=device, dtype=dtype).div_(127.5).sub_(1.0)
         else:
-            frames = frames.to(dtype=dtype)
+            frames = frames.to(device=device, dtype=dtype)
         return frames
 
     def load_upsampler(
@@ -284,7 +291,7 @@ class PiDBridge:
         if session is None:
             raise RuntimeError("PiD upsampler is not loaded.")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        images = self._prepare_sample(sample, device, session.dtype)
+        images = self._prepare_sample(sample, device, session.dtype, session.backbone)
         output = session.decode(
             images,
             None,

@@ -64,6 +64,8 @@ _NVFP4_LOAD_LOGGED = False
 _NVFP4_KERNEL_AVAILABLE = False
 _NVFP4_KERNEL_CHECKED = False
 _NVFP4_KERNEL_BACKEND = None
+_NVFP4_AVAILABLE_BACKENDS = ()
+_NVFP4_LOGGED_BACKENDS = set()
 _NVFP4_ACT_SCALE_CACHE = {}
 
 _NVFP4_SPLIT_FIELDS = {
@@ -71,6 +73,7 @@ _NVFP4_SPLIT_FIELDS = {
     "bias": 0,
     "weight_scale": 0,
     "weight_scale_2": 0,
+    "pre_quant_scale": 0,
     "input_scale": 0,
     "input_global_scale": 0,
     "alpha": 0,
@@ -80,7 +83,6 @@ _NVFP4_SPLIT_FIELDS = {
 }
 
 _NVFP4_BACKEND = os.environ.get("WGP_NVFP4_BACKEND", _NVFP4_BACKEND_AUTO).strip().lower()
-_NVFP4_BACKEND = _NVFP4_BACKEND_LIGHTX2V
 
 def _normalize_nvfp4_backend(name):
     if name is None:
@@ -119,6 +121,7 @@ def split_fused_weights(state_dict, fused_split_map, quantization_map=None, allo
         split_handlers={
             "weight_scale": _split_or_share_nvfp4_scale,
             "weight_scale_2": _split_or_share_nvfp4_scale,
+            "pre_quant_scale": _split_or_share_nvfp4_scale,
             "input_scale": _split_or_share_nvfp4_scale,
             "input_global_scale": _split_or_share_nvfp4_scale,
             "alpha": _split_or_share_nvfp4_scale,
@@ -165,20 +168,24 @@ def _nvfp4_lightx2v_device_ok(device):
 def set_nvfp4_backend(name):
     global _NVFP4_BACKEND, _NVFP4_KERNEL_CHECKED, _NVFP4_KERNEL_AVAILABLE, _NVFP4_KERNEL_BACKEND
     global _NVFP4_KERNEL_LOGGED, _NVFP4_LOAD_LOGGED
+    global _NVFP4_AVAILABLE_BACKENDS
     _NVFP4_BACKEND = _normalize_nvfp4_backend(name)
     _NVFP4_KERNEL_CHECKED = False
     _NVFP4_KERNEL_AVAILABLE = False
     _NVFP4_KERNEL_BACKEND = None
+    _NVFP4_AVAILABLE_BACKENDS = ()
+    _NVFP4_LOGGED_BACKENDS.clear()
     _NVFP4_KERNEL_LOGGED = False
     _NVFP4_LOAD_LOGGED = False
     _init_nvfp4_kernel_support()
 
 
-def _nvfp4_note_kernel():
+def _nvfp4_note_kernel(backend):
     global _NVFP4_KERNEL_LOGGED
-    if not _NVFP4_KERNEL_LOGGED:
-        label = _nvfp4_backend_label(_NVFP4_KERNEL_BACKEND) if _NVFP4_KERNEL_BACKEND else "CUDA"
+    if backend not in _NVFP4_LOGGED_BACKENDS:
+        label = _nvfp4_backend_label(backend)
         print(f"NVFP4: using {label} kernel")
+        _NVFP4_LOGGED_BACKENDS.add(backend)
         _NVFP4_KERNEL_LOGGED = True
 
 
@@ -199,6 +206,7 @@ def _nvfp4_note_reset():
     _NVFP4_KERNEL_LOGGED = False
     _NVFP4_FALLBACK_LOGGED = False
     _NVFP4_LOAD_LOGGED = False
+    _NVFP4_LOGGED_BACKENDS.clear()
 
 def _nvfp4_note_load_backend():
     global _NVFP4_LOAD_LOGGED
@@ -206,15 +214,14 @@ def _nvfp4_note_load_backend():
         return
     _NVFP4_LOAD_LOGGED = True
     if _NVFP4_KERNEL_AVAILABLE:
-        label = _nvfp4_backend_label(_NVFP4_KERNEL_BACKEND) if _NVFP4_KERNEL_BACKEND else "unknown"
-        print(f"NVFP4: kernels available ({label}); optimized path will be used when compatible.")
+        label = ", ".join(_nvfp4_backend_label(b) for b in _NVFP4_AVAILABLE_BACKENDS)
+        print(f"NVFP4: kernels available ({label}); selection follows weight packing and compatibility.")
     else:
         print("NVFP4: kernels unavailable; using fallback.")
 
 
 def _check_nvfp4_kernel_support(device, backend):
-    # return False
-    if device.type != "cuda":
+    if device.type != "cuda" or torch.version.hip is not None:
         return False
     if backend == _NVFP4_BACKEND_COMFY:
         if not _ck_cuda_available:
@@ -223,10 +230,20 @@ def _check_nvfp4_kernel_support(device, backend):
             return False
         if not hasattr(_ck_cuda, "quantize_nvfp4"):
             return False
-        if not (hasattr(torch.ops, "comfy_kitchen") and hasattr(torch.ops.comfy_kitchen, "scaled_mm_nvfp4")):
-            return False
         major, minor = torch.cuda.get_device_capability(device)
-        return (major, minor) >= (10, 0)
+        if (major, minor) < (10, 0):
+            return False
+        # Exercise the installed binary and cuBLAS, not just its Python exports.
+        with torch.inference_mode():
+            scale = torch.ones((), device=device, dtype=torch.float32)
+            for dtype in (torch.float16, torch.bfloat16):
+                x = torch.full((16, 128), 6.0, device=device, dtype=dtype)
+                packed, blocks = _ck_cuda.quantize_nvfp4(x, scale)
+                out = _ck_cuda.scaled_mm_nvfp4(
+                    packed, packed, scale, scale, blocks, blocks, out_dtype=dtype)
+                if out.shape != (16, 16) or out.dtype != dtype or not (out == 4608).all().item():
+                    return False
+        return True
     if backend == _NVFP4_BACKEND_LIGHTX2V:
         if not _lx_gemm_available:
             return False
@@ -243,22 +260,30 @@ def _check_nvfp4_kernel_support(device, backend):
 
 def _init_nvfp4_kernel_support():
     global _NVFP4_KERNEL_AVAILABLE, _NVFP4_KERNEL_CHECKED, _NVFP4_KERNEL_BACKEND
+    global _NVFP4_AVAILABLE_BACKENDS
     if _NVFP4_KERNEL_CHECKED:
+        return
+    if torch.compiler.is_compiling():
+        return
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
         return
     _NVFP4_KERNEL_CHECKED = True
     _NVFP4_KERNEL_AVAILABLE = False
     _NVFP4_KERNEL_BACKEND = None
+    available = []
+    _NVFP4_AVAILABLE_BACKENDS = ()
     if not torch.cuda.is_available():
         return
     device = torch.device("cuda")
     for backend in _nvfp4_backend_candidates():
         try:
             if _check_nvfp4_kernel_support(device, backend):
-                _NVFP4_KERNEL_AVAILABLE = True
-                _NVFP4_KERNEL_BACKEND = backend
-                break
+                available.append(backend)
         except Exception:
             continue
+    _NVFP4_AVAILABLE_BACKENDS = tuple(available)
+    _NVFP4_KERNEL_AVAILABLE = bool(available)
+    _NVFP4_KERNEL_BACKEND = available[0] if available else None
 
 
 def _supports_nvfp4_kernel(device):
@@ -280,6 +305,22 @@ def _nvfp4_layout(weight):
     return getattr(weight, "_layout", _NVFP4_LAYOUT_LEGACY)
 
 
+def _nvfp4_select_backend(input, weight):
+    layout = _nvfp4_layout(weight)
+    order = ((_NVFP4_BACKEND_LIGHTX2V, _NVFP4_BACKEND_COMFY) if layout == _NVFP4_LAYOUT_LEGACY
+             else (_NVFP4_BACKEND_COMFY, _NVFP4_BACKEND_LIGHTX2V))
+    k, n = input.shape[-1], weight.size(0)
+    for backend in order:
+        if backend not in _NVFP4_AVAILABLE_BACKENDS:
+            continue
+        if backend == _NVFP4_BACKEND_LIGHTX2V:
+            if k % 32 == 0 and n % 32 == 0:
+                return backend
+        elif k % (64 if layout == _NVFP4_LAYOUT_LEGACY else 32) == 0 and n % 8 == 0:
+            return backend
+    return None
+
+
 def _nvfp4_can_use_kernel(input, weight):
     if not torch.is_tensor(input):
         return False
@@ -287,24 +328,9 @@ def _nvfp4_can_use_kernel(input, weight):
         return False
     if not _supports_nvfp4_kernel(input.device):
         return False
-    backend = _NVFP4_KERNEL_BACKEND
+    backend = _nvfp4_select_backend(input, weight)
     if backend is None:
         return False
-    layout = _nvfp4_layout(weight)
-    if backend == _NVFP4_BACKEND_LIGHTX2V:
-        if input.shape[-1] % 32 != 0:
-            return False
-        if weight.size(0) % 32 != 0:
-            return False
-    else:
-        if layout == _NVFP4_LAYOUT_LEGACY:
-            if input.shape[-1] % 64 != 0:
-                return False
-        else:
-            if input.shape[-1] % 16 != 0:
-                return False
-        if weight.size(0) % 8 != 0:
-            return False
     if weight._data.shape[1] * 2 != input.shape[-1]:
         return False
     if weight._block_size != 16:
@@ -336,7 +362,7 @@ def _nvfp4_swap_nibbles(tensor):
 
 
 def _nvfp4_linear_cuda_comfy(input, weight, bias=None):
-    _nvfp4_note_kernel()
+    _nvfp4_note_kernel(_NVFP4_BACKEND_COMFY)
     x2d = input.reshape(-1, input.shape[-1])
     if not x2d.is_floating_point():
         x2d = x2d.to(torch.float16)
@@ -406,7 +432,7 @@ def _nvfp4_linear_cuda_comfy(input, weight, bias=None):
 
 
 def _nvfp4_linear_cuda_lightx2v(input, weight, bias=None):
-    _nvfp4_note_kernel()
+    _nvfp4_note_kernel(_NVFP4_BACKEND_LIGHTX2V)
     x2d = input.reshape(-1, input.shape[-1])
     if not x2d.is_floating_point():
         x2d = x2d.to(torch.float16)
@@ -471,7 +497,7 @@ def _nvfp4_linear_cuda_lightx2v(input, weight, bias=None):
 
 
 def _nvfp4_linear_cuda(input, weight, bias=None):
-    if _NVFP4_KERNEL_BACKEND == _NVFP4_BACKEND_LIGHTX2V:
+    if _nvfp4_select_backend(input, weight) == _NVFP4_BACKEND_LIGHTX2V:
         return _nvfp4_linear_cuda_lightx2v(input, weight, bias=bias)
     return _nvfp4_linear_cuda_comfy(input, weight, bias=bias)
 
@@ -623,6 +649,7 @@ def _collect_nvfp4_specs(state_dict):
                     "weight": tensor,
                     "weight_scale": state_dict[scale_key],
                     "weight_scale_2": state_dict[weight_scale_2_key],
+                    "pre_quant_scale": state_dict.get(base + ".pre_quant_scale", None),
                     "input_scale": state_dict.get(input_scale_key, None),
                     "bias": state_dict.get(base + ".bias", None),
                     "layout": _NVFP4_LAYOUT_TENSORCORE,
@@ -649,6 +676,7 @@ def _collect_nvfp4_specs(state_dict):
                 "name": base,
                 "weight": tensor,
                 "weight_scale": state_dict[scale_key],
+                "pre_quant_scale": state_dict.get(base + ".pre_quant_scale", None),
                 "input_global_scale": input_global_scale,
                 "alpha": alpha,
                 "bias": state_dict.get(base + ".bias", None),
@@ -700,6 +728,7 @@ class Int8TensorwiseEmbedding(torch.nn.Embedding):
                          module.scale_grad_by_freq, module.sparse, device=module.weight.device, dtype=module.weight.dtype)
         self.register_buffer("weight_scale", torch.empty((module.num_embeddings, 1), device=module.weight.device, dtype=torch.float32))
         self.output_dtype = output_dtype
+        self._lock_dtype = torch.int8
         self.requires_grad_(False)
 
     def forward(self, input):
@@ -750,6 +779,7 @@ class NVFP4WeightTensor(QTensor):
         alpha=None,
         input_scale=None,
         weight_scale_2=None,
+        pre_quant_scale=None,
         device=None,
         requires_grad=False,
         layout=_NVFP4_LAYOUT_LEGACY,
@@ -778,6 +808,8 @@ class NVFP4WeightTensor(QTensor):
             input_global_scale = input_global_scale.to(device)
         if alpha.device != device:
             alpha = alpha.to(device)
+        if pre_quant_scale is not None and pre_quant_scale.device != device:
+            pre_quant_scale = pre_quant_scale.to(device)
         return NVFP4WeightTensor(
             qtype=_NVFP4_QTYPE,
             axis=0,
@@ -787,6 +819,7 @@ class NVFP4WeightTensor(QTensor):
             weight_scale=weight_scale,
             input_global_scale=input_global_scale,
             alpha=alpha,
+            pre_quant_scale=pre_quant_scale,
             allow_kernel=allow_kernel,
             dtype=dtype,
             requires_grad=requires_grad,
@@ -805,6 +838,7 @@ class NVFP4WeightTensor(QTensor):
         input_global_scale,
         alpha,
         dtype,
+        pre_quant_scale=None,
         allow_kernel=True,
         requires_grad=False,
         layout=_NVFP4_LAYOUT_LEGACY,
@@ -829,6 +863,7 @@ class NVFP4WeightTensor(QTensor):
         input_global_scale,
         alpha,
         dtype,
+        pre_quant_scale=None,
         requires_grad=False,
         layout=_NVFP4_LAYOUT_LEGACY,
         allow_kernel=True,
@@ -838,6 +873,7 @@ class NVFP4WeightTensor(QTensor):
         self._scale = weight_scale
         self._input_global_scale = input_global_scale
         self._alpha = alpha
+        self._pre_quant_scale = pre_quant_scale
         self._block_size = 16
         self._layout = layout
         self._allow_kernel = allow_kernel
@@ -865,18 +901,22 @@ class NVFP4WeightTensor(QTensor):
 
     def get_quantized_subtensors(self):
         if self._layout == _NVFP4_LAYOUT_TENSORCORE:
-            return [
+            subtensors = [
                 ("weight_u8", self._data),
                 ("weight_scale", self._scale),
                 ("weight_scale_2", self._alpha),
                 ("input_scale", self._input_global_scale),
             ]
-        return [
-            ("weight_u8", self._data),
-            ("weight_scale", self._scale),
-            ("input_global_scale", self._input_global_scale),
-            ("alpha", self._alpha),
-        ]
+        else:
+            subtensors = [
+                ("weight_u8", self._data),
+                ("weight_scale", self._scale),
+                ("input_global_scale", self._input_global_scale),
+                ("alpha", self._alpha),
+            ]
+        if self._pre_quant_scale is not None:
+            subtensors.append(("pre_quant_scale", self._pre_quant_scale))
+        return subtensors
 
     def set_quantized_subtensors(self, sub_tensors):
         if isinstance(sub_tensors, dict):
@@ -896,9 +936,13 @@ class NVFP4WeightTensor(QTensor):
             self._alpha = sub_map["weight_scale_2"]
         elif "alpha" in sub_map and sub_map["alpha"] is not None:
             self._alpha = sub_map["alpha"]
+        if "pre_quant_scale" in sub_map:
+            self._pre_quant_scale = sub_map["pre_quant_scale"]
 
     def __tensor_flatten__(self):
         inner_tensors = ["_data", "_scale", "_input_global_scale", "_alpha"]
+        if self._pre_quant_scale is not None:
+            inner_tensors.append("_pre_quant_scale")
         meta = {
             "qtype": self._qtype.name,
             "axis": str(self._axis),
@@ -933,6 +977,7 @@ class NVFP4WeightTensor(QTensor):
             weight_scale=inner_tensors["_scale"],
             input_global_scale=inner_tensors["_input_global_scale"],
             alpha=inner_tensors["_alpha"],
+            pre_quant_scale=inner_tensors.get("_pre_quant_scale"),
             allow_kernel=allow_kernel,
             dtype=dtype,
             layout=layout,
@@ -966,6 +1011,7 @@ class NVFP4WeightTensor(QTensor):
                 weight_scale=op(t._scale),
                 input_global_scale=op(t._input_global_scale),
                 alpha=op(t._alpha),
+                pre_quant_scale=op(t._pre_quant_scale) if t._pre_quant_scale is not None else None,
                 allow_kernel=getattr(t, "_allow_kernel", True),
                 size=t.size(),
                 stride=t.stride(),
@@ -984,11 +1030,13 @@ class NVFP4WeightTensor(QTensor):
             out_scale = op(t._scale, device=device, **(kwargs or {}))
             out_igs = op(t._input_global_scale, device=device, **(kwargs or {}))
             out_alpha = op(t._alpha, device=device, **(kwargs or {}))
+            out_pre_quant_scale = op(t._pre_quant_scale, device=device, **(kwargs or {})) if t._pre_quant_scale is not None else None
             return NVFP4WeightTensor.create(
                 weight_u8=out_data,
                 weight_scale=out_scale,
                 input_global_scale=out_igs,
                 alpha=out_alpha,
+                pre_quant_scale=out_pre_quant_scale,
                 allow_kernel=getattr(t, "_allow_kernel", True),
                 size=t.size(),
                 stride=t.stride(),
@@ -1063,6 +1111,9 @@ class QLinearNVFP4(QModuleMixin, torch.nn.Linear):
         return super().qweight
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        pre_quant_scale = getattr(self.qweight, "_pre_quant_scale", None)
+        if pre_quant_scale is not None:
+            input = input * pre_quant_scale.to(device=input.device, dtype=input.dtype)
         return torch.nn.functional.linear(input, self.qweight, bias=self.bias)
 
     def _load_from_state_dict(
@@ -1076,6 +1127,7 @@ class QLinearNVFP4(QModuleMixin, torch.nn.Linear):
         weight_key = prefix + "weight"
         scale_key = prefix + "weight_scale"
         scale2_key = prefix + "weight_scale_2"
+        pre_quant_scale_key = prefix + "pre_quant_scale"
         igs_key = prefix + "input_global_scale"
         alpha_key = prefix + "alpha"
         input_absmax_key = prefix + "input_absmax"
@@ -1087,6 +1139,7 @@ class QLinearNVFP4(QModuleMixin, torch.nn.Linear):
         weight_u8 = state_dict.pop(weight_key, None)
         weight_scale = state_dict.pop(scale_key, None)
         weight_scale_2 = state_dict.pop(scale2_key, None)
+        pre_quant_scale = state_dict.pop(pre_quant_scale_key, None)
         input_global_scale = state_dict.pop(igs_key, None)
         alpha = state_dict.pop(alpha_key, None)
         input_absmax = state_dict.pop(input_absmax_key, None)
@@ -1131,6 +1184,7 @@ class QLinearNVFP4(QModuleMixin, torch.nn.Linear):
                     weight_scale=weight_scale,
                     input_global_scale=input_scale,
                     alpha=weight_scale_2,
+                    pre_quant_scale=pre_quant_scale,
                     allow_kernel=allow_kernel,
                     size=self.weight.size(),
                     stride=self.weight.stride(),
@@ -1147,6 +1201,7 @@ class QLinearNVFP4(QModuleMixin, torch.nn.Linear):
                     weight_scale=weight_scale,
                     input_global_scale=input_global_scale,
                     alpha=alpha,
+                    pre_quant_scale=pre_quant_scale,
                     size=self.weight.size(),
                     stride=self.weight.stride(),
                     dtype=target_dtype,
@@ -1254,6 +1309,9 @@ def validate_nvfp4_kernel(
             )
 
             x = torch.randn(batch_size, in_features, device=device, dtype=dtype)
+            pre_quant_scale = spec.get("pre_quant_scale")
+            if pre_quant_scale is not None:
+                x = x * pre_quant_scale.to(device=device, dtype=dtype)
             if bias is not None:
                 bias = bias.to(device=device, dtype=dtype)
 

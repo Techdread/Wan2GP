@@ -21,6 +21,7 @@
 *.backup
 *.pkl
 *.html
+!shared/deepy/web/app.html
 !plugins/motion_designer/assets/motion_designer_iframe_template.html
 *.pdf
 *.whl
@@ -30,6 +31,7 @@ __pycache__/
 venv/
 env_venv/
 envs.json
+node_modules/
 shared/gradio/wangp_image_editor/templates/component/index.js.map
 storage/
 samples/
@@ -46,10 +48,19 @@ ckpts/
 loras/
 loras_i2v/
 tmp/
+deepy_sessions/
+dlss5/
 /settings/
+
+# Local engineering specifications and tests must never be committed.
+/specs/
+/tests/
 
 wgp_config.json
 plugins_local.json
+/plugins/wan2gp-*/
+!/plugins/wan2gp-ming-image/
+/plugins/wangp-*/
 loras_url_cache.json
 AI-integration/01-ai-media-capability-architecture.md
 AI-integration/02-settings-and-capability-dashboard.md

@@ -12,6 +12,7 @@ from .feed_forward import FeedForward
 from .rope import LTXRopeType
 from .transformer_args import TransformerArgs
 from ...utils import rms_norm
+from ....denoiser_kernels import scale_shift
 
 
 def _reshape_hidden_states(hidden_states: torch.Tensor, frames: int) -> torch.Tensor:
@@ -23,6 +24,9 @@ def _restore_hidden_states_shape(hidden_states: torch.Tensor) -> torch.Tensor:
 
 
 def _apply_scale_shift(hidden_states: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, in_place: bool = True) -> torch.Tensor:
+    fused = scale_shift(hidden_states, scale, shift, in_place)
+    if fused is not None:
+        return fused
     if scale.shape[1] == hidden_states.shape[1]:
         if in_place:
             hidden_states.mul_(1 + scale).add_(shift)
@@ -53,6 +57,7 @@ class TransformerConfig:
     context_dim: int
     apply_gated_attention: bool = False
     cross_attention_adaln: bool = False
+    ff_bias: bool = True
 
 
 class BasicAVTransformerBlock(torch.nn.Module):
@@ -89,7 +94,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 attention_function=attention_function,
                 apply_gated_attention=video.apply_gated_attention,
             )
-            self.ff = FeedForward(video.dim, dim_out=video.dim)
+            self.ff = FeedForward(video.dim, dim_out=video.dim, bias=video.ff_bias)
             self.scale_shift_table = torch.nn.Parameter(torch.empty(adaln_embedding_coefficient(video.cross_attention_adaln), video.dim))
 
         if audio is not None:
@@ -113,7 +118,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
                 attention_function=attention_function,
                 apply_gated_attention=audio.apply_gated_attention,
             )
-            self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim)
+            self.audio_ff = FeedForward(audio.dim, dim_out=audio.dim, bias=audio.ff_bias)
             self.audio_scale_shift_table = torch.nn.Parameter(torch.empty(adaln_embedding_coefficient(audio.cross_attention_adaln), audio.dim))
 
         if audio is not None and video is not None:

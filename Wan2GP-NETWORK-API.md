@@ -77,7 +77,8 @@ curl http://192.168.1.199:8100/api/health
 ```json
 {
   "status": "ok",
-  "version": "0.6.0",
+  "version": "0.7.0",
+  "wangp_version": "13.141",
   "uptime_seconds": 1234,
   "queue": {"running": 0, "queued": 0},
   "current_job_id": null,
@@ -288,7 +289,7 @@ Valid H3 text-encoder configs are `bf16`, `int8`, `nvfp4_awq`,
   "num_inference_steps": 20,
   "video_length": 124,
   "image_refs": ["/server/path/person.png"],
-  "video_prompt_type": "IVG",
+  "video_prompt_type": "IV-U",
   "video_guide": "/server/path/motion.mp4",
   "audio_prompt_type": "A",
   "audio_guide": "/server/path/voice.wav"
@@ -298,6 +299,14 @@ Valid H3 text-encoder configs are `bf16`, `int8`, `nvfp4_awq`,
 Use `audio_prompt_type: "K"` to reuse the soundtrack of the reference
 video instead of supplying separate audio. Reference clips must satisfy the
 duration/count constraints returned by the model detail endpoint.
+
+WanGP 13.141 accepts up to nine reference images, three videos, and three
+audio references (12 reference files total). Use video flags `V-U`, `V+-U`,
+or `V+*-U` for one, two, or three reference videos; additional paths go in
+`video_guide2` and `video_guide3`. Audio flags are `A`, `AB`, and `ABD`, with
+additional paths in `audio_guide2` and `audio_guide3`. Ref2VA also accepts
+optional start/end boundary images. The Python `generate_minimax_h3` helper
+sets these flags automatically.
 
 ### Krea 2 Edit and LTX MSR
 
