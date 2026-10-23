@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import json
 import os
 import shutil
@@ -250,6 +251,18 @@ def probe_video_stream_metadata(video_path, *, file_version=None):
         if frame_count <= 0:
             frame_count = int(round(duration * fps_float)) if duration > 0 and fps_float > 0 else 0
     side_data = stream.get("side_data_list") or []
+    rotation = 0
+    for item in side_data:
+        if item.get("rotation") is not None:
+            try:
+                rotation = int(round(float(item["rotation"])))
+            except (TypeError, ValueError, OverflowError):
+                pass
+    needs_sar_fix = display_width != width
+    display_height = height
+    # FFmpeg autorotates before our filters; preserve the stored-raster SAR decision.
+    if abs(rotation) % 180 == 90:
+        display_width, display_height = display_height, display_width
     color_transfer = str(stream.get("color_transfer") or "").lower()
     color_primaries = str(stream.get("color_primaries") or "").lower()
     color_space = str(stream.get("color_space") or "").lower()
@@ -265,7 +278,8 @@ def probe_video_stream_metadata(video_path, *, file_version=None):
         "width": width,
         "height": height,
         "display_width": display_width,
-        "display_height": height,
+        "display_height": display_height,
+        "rotation": rotation,
         "fps_float": fps_float,
         "fps": int(round(fps_float)) if fps_float > 0 else 0,
         "frame_count": frame_count,
@@ -277,7 +291,7 @@ def probe_video_stream_metadata(video_path, *, file_version=None):
         "color_primaries": color_primaries,
         "color_space": color_space,
         "color_range": color_range,
-        "needs_sar_fix": display_width != width,
+        "needs_sar_fix": needs_sar_fix,
         "needs_tonemap": is_hdr,
     })
 
@@ -406,7 +420,8 @@ def _decode_contiguous_video_frames_ffmpeg(video_path, start_frame, max_frames, 
         raise RuntimeError("ffmpeg binary not found")
     start_frame = int(start_frame)
     max_frames = int(max_frames)
-    if metadata.get("virtual_end_frame") is not None:
+    # The caller's limit can greatly exceed the clip length (for example, postprocessing).
+    if metadata["frame_count"] > 0 or metadata.get("virtual_end_frame") is not None:
         available_frames = max(0, int(metadata["frame_count"]) - max(0, start_frame))
         max_frames = min(max_frames, available_frames)
     if max_frames <= 0:

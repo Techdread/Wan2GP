@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """Cooperative media pause/abort at MMGP block boundaries and preparation checkpoints."""
 
 from contextvars import ContextVar
@@ -6,6 +7,7 @@ from functools import wraps
 import inspect
 import time
 
+from shared.utils.generation_state import set_generation_state
 from shared.utils.process_locks import gen_lock
 
 
@@ -34,7 +36,7 @@ def pause_checkpoint(gen, send_cmd=None, managers=()):
             active = [(model_id, manager.loaded_blocks[model_id]) for model_id in manager.active_models_ids]
             manager.unload_all()
             suspended.append((manager, active))
-        gen["process_status"] = status.replace("request:", "process:", 1)
+        set_generation_state(gen, process_status=status.replace("request:", "process:", 1))
     if send_cmd is not None:
         send_cmd("progress", [0, gen.get("pause_msg", "Media Processing Paused - Click Resume to Continue")])
     while True:
@@ -43,12 +45,12 @@ def pause_checkpoint(gen, send_cmd=None, managers=()):
             manual_pause = status == "process:pause" or status.startswith("process:deepy_pause_")
             if gen.get("abort") and manual_pause:
                 gen["resume"] = True
-                gen["process_status"] = "process:main"
+                set_generation_state(gen, process_status="process:main")
                 break
             if status in ("", "process:main"):
                 break
             if status.startswith("request:"):
-                gen["process_status"] = status.replace("request:", "process:", 1)
+                set_generation_state(gen, process_status=status.replace("request:", "process:", 1))
         time.sleep(0.1)
     if not gen.get("abort"):
         for manager, active in suspended:

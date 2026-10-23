@@ -18,6 +18,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified for WanGP.
 import os
 from dataclasses import dataclass
 from typing import Any, Optional, Union
@@ -1272,8 +1273,8 @@ class TimestepEmbedder(nn.Module):
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
         half = dim // 2
         freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
+        )
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:

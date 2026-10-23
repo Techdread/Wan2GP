@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import ast
 import os
 import sys
@@ -207,7 +208,9 @@ def _get_fp4_lut(device, dtype):
     key = (device, dtype)
     lut = _FP4_LUT_CACHE.get(key)
     if lut is None:
+        from mmgp import cuda_graphs
         lut = _FP4_LUT_BASE.to(device=device, dtype=dtype)
+        lut = cuda_graphs.register_constant(lut)
         _FP4_LUT_CACHE[key] = lut
     return lut
 
@@ -740,37 +743,10 @@ class NunchakuSVDQWeightTensor(NunchakuBaseWeightTensor):
         if not ops:
             return self._linear_fallback(input, bias=bias)
 
-        x = input.reshape(-1, input.shape[-1])
-        qx, ascales, lora_act = ops.svdq_quantize_w4a4_act_fuse_lora_cuda(
-            x,
-            lora_down=self._proj_down,
-            smooth=self._smooth_factor,
-            fp4=True,
-            pad_size=256,
-        )
-        out = torch.empty(qx.shape[0], self.shape[0], dtype=self._proj_up.dtype, device=qx.device)
-        if bias is not None and bias.dtype != out.dtype:
-            bias = bias.to(out.dtype)
-        alpha = 1.0
-        if torch.is_tensor(self._wtscale):
-            alpha = float(self._wtscale.item())
-        elif self._wtscale is not None:
-            alpha = float(self._wtscale)
-        ops.svdq_gemm_w4a4_cuda(
-            act=qx,
-            wgt=self._qweight,
-            out=out,
-            ascales=ascales,
-            wscales=self._wscales,
-            lora_act_in=lora_act,
-            lora_up=self._proj_up,
-            bias=bias,
-            fp4=True,
-            alpha=alpha,
-            wcscales=self._wcscales,
-            act_unsigned=False,
-        )
-        out = out[: x.shape[0]]
+        alpha = self.__dict__.get("_alpha")
+        if alpha is None:  # read once: a device sync on every call otherwise, which CUDA graphs cannot capture
+            alpha = self._alpha = float(self._wtscale.item()) if torch.is_tensor(self._wtscale) else 1.0 if self._wtscale is None else float(self._wtscale)
+        out = w4a4_linear(ops, input.reshape(-1, input.shape[-1]), self, bias, True, alpha, self._wcscales, False)
         return out.reshape(*input.shape[:-1], self.shape[0])
 
     @torch.compiler.disable()
@@ -807,6 +783,7 @@ class NunchakuSVDQWeightTensor(NunchakuBaseWeightTensor):
             self._wscales = sub_map["wscales"]
         if "wtscale" in sub_map and sub_map["wtscale"] is not None:
             self._wtscale = sub_map["wtscale"]
+            self.__dict__.pop("_alpha", None)
         if "wcscales" in sub_map and sub_map["wcscales"] is not None:
             self._wcscales = sub_map["wcscales"]
         if "smooth_factor" in sub_map and sub_map["smooth_factor"] is not None:
@@ -1515,6 +1492,8 @@ def _view_shape_from_args(args, numel):
 
 
 def _copy_mod_flags(src, dst):
+    if src.__dict__.get("_alpha") is not None:  # the scale already read, carried to the copies and moves of the weight
+        dst._alpha = src._alpha
     if getattr(src, "_nunchaku_mod_reorder", False):
         dst._nunchaku_mod_reorder = True
     if getattr(src, "_nunchaku_mod_scale_shift", False):
@@ -1601,3 +1580,10 @@ def convert_to_quanto(state_dict, default_dtype, verboseLevel=1, detection=None)
 
 def apply_pre_quantization(model, state_dict, quantization_map, default_dtype=None, verboseLevel=1):
     return quantization_map or {}, []
+
+
+from mmgp import offload
+from .nunchaku_rows import NunchakuRowProjection, w4a4_linear
+
+_ROW_PROJECTION = NunchakuRowProjection(sys.modules[__name__])
+offload.register_row_projection(_ROW_PROJECTION)

@@ -4,9 +4,10 @@ from typing import Protocol
 import torch
 
 from ...utils import rms_norm
+from shared import attention_kit
 from shared.attention import pay_attention
-from .rope import LTXRopeType, apply_rotary_emb_inplace
-from ....denoiser_kernels import project_many
+from .rope import LTXRopeType, RopeCache, apply_rotary_emb_inplace, apply_rope_cache_heads_inplace
+from shared.kernels.ops import project_many
 
 memory_efficient_attention = None
 flash_attn_interface = None
@@ -200,6 +201,33 @@ class Attention(torch.nn.Module):
                 return "flash", 3
         return None, None
 
+    def _head_mean_squares(self, project):
+        # LTX uses vector_norm followed by square, including that rounding point. Compute each full-width statistic once;
+        # retain only per-token FP32 scalars while projecting/attending groups of heads.
+        result = []
+        for which in (0, 1):
+            full = project(which, range(self.heads)).flatten(2)
+            norm = torch.linalg.vector_norm(full, ord=2, dim=-1, keepdim=True, dtype=torch.float32)
+            del full
+            result.append(norm.square_().div_(self.heads * self.dim_head))
+        return tuple(result)
+
+    def _norm_rope_(self, query, key, pe, k_pe, group):
+        """attention_kit callback: q_norm/k_norm (over all heads) and RoPE of q and/or k in place."""
+        for which, (tensor, norm, freqs, heads) in enumerate(((query, self.q_norm, pe, group.q), (key, self.k_norm, pe if k_pe is None else k_pe, group.kv))):
+            if tensor is not None:
+                rows = tensor.flatten(2)
+                if group.mean_squares is None:
+                    norm(rows)
+                else:
+                    rows.mul_(group.mean_squares[which].add(norm.eps).rsqrt_())
+                    rows.mul_(norm.weight[heads.start * self.dim_head:heads.stop * self.dim_head])
+                if freqs is not None:
+                    if len(heads) == self.heads:
+                        apply_rotary_emb_inplace(rows, freqs, self.rope_type)
+                    else:
+                        apply_rope_cache_heads_inplace(rows, freqs, heads)
+
     def forward(
         self,
         x_list: torch.Tensor,
@@ -209,8 +237,24 @@ class Attention(torch.nn.Module):
         k_pe: torch.Tensor | None = None,
         NAG: dict | None = None,
     ) -> torch.Tensor:
+        split_heads = all(freqs is None or isinstance(freqs, RopeCache) and freqs.rope_type == LTXRopeType.SPLIT
+                          and freqs.num_attention_heads == self.heads for freqs in (pe, k_pe))
+        split_cross = (context_list is not None and NAG is None and split_heads and context_list[0].shape[0] == x_list[0].shape[0] and
+                       attention_kit.head_groups(self.heads, x_list[0].shape[0] * max(x_list[0].shape[1], context_list[0].shape[1])) > 1)
+        if ((context_list is None and mask is None or split_cross) and self._resolve_attention_override()[0] is None):
+            # the gates read the attention input: computed first so that the input is released by the q/k/v projections
+            gate_logits = None if self.to_gate_logits is None else self.to_gate_logits(x_list[0])
+            callback = lambda query, key, group: self._norm_rope_(query, key, pe, k_pe, group)
+            options = dict(split_heads=split_heads, norm_spans_heads=True, norm_stats=self._head_mean_squares, attention_mask=mask)
+            if context_list is None:
+                out = attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.dim_head, callback, **options)
+            else:
+                out = attention_kit.cross_qkv_attention(x_list, context_list, self.to_q, self.to_k, self.to_v, self.heads, self.dim_head, callback, **options)
+            if gate_logits is not None:
+                out.mul_((2.0 * torch.sigmoid(gate_logits).to(dtype=out.dtype)).unsqueeze(-1))
+            return self.to_out(out.flatten(2, 3))
         x = x_list[0]
-        gate_input = x
+        gate_logits = None if self.to_gate_logits is None else self.to_gate_logits(x)  # first: x is released after the projections
         x_list.clear()
         context = None
         if context_list is not None:
@@ -219,9 +263,11 @@ class Attention(torch.nn.Module):
         cross_attn = context is not None
         if cross_attn:
             q = self.to_q(x)
-            k, v = project_many((self.to_k, self.to_v), context)
+            context_list, context, x = [context], None, None
+            k, v = project_many((self.to_k, self.to_v), context_list)
         else:
-            q, k, v = project_many((self.to_q, self.to_k, self.to_v), x)
+            x_list, x = [x], None
+            q, k, v = project_many((self.to_q, self.to_k, self.to_v), x_list)
         x = None
         context = None
         self.q_norm(q)
@@ -274,11 +320,10 @@ class Attention(torch.nn.Module):
                 out.mul_(nag_alpha)
                 out.add_(x_pos)
                 x_pos = None
-                if self.to_gate_logits is not None:
-                    gate_logits = self.to_gate_logits(gate_input)
+                if gate_logits is not None:
                     gates = 2.0 * torch.sigmoid(gate_logits).to(dtype=out.dtype)
                     out.mul_(gates.unsqueeze(-1))
-                gate_input = None
+                gate_logits = None
                 out = out.flatten(2, 3)
                 out = self.to_out(out)
                 return out
@@ -292,11 +337,10 @@ class Attention(torch.nn.Module):
             version=attention_version,
             recycle_q= True,
         )
-        if self.to_gate_logits is not None:
-            gate_logits = self.to_gate_logits(gate_input)
+        if gate_logits is not None:
             gates = 2.0 * torch.sigmoid(gate_logits).to(dtype=out.dtype)
             out.mul_(gates.unsqueeze(-1))
-        gate_input = None
+        gate_logits = None
         out = out.flatten(2, 3)
         out = self.to_out(out)
         return out

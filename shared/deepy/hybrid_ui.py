@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """Gradio view adapters for the shared Deepy service."""
 from __future__ import annotations
 
@@ -10,8 +11,18 @@ from shared.deepy import ui_settings
 from shared.deepy.errors import DeepyBusy
 from shared.gradio.form_sync import GradioForm
 from shared.gradio.gallery_frames import bind_gallery_frames
+from shared.gradio.gallery_snapshots import bind_gallery_snapshots
 from shared.utils.form_sync import Saved
+from shared.utils.gallery_sources import GALLERY_SOURCES, STRIP_SOURCES
 from shared.utils.gallery_view import gallery_offset, gallery_window
+
+
+def bind_generation_state(tab_id, status, pause, resume):
+    """Apply the ordered shared stream locally, with no status HTTP requests."""
+    elem_id = f'wangp-generation-state-{tab_id}'
+    trigger = gr.Textbox(visible=False, elem_id=elem_id)
+    trigger.input(fn=None, inputs=[trigger], outputs=[status, pause, resume], js='() => window.WanGPGenerationState.updates()', queue=False, show_progress='hidden', trigger_mode='always_last', api_name=False)
+    gr.context.Context.root_block.load(fn=None, js=f'() => window.WanGPGenerationState.register({json.dumps(elem_id)})')
 
 
 def bind_workspace_extract(service, state, validate_prompt, prompt_inputs, save_inputs, save_values, use_settings, outputs):
@@ -31,8 +42,8 @@ def bind_workspace_extract(service, state, validate_prompt, prompt_inputs, save_
                     if selection.revision != viewer._catalog(selection.source)['revision']:
                         raise ValueError('The gallery changed. Reopen the workspace manager and select the media again.')
                 # use_settings acquires the same non-reentrant gallery lock itself.
-                # The original action reads the full lists from state; audio still needs a packed input.
-                return use_settings(state_value, '[]' if selection.source == 'audio' else [], entry['index'], selection.source)
+                # The original action reads the full lists from state; strip galleries still need a packed input.
+                return use_settings(state_value, [] if selection.source == 'video' else '[]', entry['index'], selection.source)
         except ValueError as exc:
             raise gr.Error(str(exc)) from exc
 
@@ -41,8 +52,10 @@ def bind_workspace_extract(service, state, validate_prompt, prompt_inputs, save_
     ).then(extract, inputs=[trigger, state], outputs=outputs, show_progress='hidden')
 
 
-def bind_gallery_sync(service, state, render_gallery, outputs, *, gallery, main):
+def bind_gallery_sync(service, state, render_gallery, outputs, *, gallery, strip_states, main):
+    """`strip_states`: the 3 state components (paths, selected, refresh) of each strip gallery, in STRIP_SOURCES order."""
     bind_gallery_frames(service)
+    bind_gallery_snapshots(service)
     gr.HTML('<span data-deepy-hybrid="/deepy/"></span>', visible=False)
     error = gr.Textbox(visible=False, elem_id='deepy_hybrid_error')
 
@@ -92,21 +105,29 @@ def bind_gallery_sync(service, state, render_gallery, outputs, *, gallery, main)
             video, selected, video_offset = gallery_window(gen['file_list'], gen['selected'], limit, keep_selected=True)
             if video_offset != gallery_offset(len(gen['file_list']), limit):
                 updates[outputs.index(gallery)] = gr.update(value=video, selected_index=selected)
-            audio, _, audio_offset = gallery_window(gen['audio_file_list'], gen['audio_selected'], limit)
-            gallery_view = {'session': session, 'workspace': service.workspace_id, 'video': video, 'audio': audio, 'video_offset': video_offset, 'audio_offset': audio_offset, 'selected': selected, 'audio_selected': gen['audio_selected']}
+            gallery_view = {'session': session, 'revision': current, 'workspace': service.workspace_id, 'sources': [{'id': source.id, 'label': source.tab_label} for source in GALLERY_SOURCES], 'video': video, 'video_offset': video_offset, 'selected': selected}
+            for source in STRIP_SOURCES:
+                gallery_view[source.id], _, gallery_view[source.id + '_offset'] = gallery_window(gen[source.files_key], gen[source.selected_key], limit)
+                gallery_view[source.id + '_selected'] = gen[source.selected_key]
             gallery_view['gallery_sequence'] = state_value.get('gallery_interaction_sequence', 0)
             if same_session and previous.get('workspace') == gallery_view['workspace']:
                 # Selection does not change the files. Avoid Gallery.postprocess
-                # and an audio render on every visual thumbnail click.
+                # and a strip gallery render on every visual thumbnail click.
                 if previous.get('video') == video:
                     updates[outputs.index(gallery)] = gr.update(selected_index=selected)
-                if all(previous.get(key) == gallery_view[key] for key in ('audio', 'audio_offset', 'audio_selected')):
-                    updates[4:7] = [gr.skip()] * 3
+                for number, source in enumerate(STRIP_SOURCES):
+                    if all(previous.get(key) == gallery_view[key] for key in (source.id, source.id + '_offset', source.id + '_selected')):
+                        start = outputs.index(strip_states[3 * number])
+                        updates[start:start + 3] = [gr.skip()] * 3
             return *updates, current, restoration, json.dumps(gallery_view)
 
     # The patched Gallery applies explicit indices with the value, including its
     # first population. A second response can restore an already obsolete index.
-    gr.on([main.load, trigger.click], refresh, inputs=[state, revision, restored, view], outputs=[*outputs, revision, restored, view], queue=False, show_progress='hidden', trigger_mode='always_last').success(fn=None, inputs=[restored, revision], outputs=None, js='(payload, revision) => window.__wangpAssistantChatNS.galleryRestored?.(JSON.parse(payload), revision)')
+    # The transport's initial snapshot also requests the first view. A separate
+    # load request could race it before Gradio marks either request as pending.
+    refreshed = trigger.click(refresh, inputs=[state, revision, restored, view], outputs=[*outputs, revision, restored, view], queue=False, show_progress='hidden', trigger_mode='always_last')
+    refreshed.success(fn=None, inputs=[restored, revision], outputs=None, js='(payload, revision) => window.__wangpAssistantChatNS.galleryRestored?.(JSON.parse(payload), revision)')
+    refreshed.then(fn=None, inputs=None, outputs=None, js='() => window.__wangpAssistantChatNS.galleryRefreshFinished?.()')
 
     # Reuse the existing preview renderer without requiring a generation request
     # in this page. New/reconnected pages also read the current shared preview.

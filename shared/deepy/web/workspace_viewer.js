@@ -1,3 +1,4 @@
+// Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 /* Full workspace management is available only in the native Gradio interface. */
 (() => {
   const icons = {search:'<circle cx="10" cy="10" r="6"/><path d="m15 15 6 6"/>', close:'<path d="m6 6 12 12M6 18 18 6"/>', import:'<path d="M12 16V3m-5 5 5-5 5 5M4 15v6h16v-6"/>', eject:'<path d="m12 3 8 11H4l8-11ZM4 20h16"/>', delete:'<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/>', copy:'<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V3H3v13h5"/>', archive:'<path d="M3 3h18v5H3zM5 8v13h14V8M10 12h4"/>'};
@@ -13,23 +14,28 @@
   icons.minimize = '<path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/>';
   class WorkspaceViewer {
     constructor(picker, transport) {
-      this.picker = picker; this.transport = transport; this.source = 'video'; this.selections = {video: new Set(), audio: new Set()}; this.requestId = 0;
+      this.picker = picker; this.transport = transport; this.source = 'video'; this.selections = {}; this.requestId = 0;
       const button = document.createElement('button'); button.type = 'button'; button.title = button.ariaLabel = 'Explore workspace'; button.innerHTML = svg('search');
       picker.node.append(button); button.onclick = event => {event.stopPropagation(); this.open();};
       this.dialog = document.createElement('dialog'); this.dialog.className = 'wangp-workspace-viewer'; this.dialog.ariaLabel = 'Workspace media viewer';
-      this.dialog.innerHTML = `<header><div class="wv-heading"><div class="wv-workspace-picker"><select data-workspace aria-label="Workspace"></select><button data-create aria-label="Add workspace" title="Add workspace">${svg('create')}</button></div><span data-summary></span></div><div class="wv-header-actions"><button data-retention aria-label="Automatic workspace archiving" title="Automatic workspace archiving">${svg('broom')}</button><button data-close aria-label="Close workspace viewer" title="Close (Esc)">${svg('close')}</button></div></header>
-        <div class="wv-toolbar"><div role="tablist" aria-label="Workspace media"><button role="tab" data-source="video">Images / Videos</button><button role="tab" data-source="audio">Audio</button></div><span class="wv-spacer"></span><span data-activity></span><button data-protect aria-label="Protect workspace from automatic archiving" aria-pressed="false">${svg('unlock')}</button><button data-import>${svg('import')}Import</button><button data-refresh>Refresh</button><input data-files type="file" accept="image/*,video/*,audio/*" multiple hidden></div>
+      this.dialog.innerHTML = `<header><div class="wv-heading"><div class="wv-workspace-picker"><select data-workspace aria-label="Workspace"></select><button data-create aria-label="Add workspace" title="Add workspace">${svg('create')}</button></div></div><div class="wv-header-actions"><button data-retention aria-label="Automatic workspace archiving" title="Automatic workspace archiving">${svg('broom')}</button><button data-close aria-label="Close workspace viewer" title="Close (Esc)">${svg('close')}</button></div><div class="wv-meta"><span data-summary></span><div class="wv-storage"><strong data-storage-label></strong><code data-folder></code><button data-folder-change hidden>Change Folder</button></div></div></header>
+        <div class="wv-toolbar"><div role="tablist" data-sources aria-label="Workspace media"></div><span class="wv-spacer"></span><span data-activity></span><button data-protect aria-label="Protect workspace from automatic archiving" aria-pressed="false">${svg('unlock')}</button><button data-import>${svg('import')}Import</button><button data-refresh>Refresh</button><input data-files type="file" multiple hidden></div>
         <div class="wv-selection"><span data-count></span><button data-page-select>Select page</button><button data-clear>Clear selection</button><div data-actions hidden><button data-action="eject">${svg('eject')}Eject</button><button data-action="delete">${svg('delete')}Delete files</button><button data-action="copy">${svg('copy')}Copy to workspace</button><button data-action="move">${svg('move')}Move to workspace</button><button data-action="archive">${svg('archive')}ZIP</button><button data-action="first" title="Move selected media to the oldest end">${svg('first')}Move to start</button><button data-action="last" title="Move selected media to the newest end">${svg('last')}Move to end</button></div></div>
-        <p class="wv-notice" role="status" hidden></p><div class="wv-content"><section class="wv-browser" aria-label="Workspace media grid"><div class="wv-grid" role="listbox" aria-multiselectable="true" aria-label="Media"></div><div class="wv-empty" hidden>No media in this gallery. Import files to get started.</div><div class="wv-rubber" hidden></div></section><aside><h3>Media details</h3><div class="wv-preview"></div><iframe title="Generation properties" sandbox=""></iframe><button data-extract-settings disabled title="Load the selected media's generation settings and close the workspace manager">Extract Settings</button></aside></div>
-        <footer><span>Oldest → newest · Ctrl/⌘ click or drag on empty space to select · Drag tiles to reorder</span><button data-prev aria-label="Older page">←</button><label>Page <input data-page type="number" min="1" aria-label="Page number"></label><span data-pages></span><button data-next aria-label="Newer page">→</button></footer>`;
+        <p class="wv-notice" role="status" hidden></p><div class="wv-content"><div class="wv-gallery"><section class="wv-browser" aria-label="Workspace media grid"><div class="wv-grid" role="listbox" aria-multiselectable="true" aria-label="Media"></div><div class="wv-empty" hidden>No media in this gallery. Import files to get started.</div><div class="wv-rubber" hidden></div></section>
+        <footer><span>Oldest → newest · Ctrl/⌘ click or drag on empty space to select · Drag tiles to reorder</span><div class="wv-pagination"><button data-prev aria-label="Older page">←</button><label>Page <input data-page type="number" min="1" aria-label="Page number"></label><span data-pages></span><button data-next aria-label="Newer page">→</button></div></footer></div>
+        <aside><h3>Media details</h3><div class="wv-detail-panes"><div class="wv-preview"></div><div class="wv-divider" role="separator" tabindex="0" aria-label="Resize media preview and settings summary" aria-orientation="horizontal" aria-valuemin="10" aria-valuemax="80" aria-valuenow="34" title="Drag to resize · Arrow keys to adjust · Double-click to reset"></div><iframe title="Generation properties" sandbox=""></iframe></div><button data-extract-settings disabled title="Load the selected media's generation settings and close the workspace manager">Extract Settings</button></aside></div>`;
       document.body.append(this.dialog);
       this.grid = this.dialog.querySelector('.wv-grid'); this.browser = this.dialog.querySelector('.wv-browser');
       this.info = this.dialog.querySelector('iframe'); this.preview = this.dialog.querySelector('.wv-preview');
       this.modal = document.createElement('dialog'); this.modal.className = 'wangp-workspace-dialog';
-      this.modal.innerHTML = '<form><h2></h2><div class="wangp-workspace-body"><p></p><label data-name-label>Archive name<input maxlength="120" required></label><label data-target-label><span data-select-label>Target workspace</span><select required></select></label><div class="wangp-workspace-error" role="alert" hidden></div><div class="wangp-workspace-actions"><button type="button" data-cancel>Cancel</button><button type="submit">Confirm</button></div></div></form>';
+      this.modal.innerHTML = '<form><h2></h2><div class="wangp-workspace-body"><p></p><label data-name-label><span data-name-caption>Archive name</span><input maxlength="120" required></label><label data-target-label><span data-select-label>Target workspace</span><select required></select></label><div class="wangp-workspace-error" role="alert" hidden></div><div class="wangp-workspace-actions"><button type="button" data-cancel>Cancel</button><button type="submit">Confirm</button></div></div></form>';
       document.body.append(this.modal);
       this.modal.querySelector('[data-cancel]').onclick = () => this.modal.close();
       this.modal.querySelector('form').onsubmit = event => {event.preventDefault(); this.confirm();};
+      const storageButton = document.createElement('button'); storageButton.type = 'button'; storageButton.dataset.storage = ''; storageButton.textContent = 'Storage'; storageButton.title = 'Inspect or Convert Workspace Storage';
+      this.dialog.querySelector('.wv-header-actions').prepend(storageButton);
+      storageButton.onclick = () => this.storage();
+      this.dialog.querySelector('[data-folder-change]').onclick = () => this.storage(true);
       this.dialog.querySelector('[data-close]').onclick = () => this.dialog.close();
       this.dialog.querySelector('[data-extract-settings]').onclick = () => {
         if (this.busy || this.loading || this.selected.size !== 1) return;
@@ -41,8 +47,7 @@
       this.picker.dialog.addEventListener('close', () => this.invalidate());
       this.dialog.querySelector('[data-protect]').onclick = () => this.protect();
       this.dialog.querySelector('[data-retention]').onclick = () => this.action('retention').catch(error => this.notice(error.message));
-      this.dialog.onclose = () => {this.requestId++; this.detailRequest?.abort(); this.grid.replaceChildren(); this.preview.replaceChildren(); this.modal.close(); clearTimeout(this.refreshTimer); clearTimeout(this.pageHover); cancelAnimationFrame(this.rubberFrame);};
-      this.dialog.querySelectorAll('[data-source]').forEach(tab => tab.onclick = () => {if (this.source !== tab.dataset.source) {this.source = tab.dataset.source; this.detailKey = null; this.preview.replaceChildren(); this.info.srcdoc = WanGPMediaView.documentHtml('Select media to view its properties.'); this.load(this.pages[this.source]);}});
+      this.dialog.onclose = () => {this.requestId++; this.detailRequest?.abort(); this.grid.replaceChildren(); this.clearPreview(); this.modal.close(); clearTimeout(this.refreshTimer); clearTimeout(this.pageHover); cancelAnimationFrame(this.rubberFrame);};
       this.dialog.querySelector('[data-import]').onclick = () => this.dialog.querySelector('[data-files]').click();
       this.dialog.querySelector('[data-files]').onchange = event => this.importFiles([...event.target.files]);
       this.dialog.querySelector('[data-refresh]').onclick = () => this.load(this.state?.page || 0);
@@ -62,9 +67,21 @@
         if (event.key === ' ' || event.key === 'Enter') {const tile = event.target.closest('[data-key]'); if (tile) {event.preventDefault(); this.choose(tile.dataset.key, event);}}
         if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {event.preventDefault(); this.state.items.forEach(item => this.selected.add(item.key)); this.selectionChanged();}
       };
-      this.installDrag(); this.installRubber();
+      this.installDrag(); this.installRubber(); this.installDivider();
     }
-    get selected() {return this.selections[this.source];}
+    get selected() {return this.selections[this.source] ??= new Set();}
+    // One tab per gallery of the workspace, in the order and with the import filters published by the server.
+    renderSources(sources) {
+      const list = this.dialog.querySelector('[data-sources]');
+      if (list.dataset.ids === sources.map(source => source.id).join()) return;
+      list.dataset.ids = sources.map(source => source.id).join();
+      list.replaceChildren(...sources.map(source => {
+        const tab = document.createElement('button'); tab.setAttribute('role', 'tab'); tab.dataset.source = source.id; tab.textContent = source.label;
+        tab.onclick = () => {if (this.source !== source.id) {this.source = source.id; this.detailKey = null; this.clearPreview(); this.info.srcdoc = WanGPMediaView.documentHtml('Select media to view its properties.'); this.load(this.pages[this.source] ?? 0);}};
+        return tab;
+      }));
+      this.dialog.querySelector('[data-files]').accept = sources.map(source => source.accept).join(',');
+    }
     query(path, extra = {}) {return path + '?' + new URLSearchParams({workspace: this.workspace, source: this.source, ...extra});}
     notice(text) {const node = this.dialog.querySelector('.wv-notice'); node.textContent = text; node.hidden = !text;}
     navigation() {
@@ -91,6 +108,12 @@
       select.title = select.selectedOptions[0].textContent;
     }
     renderActivity(state) {
+      this.dialog.querySelector('[data-storage]').textContent = state.storage_mode === 'dedicated' ? 'Folder Storage' : 'Shared Storage';
+      this.dialog.querySelector('[data-storage]').title = state.folder || 'Shared Output Folders';
+      this.dialog.querySelector('[data-storage-label]').textContent = state.storage_mode === 'dedicated' ? 'Dedicated folder' : 'Shared references · Files can be in multiple folders';
+      this.dialog.querySelector('[data-folder]').textContent = this.dialog.querySelector('[data-folder]').title = state.folder || '';
+      this.dialog.querySelector('[data-folder]').hidden = !state.folder;
+      this.dialog.querySelector('[data-folder-change]').hidden = !state.folder;
       const date = new Date(state.last_activity * 1000), activity = this.dialog.querySelector('[data-activity]');
       activity.textContent = 'Last Activity: ' + date.toLocaleString([], {dateStyle:'medium', timeStyle:'short'}); activity.title = date.toLocaleString();
       const button = this.dialog.querySelector('[data-protect]');
@@ -100,8 +123,8 @@
     }
     resetWorkspace() {
       clearTimeout(this.refreshTimer); this.modal.close();
-      this.workspace = this.picker.state.selected; this.selections = {video: new Set(), audio: new Set()}; this.state = null; this.detailKey = null;
-      this.pages = {video: 0, audio: 0};
+      this.workspace = this.picker.state.selected; this.selections = {}; this.state = null; this.detailKey = null;
+      this.pages = {};
       this.grid.replaceChildren(); this.selectionChanged();
       this.renderWorkspaces(); this.dialog.querySelector('[data-activity]').textContent = '';
       this.dialog.querySelector('[data-summary]').textContent = '';
@@ -118,6 +141,27 @@
       this.setBusy(true);
       try {await this.transport.request('workspace_viewer/protection', {workspace:this.workspace, protected:!this.state.archive_protected}); await this.load(this.page, true);}
       catch (error) {this.notice(error.message);}
+      finally {this.setBusy(false);}
+    }
+    async storage(relocate = false) {
+      if (this.busy || !this.state) return;
+      this.setBusy(true);
+      try {
+        const mode = relocate ? 'dedicated' : this.state.storage_mode === 'dedicated' ? 'shared' : 'dedicated';
+        const preview = await this.transport.request('workspace_viewer/storage', {workspace:this.workspace, mode});
+        this.modal.dataset.action = relocate ? 'folder' : 'storage'; this.modal.dataset.storageMode = mode; this.modal.dataset.workspace = this.workspace;
+        delete this.modal.dataset.targetFolder;
+        this.modal.querySelector('h2').textContent = relocate ? 'Change Workspace Folder' : mode === 'dedicated' ? 'Convert to Dedicated Folder' : 'Convert to Shared References';
+        this.modal.querySelector('p').textContent = `${preview.media_count} media, ${preview.file_count} files, ${(preview.bytes / 1024 / 1024).toFixed(1)} MB. ${mode === 'dedicated' ? 'Copy these files into an independent workspace folder. Originals stay in place.' : 'Keep files in their current folder and store absolute references. Future outputs use the shared output folders.'}${this.state.folder ? '\nCurrent folder: ' + this.state.folder : ''}${preview.missing.length ? '\nRestore missing files before converting: ' + preview.missing.join(', ') : ''}`;
+        this.modal.querySelector('[data-name-label]').hidden = !relocate; this.modal.querySelector('input').disabled = !relocate;
+        this.modal.querySelector('[data-name-caption]').textContent = 'New folder on the server';
+        this.modal.querySelector('input').maxLength = 32767;
+        this.modal.querySelector('input').value = relocate ? this.state.folder : '';
+        this.modal.querySelector('[data-target-label]').hidden = true; this.modal.querySelector('select').disabled = true;
+        this.modal.querySelector('[role=alert]').hidden = true;
+        this.modal.querySelector('[type=submit]').textContent = relocate ? 'Preview Copy' : 'Convert'; this.modal.querySelector('[type=submit]').disabled = !!preview.missing.length;
+        this.modal.showModal();
+      } catch (error) {this.notice(error.message);}
       finally {this.setBusy(false);}
     }
     invalidate() {
@@ -137,6 +181,7 @@
         if (request !== this.requestId || !this.dialog.open) return;
         state.items.forEach(item => {if (item.thumbnail) item.thumbnail = new URL(item.thumbnail, this.transport.base).href;});
         this.pages[state.source] = state.page;
+        this.renderSources(state.sources);
         this.renderActivity(state);
         if (keepScroll && this.state?.revision === state.revision && this.state.source === state.source && this.state.page === state.page) {this.state = state; this.selectionChanged(); return;}
         const retained = new Set(state.selected);
@@ -190,22 +235,27 @@
       this.dialog.querySelector('[data-count]').textContent = `${this.selected.size} selected`;
       this.dialog.querySelector('[data-actions]').hidden = !this.selected.size;
       this.dialog.querySelector('[data-clear]').hidden = !this.selected.size;
-      if (!this.selected.size) {this.detailRequest?.abort(); this.detailKey = null; this.preview.replaceChildren(); this.info.srcdoc = WanGPMediaView.documentHtml('Select media to view its properties.');}
+      if (!this.selected.size) {this.detailRequest?.abort(); this.detailKey = null; this.clearPreview(); this.info.srcdoc = WanGPMediaView.documentHtml('Select media to view its properties.');}
+    }
+    clearPreview() {
+      WanGPImageZoom.destroy(this.preview.querySelector('img'));
+      this.preview.replaceChildren();
     }
     async showDetails(key) {
       const item = this.state.items.find(item => item.key === key); if (!item) return;
       const identity = this.workspace + this.source + key; this.detailKey = identity;
       this.detailRequest?.abort();
       const request = this.detailRequest = new AbortController();
-      this.preview.replaceChildren();
+      this.clearPreview();
       if (item.url) {
         let preview = WanGPMediaView.thumbnail(item);
-        if (item.kind !== 'image') {
+        if (item.kind === 'video' || item.kind === 'audio') {
           const play = document.createElement('button'); play.type = 'button'; play.className = 'wv-open';
           const label = document.createElement('span'); label.textContent = '▶ Play';
           play.append(preview, label); play.onclick = () => this.play(item); preview = play;
         }
         this.preview.append(preview, this.previewActions(item));
+        if (item.kind === 'image') WanGPImageZoom.mount(preview, {viewport: this.preview, source: new URL(item.url, location.href).href});
       }
       this.info.srcdoc = WanGPMediaView.documentHtml('Loading media information…');
       try {const result = await this.transport.request(this.query('workspace_viewer/info', {key}), undefined, request.signal); if (!request.signal.aborted && this.detailKey === identity) this.info.srcdoc = WanGPMediaView.documentHtml(result.html);}
@@ -237,16 +287,19 @@
     }
     loadPreview(item) {
       let media = this.preview.firstElementChild;
+      if (item.kind === 'image') {
+        media.classList.add('wv-media'); media.loading = 'eager'; media.src = item.url;
+        return media;
+      }
       if (!media.classList.contains('wv-media')) {
         const original = WanGPMediaView.media(item); original.className = 'wv-media';
-        if (item.kind === 'image') original.loading = 'eager';
         media.replaceWith(original); media = original;
       }
       return media;
     }
     play(item) {
       const media = this.loadPreview(item);
-      if (item.kind !== 'image') media.play().catch(() => {});
+      if (item.kind === 'video' || item.kind === 'audio') media.play().catch(() => {});
     }
     async run(action, extra = {}) {
       if (this.busy) return false;
@@ -276,8 +329,9 @@
       this.modal.dataset.action = action;
       this.modal.querySelector('h2').textContent = {delete:'Delete files permanently',copy:'Copy to workspace',move:'Move to workspace',archive:'Download ZIP archive',retention:'Automatic workspace archiving'}[action];
       this.modal.querySelector('p').textContent = action === 'retention' ? 'At the next WanGP startup, archive unlocked workspaces with no media additions, removals or reordering during this period. Their dedicated Deepy sessions are archived too. Media files stay in place. Opening or renaming a workspace does not reset its activity date.' : action === 'delete' ? `Permanently delete ${this.selected.size} selected media files from disk? They will also be removed from every workspace that references them. This cannot be undone.` : action === 'copy' ? 'Append the selected media to another workspace. The original files are shared, without copying them on disk.' : 'Choose the name of the ZIP to download.';
-      if (action === 'move') this.modal.querySelector('p').textContent = 'Move the selected media to another workspace and remove them from this one. The files stay in place on disk; other workspaces keep their references.';
+      if (['copy', 'move'].includes(action)) this.modal.querySelector('p').textContent = 'Dedicated destinations receive independent file copies; shared destinations receive references. Original files remain on disk.' + (action === 'move' ? ' After success, remove these entries from the source gallery.' : '');
       this.modal.querySelector('[data-name-label]').hidden = action !== 'archive'; this.modal.querySelector('input').disabled = action !== 'archive';
+      this.modal.querySelector('[data-name-caption]').textContent = 'Archive name'; this.modal.querySelector('input').maxLength = 120;
       this.modal.querySelector('input').value = action === 'archive' ? this.state.name + '.zip' : '';
       const target = this.modal.querySelector('select'); target.disabled = !['copy', 'move', 'retention'].includes(action); target.closest('label').hidden = target.disabled;
       this.modal.querySelector('[data-select-label]').textContent = action === 'retention' ? 'Archive after inactivity of' : 'Target workspace';
@@ -290,6 +344,27 @@
     }
     async confirm() {
       const button = this.modal.querySelector('[type=submit]'); button.disabled = true;
+      if (['storage', 'folder'].includes(this.modal.dataset.action)) {
+        this.setBusy(true);
+        try {
+          const relocation = this.modal.dataset.action === 'folder';
+          const payload = {workspace:this.modal.dataset.workspace, mode:this.modal.dataset.storageMode};
+          if (relocation && !this.modal.dataset.targetFolder) {
+            const preview = await this.transport.request('workspace_viewer/storage', {...payload, folder:this.modal.querySelector('input').value.trim()});
+            if (preview.missing.length) throw new Error('Restore missing files before changing folders: ' + preview.missing.join(', '));
+            this.modal.dataset.targetFolder = preview.folder;
+            this.modal.querySelector('input').value = preview.folder; this.modal.querySelector('input').disabled = true;
+            this.modal.querySelector('p').textContent = `Copy and verify ${preview.media_count} media, ${preview.file_count} files (${(preview.bytes / 1024 / 1024).toFixed(1)} MB) into this folder, then use it for future outputs. Originals stay in place. Existing files are not overwritten or automatically added to the gallery. Agents assigned to this workspace will have access to this folder's contents.`;
+            this.modal.querySelector('[role=alert]').hidden = true;
+            button.textContent = 'Copy and Use Folder';
+          } else {
+            await this.transport.request('workspace_viewer/storage', {...payload, ...(relocation ? {folder:this.modal.dataset.targetFolder} : {}), confirmed:true});
+            this.modal.close(); await this.load(this.page || 0); this.notice(relocation ? 'Workspace folder changed. Original files were retained.' : 'Workspace storage converted. Original files were retained.');
+          }
+        } catch (error) {const node = this.modal.querySelector('[role=alert]'); node.hidden = false; node.textContent = error.message;}
+        finally {button.disabled = false; this.setBusy(false);}
+        return;
+      }
       if (this.modal.dataset.action === 'retention') {
         this.setBusy(true);
         try {
@@ -318,6 +393,34 @@
       }
       this.setBusy(false); this.dialog.querySelector('[data-files]').value = '';
       await this.load(this.state.page); this.notice([...reused, ...failures].join(' · '));
+    }
+    installDivider() {
+      const panes = this.dialog.querySelector('.wv-detail-panes'), divider = panes.querySelector('.wv-divider');
+      const resize = percent => {
+        percent = Math.max(10, Math.min(80, percent));
+        panes.style.setProperty('--wv-preview-height', percent + '%');
+        divider.setAttribute('aria-valuenow', String(Math.round(percent)));
+      };
+      let offset = 0;
+      divider.onpointerdown = event => {
+        if (event.button !== 0) return;
+        event.preventDefault(); divider.focus();
+        offset = event.clientY - this.preview.getBoundingClientRect().bottom;
+        divider.setPointerCapture(event.pointerId); panes.classList.add('wv-resizing');
+      };
+      divider.onpointermove = event => {
+        if (!divider.hasPointerCapture(event.pointerId)) return;
+        const box = panes.getBoundingClientRect(); resize(100 * (event.clientY - box.top - offset) / box.height);
+      };
+      divider.onpointerup = divider.onpointercancel = event => {if (divider.hasPointerCapture(event.pointerId)) divider.releasePointerCapture(event.pointerId);};
+      divider.onlostpointercapture = () => panes.classList.remove('wv-resizing');
+      divider.onkeydown = event => {
+        const current = 100 * this.preview.getBoundingClientRect().height / panes.clientHeight;
+        const next = {ArrowUp: current - 5, ArrowDown: current + 5, Home: 10, End: 80}[event.key];
+        if (next === undefined) return;
+        event.preventDefault(); resize(next);
+      };
+      divider.ondblclick = () => resize(34);
     }
     installDrag() {
       this.grid.ondragstart = event => {

@@ -1,3 +1,4 @@
+# Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import struct
 from typing import Optional
 import json
@@ -145,7 +146,7 @@ def save_audio_metadata(path, configs):
     elif ext == ".flac":
         from mutagen.flac import FLAC
         audio = FLAC(path)
-        audio["WanGP"] = [payload]
+        audio["WanGP"] = payload
         audio.save()
     else:
         raise ValueError(f"Unsupported audio metadata format: {ext}")

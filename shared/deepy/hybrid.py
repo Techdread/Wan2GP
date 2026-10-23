@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """One persistent Deepy service shared by Gradio and the standalone browser client."""
 from __future__ import annotations
 
@@ -11,6 +12,9 @@ from types import SimpleNamespace
 from shared.deepy.drivers import GradioGallery
 from shared.deepy.runtime import GenerationRuntime
 from shared.deepy.service import DeepyService
+from shared.utils.gallery_sources import GALLERY_SOURCES, SOURCES, STRIP_SOURCES, VIDEO
+from shared.utils.generation_state import pause_state, set_generation_state
+from shared.gradio.progress import ProgressUpdates, WangpProgress
 
 
 class SharedState(dict):
@@ -32,13 +36,15 @@ def service_for(state):
 
 
 class HybridService(DeepyService):
-    def __init__(self, deps, state, *, process_queue, finalize_queue, unload, gallery_lock=None):
+    def __init__(self, deps, state, *, process_queue, finalize_queue, unload, gallery_lock=None, model_label=lambda: '', task_label=lambda task: ''):
         # Gradio historically initializes these lists on the first UI interaction.
         defaults = GenerationRuntime._build_state(SimpleNamespace(_deps=deps))['gen']
         defaults.pop('in_progress')
         for key, value in defaults.items():
             state['gen'].setdefault(key, value)
         self._host_dirty = threading.Event()
+        self._host_changes = threading.Event()
+        self._generation_updates = ProgressUpdates(self._host_dirty.set)
         self._host_signature = None
         self._gallery_signature = None
         self.gallery_revision = 0
@@ -57,8 +63,17 @@ class HybridService(DeepyService):
         self._process_queue = process_queue
         self._finalize_queue = finalize_queue
         self._unload = unload
+        self._model_label = model_label
+        self._task_label = task_label
+        self._generation_view = None
+        self._generation_view_revision = 0
+        self._progress_event = None
+        self._generation_status = state['gen'].get('status')
         super().__init__(deps, state=state, gallery_factory=lambda deps, state: GradioGallery(deps, state, self.host_changed))
+        self._progress_bar = WangpProgress(on_change=self._generation_updates.changed)
         state.service = self
+        state['gen']['state_change_callback'] = self.generation_state_changed
+        self._publish_generation_view(force=True)
         from shared.deepy.workspace_viewer import WorkspaceViewer
         self.gallery_lock = threading.RLock() if gallery_lock is None else gallery_lock
         self.workspace_viewer = WorkspaceViewer(self)
@@ -77,7 +92,64 @@ class HybridService(DeepyService):
         return deepcopy(snapshot) if snapshot is not None else None
 
     def host_changed(self):
+        self._host_changes.set()
         self._host_dirty.set()
+
+    def generation_state_changed(self):
+        self._host_changes.set()
+        self._generation_updates.changed(immediate=True)
+
+    def _generation_event(self, command, data):
+        # Callbacks only record progress and wake the shared publisher. Rendering
+        # and fan-out never run on the inference/download thread.
+        with self._condition:
+            if command == 'exit':
+                self._progress_event = None
+                self._generation_updates.changed(immediate=True)
+                self._generation_aborting = False
+                return
+            if command not in {'progress', 'status', 'download'}:
+                return
+            if self._progress_event is None:
+                self._progress_bar = WangpProgress(on_change=self._generation_updates.changed)
+            self._progress_event = {'type': command, 'data': data}
+            if command == 'progress':
+                self._progress_bar(*data)
+            elif command == 'status':
+                self._generation_status = self._state['gen'].get('status')
+                self._progress_bar.status(data)
+            else:
+                self._progress_bar.set_download(data)
+
+    def _publish_generation_view(self, force=False):
+        gen = self._state['gen']
+        with self._condition:
+            progress = self._progress_bar
+            status = gen.get('status')
+            if status != self._generation_status or progress.position is None:
+                self._generation_status = status
+                progress.status(status or 'Ready')
+            if not self._generation_updates.consume(force=force):
+                return
+            pending, paused = pause_state(gen)
+            active, aborting = bool(gen.get('status_display')), bool(gen.get('abort')) or self._generation_aborting
+            task = gen.get('api_active_queue_task')
+            model_name = self._task_label(task) if active and task is not None else self._model_label()
+            html = None if gen.get('model_preloading') else progress.render(active=active, aborting=aborting, hold_complete=True, model_name=model_name)
+            view = {'html': html, 'pending': pending, 'paused': paused}
+            current = None if self._progress_event is None else {**self._progress_event, 'description': progress.description, 'aborting': aborting, 'html': progress.render(compact=True, aborting=aborting, hold_complete=True)}
+            if current != self._progress:
+                self._progress = current
+                self.publish('progress', current)
+            self._generation_updates.hold(progress.completion_delay if not aborting and (html is not None or current is not None) else 0)
+            if view != self._generation_view:
+                self._generation_view = view
+                self._generation_view_revision += 1
+                self.publish('generation_state', self.generation_view())
+
+    def generation_view(self):
+        with self._condition:
+            return {'instance': self._instance_id, 'revision': self._generation_view_revision, **self._generation_view}
 
     def select_gallery_view(self, payload):
         with self._mutation_lock:
@@ -85,20 +157,20 @@ class HybridService(DeepyService):
             if payload['workspace'] != self.workspace_id:
                 return
             source = payload['source']
-            if source not in ('video', 'audio'):
+            if source not in SOURCES:
                 raise ValueError('Invalid gallery source.')
             gen = self._state['gen']
             path = payload['path']
             if path is None:
                 gen['current_gallery_source'] = source
-                if source == 'audio':
+                if source != VIDEO.id:
                     gen['selected_video_time'] = None
             else:
-                paths, _ = self.gallery._resolve_lists(source == 'audio')
+                paths, _ = self.gallery._resolve_lists(source)
                 index = payload['index']
                 if not isinstance(index, int) or index < 0 or index >= len(paths) or paths[index] != path:
                     return
-                self.gallery._select_index(index, source == 'audio')
+                self.gallery._select_index(index, source)
             self.host_changed()
 
     def publish_workspaces(self):
@@ -107,20 +179,26 @@ class HybridService(DeepyService):
 
     def _publish_host_changes(self):
         while True:
-            self._host_dirty.wait()
+            self._host_dirty.wait(self._generation_updates.delay())
             self._host_dirty.clear()
             if self._closing:
                 return
             try:
                 with self._mutation_lock:
                     gen = self._state['gen']
-                    if gen['last_selected']:
-                        gen['selected'] = len(gen['file_list']) - 1
-                    if gen['audio_last_selected']:
-                        gen['audio_selected'] = len(gen['audio_file_list']) - 1
+                    host_changed = self._host_changes.is_set()
+                    if host_changed:
+                        self._host_changes.clear()
+                    self._publish_generation_view(force=host_changed)
+                    if not host_changed:
+                        continue
+                    for source in GALLERY_SOURCES:
+                        if gen[source.last_selected_key]:
+                            gen[source.selected_key] = len(gen[source.files_key]) - 1
                     if gen.pop('refresh_tab', False):
-                        gen['current_gallery_source'] = 'audio' if gen['last_was_audio'] else 'video'
-                    signature = (tuple(gen['file_list']), tuple(gen['audio_file_list']), gen['selected'], gen['audio_selected'], gen['current_gallery_source'], tuple(map(id, list.__iter__(gen['file_settings_list']))), tuple(map(id, list.__iter__(gen['audio_file_settings_list']))), self._deps.get_server_config().get('clear_file_list', 5))
+                        gen['current_gallery_source'] = gen['last_gallery_source']
+                    # (files of every gallery, selections, active gallery, settings identities, gallery size limit)
+                    signature = (tuple(tuple(gen[source.files_key]) for source in GALLERY_SOURCES), tuple(gen[source.selected_key] for source in GALLERY_SOURCES), gen['current_gallery_source'], tuple(tuple(map(id, list.__iter__(gen[source.settings_key]))) for source in GALLERY_SOURCES), self._deps.get_server_config().get('clear_file_list', 5))
                     gallery_view = (signature, self.generation_running, self._gallery_update)
                     settings = (json.dumps(self._session.tool_ui_settings, sort_keys=True), self._session.storage_session_id, self._session.storage_title, self._catalog_revision)
                     changed = False
@@ -130,7 +208,7 @@ class HybridService(DeepyService):
                         self.preview_revision += 1
                         changed = True
                     if signature != self._gallery_signature:
-                        media_changed = self._gallery_signature is None or signature[:2] != self._gallery_signature[:2]
+                        media_changed = self._gallery_signature is None or signature[0] != self._gallery_signature[0]
                         self._gallery_signature = signature
                         self.publish('gallery', self.gallery_snapshot())
                         if media_changed:
@@ -154,6 +232,7 @@ class HybridService(DeepyService):
         result['hybrid'] = True
         result['host_view'] = {'gallery': self.gallery_revision, 'settings': self.settings_revision, 'preview': self.preview_revision}
         result['forms'] = self.forms.revisions()
+        result['generation_state'] = self.generation_view()
         return result
 
     def command(self, command, data=None):
@@ -195,8 +274,9 @@ class HybridService(DeepyService):
             return self._queue_worker
 
     def _run_generation(self):
+        queue = self._state['gen']['queue']
         before = self.gallery.counts()
-        self._state["gen"]["status_display"] = True
+        set_generation_state(self._state['gen'], status_display=True)
         self._state["gen"]["last_progress_args"] = None
         self._generation_event("status", "Preparing generation…")
         try:
@@ -228,6 +308,9 @@ class HybridService(DeepyService):
                     self._condition.notify_all()
                 self._generation_event('exit', None)
                 self.host_changed()
+        # Tasks loaded after this worker emptied its queue went to a new list it never read.
+        if self._state['gen']['queue'] is not queue:
+            self.start_generation()
 
     def generation_event(self, command, data):
         queue = self._state['gen']['queue']
@@ -237,6 +320,11 @@ class HybridService(DeepyService):
             self._generation_event(command, data)
         elif command == 'output':
             self.host_changed()
+
+    def load_inline_queue(self):
+        """Admit API submissions into the live queue without a browser request or waiting for running work."""
+        self._deps.load_queue_action(None, self._state, SimpleNamespace(target=1))
+        self.start_generation()
 
     def _process_inline_queue(self, payload=None):
         self._deps.load_queue_action(None, self._state, SimpleNamespace(target=1))
@@ -267,7 +355,8 @@ class HybridService(DeepyService):
         import gradio as gr
         # The revisioned view refresh publishes current state to every browser.
         # A late Gradio callback must not replay an earlier generation's selection.
-        return (gr.update(),) * 12
+        # Gallery tabs, current tab, image/video gallery, 3 values per strip gallery, then 6 generation controls.
+        return (gr.update(),) * (3 + 3 * len(STRIP_SOURCES) + 6)
 
     def close(self):
         super().close()
@@ -291,10 +380,21 @@ class HybridService(DeepyService):
 def launch_gradio(demo, service, args, **kwargs):
     """Use Gradio's supported lifespan hook to mount the shared Web application."""
     from shared.deepy.server import server_options
+    if service.workspaces is not None:
+        def allow_workspace_media(directory):
+            if directory not in demo.allowed_paths:
+                demo.allowed_paths.append(directory)
+        service._deps.callbacks.handlers['allow_workspace_media'] = allow_workspace_media
+        kwargs['allowed_paths'] = [*kwargs.get('allowed_paths', []), *(str(service.workspaces._directory(record)) for record in service.workspaces.records.values() if 'folder' in record)]
+    if args.mcp_webui is None:
+        args.mcp_webui = service._deps.get_server_config().get('mcp_webui', False)
     host, port, cert, key, https_port, auth = server_options(args)
     print("WanGP web authentication disabled." if auth.gate is None else "WanGP web authentication enabled.")
     scheme = 'https' if cert and https_port is None else 'http'
     print(f"Deepy Web app: {scheme}://{host}:{port}/deepy/")
+    if args.mcp_webui:
+        from shared.mcp.server import build_webui_server
+        mcp_server = build_webui_server(service, args)
 
     @asynccontextmanager
     async def lifespan(app):
@@ -302,6 +402,9 @@ def launch_gradio(demo, service, args, **kwargs):
         await demo.run_extra_startup_events()
         app.startup_events_triggered = True
         async with service.lifespan(app, auth=auth, voice_language=args.deepy_voice_language, https_port=https_port):
+            # Agents start after the saved queue has been restored.
+            if args.mcp_webui:
+                threading.Thread(target=mcp_server.run, name='WanGP MCP server', daemon=True).start()
             yield
 
     from starlette.middleware import Middleware

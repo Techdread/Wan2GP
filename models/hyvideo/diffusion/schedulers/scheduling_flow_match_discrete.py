@@ -16,6 +16,7 @@
 # Modified from diffusers==0.29.2
 #
 # ==============================================================================
+# Modified for WanGP.
 
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -139,7 +140,7 @@ class FlowMatchDiscreteScheduler(SchedulerMixin, ConfigMixin):
         """
         self.num_inference_steps = num_inference_steps
         
-        sigmas = torch.linspace(1, 0, num_inference_steps + 1)
+        sigmas = torch.linspace(1, 0, num_inference_steps + 1, device=device)
         sigmas = self.sd3_time_shift(sigmas)
 
         if not self.config.reverse:

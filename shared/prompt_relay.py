@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
 import math
@@ -315,7 +316,7 @@ def _seq_len(context: torch.Tensor) -> int:
 def _normalize_key_mask(mask: torch.Tensor, seq_len: int) -> torch.Tensor:
     mask = mask.detach().to("cpu", dtype=torch.bool).reshape(-1)
     if mask.numel() < seq_len:
-        mask = torch.cat([mask, torch.ones(seq_len - mask.numel(), dtype=torch.bool)])
+        mask = torch.cat([mask, mask.new_ones(seq_len - mask.numel())])
     return mask[:seq_len]
 
 

@@ -1,3 +1,4 @@
+// Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import {I as WangpFrameIconButton} from "./IconButton-DSs-aBrk.js";
 
 // Reuse Gradio's actual icon buttons, including their theme and hover styles.
@@ -29,6 +30,7 @@ function wangpGallerySave(video, state) {
     // Anchor to the video controls, not the taller gallery/thumbnail area.
     // Gradio fullscreen resizes the video independently of the preview.
     const positionActions = () => {
+        if (!menu.offsetParent) return; // The gallery's tab may be hidden.
         const bounds = video.getBoundingClientRect();
         const parent = menu.offsetParent.getBoundingClientRect();
         menu.style.left = `${bounds.right - parent.left - 24}px`;

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """PyTorch Qwen3TTS model."""
 
 import json
@@ -1803,8 +1804,8 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
     def get_decoder(self):
         return self.model
 
-    def set_lm_decoder_engine(self, lm_decoder_engine: str | None) -> None:
-        self._cuda_graph_hooks.set_lm_decoder_engine(lm_decoder_engine)
+    def set_cuda_graphs(self, enabled: bool, graph_owner=None) -> None:
+        self._cuda_graph_hooks.set_cuda_graphs(enabled, graph_owner)
 
     def prepare_decode_cuda_graph(self, *, max_batch_size: int, max_talker_tokens: int, max_subtalker_tokens: int) -> None:
         self._cuda_graph_hooks.prepare(
@@ -2255,6 +2256,9 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
 
 class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin):
     config_class = Qwen3TTSConfig
+    # mmgp keeps the text projection (16 MB, its linear_fc1 / fc2 would be two streamed blocks used by the prefill only) with the model
+    # base: the talker's blocks then all stay in VRAM with the dynamic preload, and its decoding steps run as one CUDA graph each
+    _offload_base_modules = ("talker.text_projection",)
 
     def __init__(self, config: Qwen3TTSConfig):
         super().__init__(config)
@@ -2291,8 +2295,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     def load_generate_config(self, generate_config):
         self.generate_config = generate_config
 
-    def set_lm_decoder_engine(self, lm_decoder_engine: str | None) -> None:
-        self.talker.set_lm_decoder_engine(lm_decoder_engine)
+    def set_cuda_graphs(self, enabled: bool) -> None:
+        self.talker.set_cuda_graphs(enabled, graph_owner=self)  # this model is the one MMGP manages
 
     def prepare_decode_cuda_graph(self, *, max_batch_size: int, max_talker_tokens: int, max_subtalker_tokens: int) -> None:
         self.talker.prepare_decode_cuda_graph(
@@ -2392,16 +2396,17 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
     @torch.inference_mode()
     def extract_speaker_embedding(self, audio, sr):
         assert sr == 24000, "Only support 24kHz audio"
-        mels = mel_spectrogram(
-            torch.from_numpy(audio).unsqueeze(0), 
-            n_fft=1024, 
-            num_mels=128, 
-            sampling_rate=24000,
-            hop_size=256, 
-            win_size=1024, 
-            fmin=0, 
-            fmax=12000
-        ).transpose(1, 2)
+        with torch.device("cuda" if torch.cuda.is_available() else "cpu"):  # its window is built on the GPU then moved, as with the legacy default device
+            mels = mel_spectrogram(
+                torch.from_numpy(audio).unsqueeze(0), 
+                n_fft=1024, 
+                num_mels=128, 
+                sampling_rate=24000,
+                hop_size=256, 
+                win_size=1024, 
+                fmin=0, 
+                fmax=12000
+            ).transpose(1, 2)
         speaker_embedding = self.speaker_encoder(mels.to(self.device).to(self.dtype))[0]
         return speaker_embedding
     
@@ -2706,7 +2711,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             talker_input_embeds[index] = torch.cat([item for item in talker_input_embed if item is not None], dim=1)
 
         # for batch inferquence
-        original_lengths = torch.tensor([t.shape[1] for t in talker_input_embeds])
+        original_lengths = torch.tensor([t.shape[1] for t in talker_input_embeds], device=talker_input_embeds[0].device)
         # left padding for talker input embeds
         sequences = [t.squeeze(0) for t in talker_input_embeds]
         sequences_reversed = [t.flip(dims=[0]) for t in sequences]
@@ -2718,7 +2723,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         talker_input_embeds = padded_reversed.flip(dims=[1])
         # generate mask
         batch_size, max_len = talker_input_embeds.shape[0], talker_input_embeds.shape[1]
-        indices = torch.arange(max_len).expand(batch_size, -1)
+        indices = torch.arange(max_len, device=talker_input_embeds.device).expand(batch_size, -1)
         num_pads = max_len - original_lengths
         talker_attention_mask = (indices >= num_pads.unsqueeze(1)).long().to(talker_input_embeds.device)
         # padding trailing text hiddens

@@ -16,6 +16,7 @@
 # Modified from diffusers==0.29.2
 #
 # ==============================================================================
+# Modifications Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from shared.utils.phase_progress import text_encoding_prompts, text_encoding_progress
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union, Tuple
@@ -1528,11 +1529,11 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 else:
                     img_latents_concat = img_latents
                 img_latents_concat[:, :, 1:] = 0
-                mask_concat = torch.ones(img_latents_concat.shape[0], 1, *img_latents_concat.shape[2:]).to(device=img_latents.device)
+                mask_concat = torch.ones(img_latents_concat.shape[0], 1, *img_latents_concat.shape[2:], device=img_latents.device)
                 mask_concat[:, :, 1:] = 0
             else:
-                img_latents_concat = torch.zeros(latents.shape[0], latents.shape[1], *latents.shape[2:]).to(latents.device)
-                mask_concat = torch.zeros(img_latents_concat.shape[0], 1, *latents.shape[2:]).to(device=latents.device)
+                img_latents_concat = torch.zeros(latents.shape[0], latents.shape[1], *latents.shape[2:], device=latents.device)
+                mask_concat = torch.zeros(img_latents_concat.shape[0], 1, *latents.shape[2:], device=latents.device)
 
 
         vision_states = None

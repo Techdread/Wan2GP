@@ -2,13 +2,15 @@ from collections.abc import Callable
 from enum import Enum
 
 import torch
+from mmgp import cuda_graphs
 
 from ...guidance.perturbations import BatchedPerturbationConfig
 from .adaln import AdaLayerNormSingle, adaln_embedding_coefficient
 from .attention import AttentionCallable, AttentionFunction
 from .modality import Modality
 from .rope import LTXRopeType
-from .transformer import BasicAVTransformerBlock, TransformerConfig, _apply_scale_shift
+from .transformer import BasicAVTransformerBlock, TransformerConfig
+from shared.kernels import ops as kernels
 from .transformer_args import (
     MultiModalTransformerArgsPreprocessor,
     TransformerArgs,
@@ -389,27 +391,28 @@ class LTXModel(torch.nn.Module):
         """Process transformer blocks for LTXAV."""
 
         # Process transformer blocks
-        for block in self.transformer_blocks:
-            if self.interrupt_check is not None and self.interrupt_check():
-                self.interrupted = True
-                return None, None
-            if self._enable_gradient_checkpointing and self.training:
-                # Use gradient checkpointing to save memory during training.
-                # With use_reentrant=False, we can pass dataclasses directly -
-                # PyTorch will track all tensor leaves in the computation graph.
-                video, audio = torch.utils.checkpoint.checkpoint(
-                    block,
-                    video,
-                    audio,
-                    perturbations,
-                    use_reentrant=False,
-                )
-            else:
-                video, audio = block(
-                    video=video,
-                    audio=audio,
-                    perturbations=perturbations,
-                )
+        with cuda_graphs.scope():
+            for block in self.transformer_blocks:
+                if self.interrupt_check is not None and self.interrupt_check():
+                    self.interrupted = True
+                    return None, None
+                if self._enable_gradient_checkpointing and self.training:
+                    # Use gradient checkpointing to save memory during training.
+                    # With use_reentrant=False, we can pass dataclasses directly -
+                    # PyTorch will track all tensor leaves in the computation graph.
+                    video, audio = torch.utils.checkpoint.checkpoint(
+                        block,
+                        video,
+                        audio,
+                        perturbations,
+                        use_reentrant=False,
+                    )
+                else:
+                    video, audio = block(
+                        video=video,
+                        audio=audio,
+                        perturbations=perturbations,
+                    )
 
         return video, audio
 
@@ -423,20 +426,21 @@ class LTXModel(torch.nn.Module):
         perturbations_list = perturbations if isinstance(perturbations, list) else None
         if perturbations_list is not None and len(perturbations_list) != len(video_list):
             raise ValueError("Perturbations list must match number of joint-pass conditions.")
-        for block in self.transformer_blocks:
-            if self.interrupt_check is not None and self.interrupt_check():
-                self.interrupted = True
-                return [None] * len(video_list), [None] * len(audio_list)
+        with cuda_graphs.scope():
+            for block in self.transformer_blocks:
+                if self.interrupt_check is not None and self.interrupt_check():
+                    self.interrupted = True
+                    return [None] * len(video_list), [None] * len(audio_list)
 
-            for idx in range(len(video_list)):
-                condition_perturbations = (
-                    perturbations_list[idx] if perturbations_list is not None else perturbations
-                )
-                video_list[idx], audio_list[idx] = block(
-                    video=video_list[idx],
-                    audio=audio_list[idx],
-                    perturbations=condition_perturbations,
-                )
+                for idx in range(len(video_list)):
+                    condition_perturbations = (
+                        perturbations_list[idx] if perturbations_list is not None else perturbations
+                    )
+                    video_list[idx], audio_list[idx] = block(
+                        video=video_list[idx],
+                        audio=audio_list[idx],
+                        perturbations=condition_perturbations,
+                    )
 
         return video_list, audio_list
 
@@ -455,8 +459,8 @@ class LTXModel(torch.nn.Module):
         )
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
-        x = norm_out(x)
-        x = _apply_scale_shift(x, scale, shift)
+        x_list, x = [x], None
+        x = kernels.layer_norm_modulate(x_list, shift, scale, norm_out.eps, frames=True)
         x = proj_out(x)
         return x
 
@@ -471,6 +475,10 @@ class LTXModel(torch.nn.Module):
         Returns:
             Processed output tensors
         """
+        with cuda_graphs.scope():  # with CUDA graphs, the preparation and the head run in the graph pool's idle memory (cuda_graphs.pooled)
+            return self._forward(video, audio, perturbations)
+
+    def _forward(self, video, audio, perturbations):
         if not self.model_type.is_video_enabled() and video is not None:
             raise ValueError("Video is not enabled for this model")
         if not self.model_type.is_audio_enabled() and audio is not None:
@@ -508,15 +516,17 @@ class LTXModel(torch.nn.Module):
                 return [None] * len(video_out_list), [None] * len(audio_out_list)
 
             vx_list = [
-                self._process_output(
-                    self.scale_shift_table, self.norm_out, self.proj_out, v_out.x, v_out.embedded_timestep
+                cuda_graphs.pooled(
+                    self, self._process_output, self.scale_shift_table, self.norm_out, self.proj_out, v_out.x, v_out.embedded_timestep
                 )
                 if v_out is not None
                 else None
                 for v_out in video_out_list
             ]
             ax_list = [
-                self._process_output(
+                cuda_graphs.pooled(
+                    self,
+                    self._process_output,
                     self.audio_scale_shift_table,
                     self.audio_norm_out,
                     self.audio_proj_out,
@@ -545,14 +555,16 @@ class LTXModel(torch.nn.Module):
             return None, None
 
         vx = (
-            self._process_output(
-                self.scale_shift_table, self.norm_out, self.proj_out, video_out.x, video_out.embedded_timestep
+            cuda_graphs.pooled(
+                self, self._process_output, self.scale_shift_table, self.norm_out, self.proj_out, video_out.x, video_out.embedded_timestep
             )
             if video_out is not None
             else None
         )
         ax = (
-            self._process_output(
+            cuda_graphs.pooled(
+                self,
+                self._process_output,
                 self.audio_scale_shift_table,
                 self.audio_norm_out,
                 self.audio_proj_out,

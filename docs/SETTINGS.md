@@ -29,10 +29,22 @@ The baseline schema lives in `models/_settings.json`. Model defaults in `default
 
 ## Output Shape
 
+Click the small switch icon to the left of the resolution controls to alternate between familiar presets and a megapixel slider with an **Aspect Ratio** selector. One megapixel is 1,000,000 pixels. When all high resolutions are unlocked, the model header shows **Max Recommended Res.** for the selected phase. The **Resolution Budget (MP)** slider label previews the actual dimensions after alignment to the model's block size; changing views preserves the current size, including custom sizes. The current view is remembered with the next resolution save or model switch, independently of generation settings.
+
+In the finetune editor, **Maximum Resolution**, **Maximum With Tiling** (when supported), and **Minimum Resolution** accept either a pixel count or dimensions such as `4096x4096`. These dimensions describe pixel area, so they do not force a square image. The maximum supplies the predefined presets; **Custom Resolutions** adds more choices. The minimum hides smaller presets and sets the ordinary slider minimum. Existing imported sizes remain available for unlocked models, with a warning during submission validation when outside the recommended range.
+
+Enable **Lock Resolutions** to allow only that model's custom list. Locked models show the category picker without a mode switch, and API/Deepy requests must use an allowed size. Switching back to an unlocked model restores your preferred picker mode. An incompatible imported size requires an explicit choice; it is not silently replaced. Older exclusive preset lists retain their restriction when migrated, while old category expressions are expanded into additional presets. Saved dimensions are preserved.
+
+Categories are approximate pixel-area groups. **4.2 MP** combines the former 1440p-area presets with 2048×2048, so square and wide formats share a useful group. **4K UHD** contains the familiar UHD-sized choices; **16.8 MP** covers larger presets including 4096×4096. Exact dimensions remain visible on each preset. Existing saved dimensions are preserved.
+
+When no clear maximum is declared, WanGP uses a 1080p recommendation (1920x1088 to include VAE-aligned presets). Enable **3K/4K+ Resolutions are available for all models** to expose the full resolution catalog and allow sizes outside the recommended range in the UI. A nonblocking message warns about possible quality loss during submission validation, never when changing resolutions. **Lock Resolutions** still restricts a model to its custom list. Python API, Deepy and external agents receive a validation error when submitting sizes above the active maximum or below the declared minimum, independently of this UI option. Input fitting and optional upscaling can change the final media dimensions from the requested canvas.
+
+A start image or reference image can set the canvas shape. With a start image, or when the first reference image is the main subject or landscape (`K` in `video_prompt_type`, shown as "Conditional Image is first Main Subject / Landscape"), WanGP keeps the requested resolution's pixel budget but follows that image's aspect ratio: a 1024x1024 request with a 1280x720 landscape reference produces 1360x768. When reference images are only people or objects (`I` alone), the requested resolution is kept, which suits a portrait poster built from a landscape reference.
+
 | Setting | Type | Meaning |
 | --- | --- | --- |
 | `image_mode` | integer | `0` for video/audio-generation mode, `1` for image mode, `2` for image inpainting mode. The available tabs depend on `image_outputs`, `v2i_switch_supported`, and `inpaint_support` in the model definition. Deepy omits a fixed normal-image value from image-only model defaults, templates, and profiles; mode `2` remains explicit. |
-| `resolution` | string | Output size as `WIDTHxHEIGHT`, for example `1280x720`. WanGP rounds each dimension down to a multiple of the model's block size, so any size can be requested. |
+| `resolution` | string | Requested canvas as `WIDTHxHEIGHT`, for example `1280x720`. Exact sizes can be requested independently of the picker mode; models with **Lock Resolutions** require a listed size. WanGP aligns each dimension down to the model's block size (at least one block); input fitting and postprocessing may change final dimensions. |
 | `batch_size` | integer | Number of images for image-output models. For some special image models this may have model-specific meaning. Video and audio paths usually force one sample per repeat. |
 | `video_length` | integer or seconds string | Requested output frames. Settings files, queue imports, and API/MCP requests may use a value such as `"10s"`; WanGP converts it using numeric `force_fps` when supplied, otherwise the model FPS, then selects the nearest frame count valid for the model. For audio-only models this is usually `0`; duration may come from `duration_seconds`. |
 | `duration_seconds` | number | Requested duration for audio models or models exposing `duration_slider`. |
@@ -128,8 +140,7 @@ The baseline schema lives in `models/_settings.json`. Model defaults in `default
 | `film_grain_intensity` | number | Film grain amount. `0` disables. |
 | `film_grain_saturation` | number | Saturation of generated film grain. |
 | `RIFLEx_setting` | integer | RIFLEx long-video policy. `0` auto, `1` always on, `2` always off. |
-| `override_profile` | number | Per-task MMGP memory/offload profile override. Allowed values are `-1`, `1`, `2`, `3`, `3.5`, `4`, `4.5`, and `5`; `-1` uses the normal Video, Image, or Audio memory profile selected in WanGP configuration. This controls RAM/VRAM placement and speed only. It is not a saved settings/accelerator profile and does not accept a `setting_id`. |
-| `override_attention` | string | Per-task attention backend override. Empty uses global auto/default selection. |
+| `overrides` | string | Configuration choices replaced for this task, written as `name=value` pairs separated by commas, for example `attention_mode='sage2', memory_profile=4`. Empty uses the WanGP configuration for all of them. `memory_profile`: memory/offload profile `0`, `1`, `2`, `3`, `3.5`, `4`, `4.5` or `5` instead of the Video, Image or Audio profile of the configuration; it controls RAM/VRAM placement and speed only, is not a saved settings/accelerator profile and does not accept a `setting_id`. `compilation`: `'disabled'`, `'cudagraph'` or `'transformer'`. `attention_mode`: an attention backend such as `'sdpa'` or `'sage2'`, or a model-specific mode. `transformer_quantization`: `'int8'`, `'fp8'` or `'bf16'`; `text_encoder_quantization`: `'bf16'` or `'int8'`; when the model has no weights in that format, the closest available ones are used. A change of profile, compilation or quantization reloads the model. |
 
 ## Post-Processing Audio
 
@@ -208,7 +219,6 @@ Only flags listed in `model_def["image_prompt_types_allowed"]` survive settings 
 | `+` | A second control or reference video is used (`video_guide2`). |
 | `*` | A third reference video is used (`video_guide3`), with `+`. |
 | `-` | The guide videos are reference videos (appearance or motion references) rather than control videos, for example H3 Ref2VA `V-U` for one reference video, `V+-U` for two and `V+*-U` for three. H3 Ref2VA `V1-U` takes up to three excerpts from one reference video instead. With sliding windows, every window receives the whole reference video; without `-`, a control video is split so that each window receives its own section. |
-| `R` | Sparse video-to-video: one frame is taken from the control video for each sliding window. |
 | `\|` | Cap the video length at the control video's length (**Capped By: Control Length**). |
 | `G` | Guide/denoise against the control media. Enables `denoising_strength`. |
 | `U` | Keep/use the guide unchanged, identity/raw format, or bypass preprocessing depending on the model choice. |
@@ -285,7 +295,21 @@ Shared option flags can be appended:
 | `K` | Enable "Think" mode for supported prompt enhancer backends. |
 | `1` | Use the model's alternate enhancer instruction set, often a relayed/dialogue prompt mode. |
 
-Examples: `T`, `TI`, `T1`, and `TI1`. Older saved values `I` and `IK` are migrated to `TI` and `TIK`.
+Examples: `T`, `TI`, `T1`, `TI1`, and MOSS `T1` (`T1K` with Think). Older saved values `I` and `IK` are migrated to `TI` and `TIK`.
+
+Enhancer system instructions can insert generation values with double-brace placeholders. For example, `Compose for {{width}}x{{height}} pixels` becomes `Compose for 1536x896 pixels` at that selected resolution. This works with manual and automatic enhancement, local and external enhancers, and each instruction set in a chain. No extra flag is needed: values enter the instructions only where a placeholder requests them. The user's prompt and ordinary JSON braces are unchanged.
+
+| Placeholder | Value |
+| --- | --- |
+| `{{width}}`, `{{height}}`, `{{resolution}}` | Selected canvas dimensions in pixels, or `WIDTHxHEIGHT`. These precede reference-image fitting and postprocessing. Available for images and videos. |
+| `{{aspect_ratio}}` | Selected canvas ratio, such as `12:7`. |
+| `{{half_width}}`, `{{half_height}}` | Half the selected dimensions, useful for layouts with a centered pixel origin. |
+| `{{duration_seconds}}` | Video duration, or the selected positive audio duration. For video windows, each prompt receives its own window duration. Unavailable for still images or automatic audio duration. |
+| `{{fps}}`, `{{frame_count}}` | Video frame rate and number of frames; for video windows, the frame count belongs to that window. |
+
+Templates keep the model's coordinate convention: MOSS uses centered pixels, while models with normalized layouts retain their normalized units. Unknown or unavailable placeholders produce an error rather than guessed values. To include a literal placeholder in system instructions, escape it as `\{{width}}`.
+
+Automatic duration guidance keeps its existing behavior unless the model definition sets `prompt_enhancer_video_duration` to `false`. This is a model declaration, not a generation setting. Explicit `false` disables the generic duration sentence for both whole videos and individual windows; `true` enables it, and omitting the declaration preserves the existing workflow. A template can still request `{{duration_seconds}}` when automatic insertion is disabled. When the selected system instructions already use that placeholder, WanGP omits the generic sentence to avoid duplication. An escaped literal placeholder does not suppress it. Start/end image roles, reference labels, injected-frame positions and timestamps remain available in either case.
 
 ### `multi_prompts_gen_type`
 

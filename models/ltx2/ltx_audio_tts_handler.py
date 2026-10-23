@@ -1,10 +1,12 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import os
 import re
 import warnings
 
 import torch
 
-from postprocessing import seedvc
+from postprocessing.seedvc_processor import assets as seedvc_assets, component as seedvc_component
+from shared.deepy.assets import whisper_download_def, whisper_model_name
 from shared.utils import files_locator as fl
 from shared.utils.hf import build_hf_url
 
@@ -20,13 +22,12 @@ LTX23_AUDIO_VAE_FILENAME = "ltx-2.3-22b_audio_vae.safetensors"
 LTX23_VOCODER_FILENAME = "ltx-2.3-22b_vocoder.safetensors"
 LTX23_TEXT_EMBEDDING_PROJECTION_FILENAME = "ltx-2.3-22b_text_embedding_projection.safetensors"
 LTX23_EMBEDDINGS_CONNECTOR_FILENAME = "ltx-2.3-22b_embeddings_connector.safetensors"
-SCENEMA_WHISPER_MEDIUM_REPO = "DeepBeepMeep/Wan2.1"
-SCENEMA_WHISPER_MEDIUM_DIR = "whisper_medium"
-SCENEMA_WHISPER_MEDIUM_FILES = ["config.json", "model.safetensors"]
 SCENEMA_KOKORO_DIR = "kokoro"
 SCENEMA_KOKORO_VOICE_DIR = "kokoro/voices"
 SCENEMA_KOKORO_FILES = ["config.json", "kokoro-v1_0.pth"]
 SCENEMA_KOKORO_VOICE_FILES = ["af_heart.pt"]
+SCENEMA_KOKORO_G2P_DIR = "openphonemizer"
+SCENEMA_KOKORO_G2P_FILES = ["openphonemizer_fp32.safetensors", "openphonemizer_config.json", "openphonemizer_dict.json"]
 SCENEMA_DEFAULT_PACE = 1.5
 SCENEMA_DEFAULT_DURATION_SECONDS = 120
 SCENEMA_MAX_DURATION_SECONDS = 30 * 60
@@ -348,17 +349,13 @@ def _get_scenema_download_def():
             "sourceFolderList": [_GEMMA_FOLDER],
             "fileList": [LTX_AUDIO_TTS_TOKENIZER_FILES],
         },
-        {
-            "repoId": SCENEMA_WHISPER_MEDIUM_REPO,
-            "sourceFolderList": [SCENEMA_WHISPER_MEDIUM_DIR],
-            "fileList": [SCENEMA_WHISPER_MEDIUM_FILES],
-        },
+        whisper_download_def(),
         {
             "repoId": SCENEMA_REPO_ID,
-            "sourceFolderList": [SCENEMA_KOKORO_DIR, SCENEMA_KOKORO_VOICE_DIR],
-            "fileList": [SCENEMA_KOKORO_FILES, SCENEMA_KOKORO_VOICE_FILES],
+            "sourceFolderList": [SCENEMA_KOKORO_DIR, SCENEMA_KOKORO_VOICE_DIR, SCENEMA_KOKORO_G2P_DIR],
+            "fileList": [SCENEMA_KOKORO_FILES, SCENEMA_KOKORO_VOICE_FILES, SCENEMA_KOKORO_G2P_FILES],
         },
-    ] + seedvc.query_download_def(mode=seedvc.SEEDVC_MODE_SPEECH)
+    ] + seedvc_assets.query_download_def(mode=seedvc_assets.SEEDVC_MODE_SPEECH)
 
 
 def _get_dramabox_download_def():
@@ -373,18 +370,14 @@ def _get_dramabox_download_def():
             "sourceFolderList": [_GEMMA_FOLDER],
             "fileList": [LTX_AUDIO_TTS_TOKENIZER_FILES],
         },
-        {
-            "repoId": SCENEMA_WHISPER_MEDIUM_REPO,
-            "sourceFolderList": [SCENEMA_WHISPER_MEDIUM_DIR],
-            "fileList": [SCENEMA_WHISPER_MEDIUM_FILES],
-        },
+        whisper_download_def(),
     ]
 
 
 def _load_alignment_whisper():
-    from shared.deepy.transcription import _load_whisper_medium
+    from shared.deepy.transcription import load_whisper
 
-    alignment_whisper = _load_whisper_medium(torch.device("cpu"))
+    alignment_whisper = load_whisper(whisper_model_name(), torch.device("cpu"))
     alignment_heads = alignment_whisper.alignment_heads
     del alignment_whisper._buffers["alignment_heads"]
     object.__setattr__(alignment_whisper, "alignment_heads", alignment_heads)
@@ -443,7 +436,8 @@ class family_handler:
 
     @staticmethod
     def query_model_def(base_model_type, model_def):
-        return _get_dramabox_model_def() if _is_dramabox(base_model_type) else _get_scenema_model_def()
+        from models.help_shared import specialities
+        return {**(_get_dramabox_model_def() if _is_dramabox(base_model_type) else _get_scenema_model_def()), "device_explicit": True, "specialities": specialities("voice design", "voice cloning", "speech dialogue")}
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):
@@ -616,6 +610,8 @@ class family_handler:
             return pipeline, pipe
 
         from .scenema_audio import ScenemaAudioPipeline
+        seedvc_component.ensure_installed()
+        from postprocessing import seedvc
 
         weights_path = model_filename[0] if isinstance(model_filename, (list, tuple)) else model_filename
         if not text_encoder_filename:
@@ -628,8 +624,8 @@ class family_handler:
         alignment_whisper = _load_alignment_whisper()
         kokoro_pipeline = _load_kokoro_pipeline()
         kokoro_model = kokoro_pipeline.model
-        seedvc_model = seedvc.get_model(dtype=torch.float16, mode=seedvc.SEEDVC_MODE_SPEECH)
-        seedvc_pipe = seedvc.get_pipe(profile_no=profile, model=seedvc_model, mode=seedvc.SEEDVC_MODE_SPEECH)
+        seedvc_model = seedvc.get_model(dtype=torch.float16, mode=seedvc_assets.SEEDVC_MODE_SPEECH)
+        seedvc_pipe = seedvc.get_pipe(profile_no=profile, model=seedvc_model, mode=seedvc_assets.SEEDVC_MODE_SPEECH)
 
         pipeline = ScenemaAudioPipeline(
             model_weights_path=weights_path,

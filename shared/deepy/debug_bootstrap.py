@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
 import sys
@@ -29,7 +30,10 @@ class _SelectiveTeeTextStream:
         self.errors = getattr(wrapped, "errors", None)
 
     def write(self, data):
-        written = self._wrapped.write(data)
+        try:
+            written = self._wrapped.write(data)
+        except UnicodeEncodeError:  # a console or redirected stream in a legacy code page: debug text must not end a Deepy turn
+            written = self._wrapped.write(data.encode(self.encoding, "replace").decode(self.encoding))
         _maybe_write_log(data)
         return written
 

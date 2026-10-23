@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Bundled from ComfyUI-sol-attn v0.6.2 (commit 930a4d6).
+# Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """Triton Sol-Attn reference."""
 
 import torch
 import triton
+from shared.kernels.triton_autotune import model_autotune
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
@@ -30,15 +32,16 @@ def _lean_do_bench(fn, quantiles=None, **kwargs):
         driver.get_empty_cache_for_benchmark = original
 
 
-def _tuned(configs):
-    # cache_results / do_bench are not available on older Triton; probe once.
+def _tuned(configs, restore_value=None):
+    # cache_results / do_bench are not available on older Triton; probe once. restore_value: arguments a launch may overwrite and
+    # also read (an output written into its own input): saved and restored around each benchmark launch while tuning.
     extras = {}
     try:
-        triton.autotune(configs=[], key=["_probe"], cache_results=True, do_bench=None)
+        model_autotune(configs=[], key=["_probe"], cache_results=True, do_bench=None)
         extras = {"cache_results": True, "do_bench": _lean_do_bench}
     except TypeError:
         pass
-    return triton.autotune(configs=configs, key=["T"], **extras)
+    return model_autotune(configs=configs, key=["T"], restore_value=restore_value, **extras)
 
 
 _TMA_CONFIGS = [
@@ -111,7 +114,7 @@ def _use_pointer_arch(arch):
 
 
 @_tuned(_TMA_CONFIGS)
-@triton.jit
+@triton.jit(do_not_specialize=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end'], do_not_specialize_on_alignment=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end'])
 def _forward(
     q_desc,
     k_desc,
@@ -128,7 +131,7 @@ def _forward(
     T,
     H: tl.constexpr,
     D: tl.constexpr,
-    NT: tl.constexpr,
+    NT,
     BV: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
@@ -233,7 +236,7 @@ def _forward(
 
 
 @_tuned(_TMA_CONFIGS)
-@triton.jit
+@triton.jit(do_not_specialize=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sv_b', 'sv_t', 'sv_h'], do_not_specialize_on_alignment=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sv_b', 'sv_t', 'sv_h'])
 def _forward_int8(
     q_desc,
     kc_desc,
@@ -256,7 +259,7 @@ def _forward_int8(
     sv_b, sv_t, sv_h,
     H: tl.constexpr,
     D: tl.constexpr,
-    NT: tl.constexpr,
+    NT,
     BV: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
@@ -417,7 +420,7 @@ def _forward_int8(
 
 
 @_tuned(_PTR_CONFIGS)
-@triton.jit
+@triton.jit(do_not_specialize=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sq_b', 'sq_t', 'sq_h', 'sk_b', 'sk_t', 'sk_h', 'sv_b', 'sv_t', 'sv_h'], do_not_specialize_on_alignment=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sq_b', 'sq_t', 'sq_h', 'sk_b', 'sk_t', 'sk_h', 'sv_b', 'sv_t', 'sv_h'])
 def _forward_ptr(
     q_ptr, k_ptr, v_ptr, kc_ptr, vc_ptr, threshold, o_ptr,
     scale,
@@ -431,7 +434,7 @@ def _forward_ptr(
     sv_b, sv_t, sv_h,
     H: tl.constexpr,
     D: tl.constexpr,
-    NT: tl.constexpr,
+    NT,
     BV: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
@@ -553,8 +556,8 @@ def _forward_ptr(
     )
 
 
-@_tuned(_PTR_CONFIGS)
-@triton.jit
+@_tuned(_PTR_CONFIGS, restore_value=["q_ptr"])  # sol_attn_prepared writes its output into q
+@triton.jit(do_not_specialize=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sq_b', 'sq_t', 'sq_h', 'sv_b', 'sv_t', 'sv_h'], do_not_specialize_on_alignment=['T', 'NT', 'sink_start', 'sink_end', 'sink_q_start', 'sink_q_end', 'sq_b', 'sq_t', 'sq_h', 'sv_b', 'sv_t', 'sv_h'])
 def _forward_int8_ptr(
     q_ptr, v_ptr, kc_ptr, vc_ptr, qi_ptr, ki_ptr, q_scale, k_scale,
     vi_ptr, vsc_ptr, threshold, kc_mean_ptr, kc_var_ptr, o_ptr,
@@ -569,7 +572,7 @@ def _forward_int8_ptr(
     sv_b, sv_t, sv_h,
     H: tl.constexpr,
     D: tl.constexpr,
-    NT: tl.constexpr,
+    NT,
     BV: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
@@ -910,4 +913,44 @@ def sol_attn(
     return output
 
 
-__all__ = ["sol_attn"]
+def inline_q_path(arch, tokens, thresh_type):
+    """True when sol_attn(..., int8_qk=True) runs the pointer forward with Q quantized inline (K/V from prepare_int8_kv)."""
+    return _use_pointer_arch(arch) and _POINTER_INLINE_Q and thresh_type == "diag" and tokens >= 4096
+
+
+def sol_attn_prepared(q, v, prepared, *, scale=None, tau=1.0, sink_blocks=(0, 0), sink_q=(0, 0), out=None):
+    """sol_attn(q, k, v, int8_qk=True, thresh_type="diag") on the inline-Q pointer path (inline_q_path) from prepared =
+    prepare_int8_kv(k, v), so that k can be released before q exists. out may be q itself: each program reads its query
+    block before writing that block."""
+    kc, vc, stat_mean, stat_var, k8, k_scale = prepared
+    scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
+    batch, tokens, heads, head_dim = q.shape
+    blocks = triton.cdiv(tokens, BLOCK)
+    output = torch.empty(q.shape, device=q.device, dtype=q.dtype) if out is None else out
+    # the arguments of sol_attn's inline-Q launch, its unused Q-side inputs being q as there
+    _forward_int8_ptr[(1, blocks, batch * heads)](
+        q, v, kc, vc, q, k8, q, k_scale,
+        q, q, q, stat_mean, stat_var, output,
+        scale,
+        float(tau),
+        int(sink_blocks[0]), int(sink_blocks[1]), int(sink_q[0]), int(sink_q[1]),
+        tokens,
+        q.stride(0), q.stride(1), q.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        H=heads,
+        D=head_dim,
+        NT=blocks,
+        BV=head_dim,
+        BLOCK_SIZE=BLOCK,
+        GROUP_SIZE=GROUP,
+        INT8_PV=False,
+        INLINE_Q=True,
+    )
+    return output
+
+
+__all__ = ["inline_q_path", "sol_attn", "sol_attn_prepared"]
+
+
+from shared.kernels.triton_compilation_log import install_triton_compilation_logger
+install_triton_compilation_logger()

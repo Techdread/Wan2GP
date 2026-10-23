@@ -149,11 +149,17 @@ Choose how window prompts are separated with **How to Process each Line of the T
 
 Each window prompt may begin with optional `[/...]` commands. Use `[/overlap=9]` to select a different overlap for that transition, or `[/overlap]` to restore the model's default overlap. On text-to-video-capable models, `[/overlap=0]` creates a hard cut by preventing the preceding window from conditioning the new one; `[/new_shot]` is its more explicit alias. Different window lengths can be requested with `[/duration=121]`, `[/duration=5s]`, or `[/duration=20%]`. When duration commands are present, they define the window schedule and predicted final length instead of treating the UI's Number of Frames as a strict final cap; windows without an explicit duration consume the remaining requested frames, up to the configured Sliding Window Size. Commands can be combined, for example `[/duration=4s,/new_shot]`.
 
+When generating sound with LTX-2, MiniMax H3 or Ovi, WanGP aligns each window's audio to the video timeline and replaces a short ending of the preceding soundtrack with newly generated overlap. This also applies to Continue Video: the source's ending may be replaced even if it came from another model or was never padded. Keep the model's default overlap; if WanGP reports that it is too short for audio repair, increase it to an allowed value. This prevents accumulated timing drift; Ovi still generates each window's sound independently, so sound or voice continuity is not guaranteed. MiniMax H3 generates a little sound past each window's last frame, so its windows join without replacing anything, and the videos it saves keep about 0.1 s of sound after the last frame: continuing such a video reuses its whole soundtrack. Players may show these videos 0.1 s longer, holding the last frame.
+
+A control or source soundtrack selected for preservation keeps its original audio. Audio supplied only as a generation reference does not imply preservation. A deliberate cut without overlap can retain a short silent gap if the preceding generated soundtrack ends early.
+
+With these models, if the generated soundtrack ends slightly before the final video frame, WanGP fills the remaining ending with silence when saving. This keeps the complete video; that export padding is not reused to condition the next sliding window. H3 native continuation requires the source soundtrack to reach close to the video's end; WanGP reports when the gap is too long to repair.
+
 Sliding-window settings:
 
 - **Window Size:** choose a duration that fits the motion and model quality.
 - **Overlap Frames:** use enough overlap for continuity, but not so much that blur propagates.
-- **Discard Last Frames:** remove weak final frames from each window when a model tends to blur at the end.
+- **Discard Last Frames:** remove weak final frames from each window when a model tends to blur at the end. With MiniMax H3 any number of frames can be discarded; when a window has an end image and another window follows, that end image is generated just after the discarded frames. It steers the action without being shown, which hides the jump onto an end image the action did not reach (about 5 frames is enough). The last window still ends exactly on its end image.
 - **Add Overlapped Noise:** may help some workflows, but can reduce quality in others.
 
 ## After Generation: Postprocessing
@@ -170,7 +176,23 @@ Common postprocessing jobs:
 - Cropping, resizing, or importing existing media for a later workflow.
 - Applying a system postprocessing model through MediaFlow.
 
+SeedVC voice replacement, also used by Scenema Audio for reference voices, is distributed separately under the GPL-3.0 license. WanGP downloads it automatically from https://github.com/deepbeepmeep/WanGP-SeedVC the first time you use it, so that first use needs internet access.
+
 Late postprocessing is useful when you want to improve existing media without regenerating the original scene.
+
+### Detail Refinement Up To 8K
+
+**LTX 2.5 Detail Refiner** rebuilds fine texture, edges and natural grain in videos that look soft: compressed web video, clips upscaled with a basic resizer, or generated videos that lost detail in the VAE. Framing, motion, exposure and color stay those of the source.
+
+- **Scale:** x1 only restores detail, x1.5 and x2 also enlarge the video. The best results come from 1080p sources refined to 4K. The refiner accepts at most x2 of the source; to reach 8K, refine to 4K first and then refine the 4K result again.
+- **Speed:** the video is processed in overlapping 1024x576 areas that are refined together at every step, so there are no seams, but the work grows with the output size: FullHD needs 9 areas per step, 4K needs 49 and 8K 196. Expect minutes for FullHD and much longer for 4K or 8K.
+- **Style prompt:** describe the rendering only, for example sharpness, texture, grain or lighting. Every area of the frame receives the whole prompt, so naming a subject can paint it where it does not belong.
+- **Gentle Mode** (enabled by default in *Configuration / Extensions*) starts from the source video and runs three steps: it is faster and stays closer to the source. Disable it to rebuild detail from scratch in eight steps when the source is very soft.
+- **Temporal Window** (97 frames by default) is the number of frames refined together. Shorter windows use less VRAM.
+- **Tiles per Model Call** (*Auto* by default) is how many areas are refined in one pass of the model. Lower it to cap VRAM usage; the result is identical, only the speed changes. Very large or long outputs are also kept in system RAM automatically instead of VRAM.
+- **Media Flow:** the *LTX 2.5 Detail Refiner* process offers the same x1, x1.5 and x2 *Upsampling* choices. Outputs larger than 4320p (8K) are refused with the largest multiplier that fits. Each chunk starts from the refined end of the previous chunk, so content stays continuous across chunk boundaries; on very fine texture such as grass or foliage, a slight change of texture can remain visible at a boundary. A small `.ltx25_refine_cache.safetensors` file is kept next to an unfinished output so a stopped run resumes just as smoothly; it is removed when the output completes. Keep it with the video if you move a partial output you plan to resume.
+
+Limitations: text and logos that are heavily degraded may become shapes that only resemble letters; foam, fireworks or wind-blown foliage can look over-sharpened; archive footage becomes cleaner but can lose some mid-level texture. Save 4K and 8K results with a high-quality video codec setting, otherwise compression hides the added detail.
 
 ## Checklists
 

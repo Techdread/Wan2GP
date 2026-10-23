@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
 from typing import Any
@@ -69,6 +70,7 @@ QWEN35_VARIANT_SPECS = {
         "vision_filename": QWEN35_VISION_FILENAME,
         "tie_word_embeddings": False,
         "supports_mtp": True,
+        "mtp_draft_vocab_size": 98304,  # GGUF checkpoint: the MTP head drafts over the first 98304 tokens, as the 27B
         "mtp_speculative_tokens": 2,
         "mtp_speculative_sampling_tokens": 2,
         "mtp_speculative_confidence": 0.0,

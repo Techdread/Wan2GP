@@ -1,3 +1,4 @@
+// Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 (() => {
 const WAC = window.__wangpAssistantChatNS = window.__wangpAssistantChatNS || {};
 WAC.stopBridgeTargets = function () {
@@ -133,7 +134,8 @@ WAC.installEventBridge = function () {
   WAC.handleEventNodeMutation();
   WAC.syncDisclosureBridge();
   WAC.syncScrollBridge();
-  if (!WAC.pollTimer) WAC.pollTimer = window.setInterval(() => { WAC.readEventSource(); }, 250);
+  // The value setter and input/change handlers deliver updates immediately.
+  // Re-read on focus below; there is no need to poll the hidden textbox.
   window.addEventListener('focus', () => { WAC.readEventSource(); }, { passive: true });
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) WAC.readEventSource();

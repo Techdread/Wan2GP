@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Modified for WanGP.
 """In-place Q/K RMSNorm + RoPE for strided fused-projection views."""
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ def _round_bf16(value):
     return tl.inline_asm_elementwise("cvt.rn.bf16.f32 $0, $1;", "=h,f", [value], dtype=tl.bfloat16, is_pure=True, pack=1)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=['SXB', 'SXT', 'SXH', 'SRB', 'SRT', 'SRP', 'SRC', 'T'], do_not_specialize_on_alignment=['SXB', 'SXT', 'SXH', 'SRB', 'SRT', 'SRP', 'SRC', 'T'])
 def _rms_norm_rope_kernel(
     x,
     weight,
@@ -26,7 +27,7 @@ def _rms_norm_rope_kernel(
     SRT,
     SRP,
     SRC,
-    T: tl.constexpr,
+    T,
     H: tl.constexpr,
     D: tl.constexpr,
     PAIRS: tl.constexpr,
@@ -62,7 +63,8 @@ def _rms_norm_rope_kernel(
     tl.store(x + offsets, normalized, mask=remaining)
 
 
-def _apply_rms_norm_rope_(x: torch.Tensor, weight: torch.Tensor, rope: torch.Tensor, eps: float) -> None:
+def rms_norm_rope_(x: torch.Tensor, weight: torch.Tensor, rope: torch.Tensor, eps: float) -> None:
+    """Normalize and rotate one of Q or K in place."""
     batch, tokens, heads, head_dim = x.shape
     pairs = rope.shape[-2]
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16 or rope.dtype != torch.bfloat16:
@@ -85,8 +87,12 @@ def qk_rms_norm_rope_(q: torch.Tensor, k: torch.Tensor, q_weight: torch.Tensor, 
                        rope: torch.Tensor, eps: float) -> None:
     """Normalize and rotate Q/K in place without materializing their strided views."""
 
-    _apply_rms_norm_rope_(q, q_weight, rope, eps)
-    _apply_rms_norm_rope_(k, k_weight, rope, eps)
+    rms_norm_rope_(q, q_weight, rope, eps)
+    rms_norm_rope_(k, k_weight, rope, eps)
 
 
-__all__ = ["qk_rms_norm_rope_"]
+__all__ = ["qk_rms_norm_rope_", "rms_norm_rope_"]
+
+
+from shared.kernels.triton_compilation_log import install_triton_compilation_logger
+install_triton_compilation_logger()

@@ -11,6 +11,41 @@ gradio-app {
     width: 100%;
 }
 
+/* Settings group labels retain Gradio's values and selection behavior. */
+@keyframes wangp-settings-separator-ready {
+    from { --wangp-settings-separator-ready: 0; }
+    to { --wangp-settings-separator-ready: 1; }
+}
+[data-testid="dropdown-option"][aria-label^="─"][aria-label$="─"] {
+    animation: wangp-settings-separator-ready 1ms;
+    position: relative;
+    align-items: center;
+    gap: 0.5em;
+    padding-inline: calc(var(--size-2) + 1em);
+    white-space: nowrap;
+}
+[data-testid="dropdown-option"]:has(> .wangp-settings-separator-title)::before,
+[data-testid="dropdown-option"]:has(> .wangp-settings-separator-title)::after {
+    content: "";
+    flex: 1 1 0;
+    min-width: 0;
+    border-top: 1px solid currentColor;
+    opacity: 0.5;
+    pointer-events: none;
+}
+[data-testid="dropdown-option"]:has(> .wangp-settings-separator-title) > .inner-item {
+    position: absolute;
+    left: var(--size-2);
+}
+.wangp-settings-separator-title {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    pointer-events: none;
+}
+
 /* Keep actions at the bottom of their column, floating until their slot is in
    view. Native sticky positioning also follows wrapping, tab and form updates. */
 .gradio-container:has(.wangp-settings-actions) {
@@ -22,7 +57,13 @@ gradio-app {
 }
 .wangp-settings-actions {
     position: sticky !important;
+    /* Let the gallery and any separate media panel push controls below the
+       viewport instead of covering the preview. The bound scrolls with them. */
+    top: var(--wangp-actions-gallery-top, auto);
     bottom: max(8px, env(safe-area-inset-bottom));
+}
+.wangp-settings-actions,
+.wangp-media-actions {
     z-index: 20;
     flex: 0 0 auto !important;
     padding: 8px;
@@ -31,60 +72,37 @@ gradio-app {
     border-radius: 18px;
     background: transparent;
 }
-.wangp-settings-actions.is-floating {
+.wangp-settings-actions.is-floating,
+.wangp-media-actions.is-floating {
     border-color: color-mix(in srgb, var(--studio-border, var(--border-color-primary)) 20%, transparent);
     background: color-mix(in srgb, var(--studio-surface, var(--background-fill-primary)) 60%, transparent);
     -webkit-backdrop-filter: blur(16px) saturate(130%);
     backdrop-filter: blur(16px) saturate(130%);
     box-shadow: 0 6px 22px rgb(0 0 0 / 8%);
 }
-.wangp-settings-actions button {
+.wangp-settings-actions button,
+.wangp-media-actions button {
     min-width: min(100%, 104px) !important;
 }
-.wangp-action-tooltip {
-    position: relative;
-    overflow: visible !important;
+/* Media actions keep their original handlers and a separate landing slot.
+   Only geometry is supplied by JS; panel styling and positioning live here. */
+.wangp-media-actions.is-floating {
+    position: fixed !important;
+    left: var(--wangp-media-actions-left);
+    bottom: var(--wangp-media-actions-bottom);
+    width: var(--wangp-media-actions-width) !important;
+    max-height: calc(100dvh - var(--wangp-media-actions-bottom) - 8px);
+    overflow-y: auto;
 }
-.wangp-action-tooltip::after {
-    position: absolute;
-    bottom: calc(100% + 8px);
-    left: 50%;
-    transform: translateX(-50%);
-    width: max-content;
-    max-width: min(240px, calc(100vw - 32px));
-    padding: 6px 9px;
-    border-radius: 6px;
-    background: var(--body-text-color);
-    color: var(--body-background-fill);
-    font-size: 12px;
-    font-weight: normal;
-    line-height: 1.4;
-    white-space: normal;
-    text-align: left;
+.wangp-media-actions-slot {
+    flex: 0 0 auto;
+    width: 100%;
+    min-width: 0;
+    height: var(--wangp-media-actions-height);
     pointer-events: none;
-    opacity: 0;
-    visibility: hidden;
-    transition: opacity 120ms ease, visibility 0s;
-    z-index: 50;
 }
-.wangp-action-tooltip:is(:hover, :focus-visible)::after {
-    opacity: 1;
-    visibility: visible;
-    transition-delay: 500ms;
-}
-.wangp-action-more::after {
-    content: "Generate one more result with the current prompt.";
-    left: 0;
-    transform: none;
-}
-.wangp-action-extend::after { content: "Extend the current video by one more window."; }
-.wangp-action-pause::after { content: "Pause generation until you choose Resume."; }
-.wangp-action-resume::after { content: "Continue the paused generation."; }
-.wangp-action-abort::after {
-    content: "Stop the current generation.";
-    left: auto;
-    right: 0;
-    transform: none;
+.wangp-media-actions-slot[hidden] {
+    display: none;
 }
 /* Preview visibility still follows the same Gradio generation-state column,
    although its contents now stay beside the gallery rather than in the bar. */
@@ -122,7 +140,22 @@ gradio-app {
     border-radius: 4px;
 }
 
-/* The preview cross removes the selected item only in the reference gallery. */
+/* Image inputs use a landscape icon, sized and colored by the native label. */
+.amg-image-gallery > [data-testid="block-label"] {
+    z-index: 30;
+}
+.amg-image-gallery:has(.preview) > [data-testid="block-label"] {
+    max-width: calc(100% - 100px);
+}
+.amg-image-gallery > [data-testid="block-label"] > span {
+    background: currentColor;
+    mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='3' width='18' height='18' rx='2'/%3E%3Ccircle cx='8.5' cy='8.5' r='1.5'/%3E%3Cpath d='m21 15-5-5L5 21'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+.amg-image-gallery > [data-testid="block-label"] > span > svg {
+    visibility: hidden;
+}
+
+/* Input galleries remove the selected item; output galleries keep no cross. */
 .gallery-container > .preview button[aria-label="Close"] {
     display: none;
 }
@@ -135,6 +168,10 @@ gradio-app {
     background: var(--background-fill-primary);
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
+}
+/* Keep a closing grid's transition from painting behind a restored preview. */
+.gallery-container:has(> .preview) > .grid-wrap > .grid-container {
+    visibility: hidden;
 }
 /* The outer wrapper must not scroll when Chrome reveals a focused thumbnail. */
 .block:has(> .gallery-container) {
@@ -205,6 +242,117 @@ font-size: calc(25px * var(--wangp-ui-scale))}
 :is(#family_list, #model_base_types_list, #model_list) > .container > .wrap {
     border-radius: var(--wangp-model-corners);
 }
+
+/* The menu can be wider than its trigger; opening/resizing positions it in the viewport. */
+@keyframes wangp-dropdown-ready { from { opacity: .99; } to { opacity: 1; } }
+.wangp-model-selector-tool { transition-property: background-color, border-color, color !important; }
+.options[role="listbox"] {
+    --wangp-dropdown-limit: calc(min(100vw, var(--wangp-dropdown-viewport-width, 100vw)) - 16px);
+    width: max-content !important;
+    min-width: min(var(--wangp-dropdown-limit), max(280px, var(--wangp-dropdown-width, 0px))) !important;
+    max-width: var(--wangp-dropdown-limit) !important;
+    box-sizing: border-box;
+}
+.options[role="listbox"] > li {
+    width: auto !important;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+.options[role="listbox"] > li:first-child { animation: wangp-dropdown-ready 1ms; }
+.options[role="listbox"] > li:first-child[aria-label^="─"][aria-label$="─"] { animation: wangp-settings-separator-ready 1ms, wangp-dropdown-ready 1ms; }
+
+/* Safari zooms focused form inputs below 16px, including the Settings selector. */
+@media (max-width: 900px), (pointer: coarse) {
+    .block input[role="listbox"] { font-size: 16px !important; }
+}
+
+@media (max-width: 900px) {
+    .tabitem:has(#family_list) {
+        --wangp-selector-tab-inset: calc(var(--spacing-xl) + 2px);
+        padding-inline: var(--wangp-selector-tab-inset);
+    }
+    .row:has(> .form > #family_list) {
+        container-type: inline-size;
+        display: grid !important;
+        /* Equal outer tracks center both groups together; the middle track yields on phones. */
+        grid-template-columns: minmax(0, 1fr) max-content minmax(8px, 90px) max-content minmax(0, 1fr);
+        gap: 6px 0 !important;
+    }
+    .form:has(> #family_list) {
+        --wangp-selector-bleed: calc(var(--wangp-app-padding) + var(--wangp-selector-tab-inset, 0px) - max(4px, env(safe-area-inset-left), env(safe-area-inset-right)));
+        grid-column: 1 / -1;
+        grid-row: 1;
+        justify-self: center;
+        min-width: 0 !important;
+        width: calc(100% + 2 * var(--wangp-selector-bleed));
+        flex-wrap: nowrap !important;
+        border: 1px solid #a9bfd0;
+        box-sizing: border-box;
+        padding: 0 !important;
+        gap: 0 !important;
+    }
+    .dark .form:has(> #family_list) { border-color: #526a80; }
+    :is(#family_list, #model_base_types_list, #model_list) {
+        min-width: 0 !important;
+        flex-basis: 0 !important;
+        padding: 0 !important;
+    }
+    :is(#family_list, #model_base_types_list, #model_list) .wrap-inner { padding: 0 !important; }
+    :is(#family_list, #model_base_types_list, #model_list) .secondary-wrap { min-width: 0 !important; }
+    :is(#family_list, #model_base_types_list, #model_list) input[role="listbox"] {
+        width: 0;
+        min-width: 0;
+        flex: 1 1 0;
+        font-size: 16px !important;
+        padding: 10px 22px 10px 4px !important;
+        margin: 0;
+    }
+    :is(#model_base_types_list, #model_list) .secondary-wrap[data-wangp-availability] > input[role="listbox"] { padding-left: 24px !important; }
+    :is(#model_base_types_list, #model_list) .secondary-wrap[data-wangp-availability]::before { left: 4px !important; width: 12px !important; height: 12px !important; top: calc(50% - 6px) !important; }
+    :is(#family_list, #model_base_types_list, #model_list) .icon-wrap { right: 0; margin-right: 2px; }
+    .row:has(> .form > #family_list) > :is(.wangp-model-output-filter-wrap, .wangp-model-selector-tools) {
+        --wangp-compact-control-width: clamp(26px, calc((100cqw - 44px) / 9), 30px);
+        --wangp-compact-control-gap: clamp(4px, calc(4px + (100cqw - 320px) / 20), 12px);
+        grid-row: 2;
+        min-width: 0 !important;
+    }
+    .row:has(> .form > #family_list) > .wangp-model-output-filter-wrap { grid-column: 2; width: max-content; }
+    .row:has(> .form > #family_list) > .wangp-model-selector-tools {
+        grid-column: 4;
+        width: calc(4 * var(--wangp-compact-control-width) + 3 * var(--wangp-compact-control-gap));
+    }
+    /* Keep the replacement search field and its results inside the centered toolbar. */
+    .row:has(> .form > #family_list) #wangp_model_search_results {
+        max-width: calc(50cqw + 2 * var(--wangp-compact-control-width) + 1.5 * var(--wangp-compact-control-gap));
+    }
+    .row:has(> .form > #family_list) .wangp-model-output-filter {
+        grid-template-columns: none !important;
+        grid-auto-flow: column;
+        grid-auto-columns: var(--wangp-compact-control-width);
+        width: max-content !important;
+        gap: var(--wangp-compact-control-gap) !important;
+        padding: 0 !important;
+        margin: 0 !important;
+    }
+    .row:has(> .form > #family_list) .wangp-model-output-filter-link { min-width: 0; }
+    .row:has(> .form > #family_list) .wangp-model-selector-tool-row {
+        width: max-content;
+        flex-wrap: nowrap;
+        gap: var(--wangp-compact-control-gap) !important;
+        padding: 0 !important;
+        margin: 0 !important;
+    }
+    .row:has(> .form > #family_list) .wangp-model-selector-tool {
+        min-width: var(--wangp-compact-control-width) !important;
+        width: var(--wangp-compact-control-width) !important;
+        max-width: var(--wangp-compact-control-width) !important;
+        height: 40px !important;
+    }
+    #wangp-gallery-tabs > .tab-wrapper > .tab-container > button { padding-inline: 8px; }
+}
+/* Gradio only scopes media-rule selectors inside .contain, which excludes its outer padding. */
+gradio-app .app { --wangp-app-padding: clamp(8px, calc(10vw - 60px), 32px); padding-inline: var(--wangp-app-padding) !important; }
 
 .title-with-lines {
     display: flex;
@@ -374,13 +522,12 @@ h2 {
     max-height: 95vh;
     overflow: hidden;
 }
-#image-modal-container .modal-close-btn {
-    position: absolute;
-    top: calc(10px * var(--wangp-ui-scale));
-    right: calc(10px * var(--wangp-ui-scale));
+#image-modal-container .modal-close-btn,
+#image-modal-container .wangp-image-zoom-controls button {
     width: calc(40px * var(--wangp-ui-scale));
     height: calc(40px * var(--wangp-ui-scale));
     background-color: rgba(0, 0, 0, 0.5);
+    border: none;
     border-radius: 50%;
     color: #fff;
     font-size: calc(1.8rem * var(--wangp-ui-scale));
@@ -394,9 +541,30 @@ h2 {
     transition: background-color 0.2s, transform 0.2s;
     text-shadow: 0 0 5px rgba(0,0,0,0.5);
 }
-#image-modal-container .modal-close-btn:hover {
+#image-modal-container .modal-close-btn {
+    position: absolute;
+    top: calc(10px * var(--wangp-ui-scale));
+    right: calc(10px * var(--wangp-ui-scale));
+}
+#image-modal-container .modal-close-btn:hover,
+#image-modal-container .wangp-image-zoom-controls button:hover {
     background-color: rgba(0, 0, 0, 0.8);
     transform: scale(1.1);
+}
+#image-modal-container .wangp-image-zoom-controls {
+    top: calc(56px * var(--wangp-ui-scale));
+    right: calc(10px * var(--wangp-ui-scale));
+    gap: calc(6px * var(--wangp-ui-scale));
+}
+#image-modal-container .wangp-image-zoom-controls button > div {
+    width: calc(1.8rem * var(--wangp-ui-scale));
+    height: calc(1.8rem * var(--wangp-ui-scale));
+}
+#image-modal-container .modal-image-viewport {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 0;
 }
 #image-modal-container .modal-label {
     position: absolute;
@@ -410,8 +578,10 @@ h2 {
     z-index: 1001;
 }
 #image-modal-container .modal-image {
-    width: 100%;
-    height: 100%;
+    max-width: 95vw;
+    max-height: 95vh;
+    width: auto;
+    height: auto;
     object-fit: contain;
 }
 .progress-container-custom {
@@ -466,8 +636,10 @@ h2 {
 .wangp-generation-info #PINFO .generation-prompt-cell {width:100%;min-width:200px;padding:14px 16px;overflow-wrap:anywhere;}
 .wangp-generation-info .generation-label {margin-bottom:6px;font-size:var(--text-sm);font-weight:600;color:var(--body-text-color-subdued);}
 .wangp-generation-info .generation-note {margin-bottom:8px;color:var(--body-text-color-subdued);white-space:pre-wrap;}
-.wangp-generation-info .generation-references {display:grid;grid-template-columns:repeat(2,120px);gap:10px;}
-.wangp-generation-info .generation-references:has(> :only-child) {grid-template-columns:120px;}
+/* The mount/show event starts one layout check without a DOM observer. */
+@keyframes wangp-generation-references-ready {from {visibility:visible;} to {visibility:visible;}}
+.wangp-generation-info .generation-references {display:grid;grid-template-columns:120px;gap:10px;animation:wangp-generation-references-ready 0s;}
+.wangp-generation-info .generation-references.generation-references-two-columns {grid-template-columns:repeat(2,120px);}
 .wangp-generation-info .generation-reference {display:flex;flex-direction:column;gap:6px;width:120px;padding:6px;border:1px solid var(--border-color-primary);border-radius:var(--button-small-radius,6px);background:var(--background-fill-secondary);color:inherit;font:inherit;cursor:pointer;}
 .wangp-generation-info .generation-reference img {display:block;width:100%;height:101px;object-fit:contain;border-radius:4px;}
 .wangp-generation-info .generation-reference span {font-size:var(--text-sm);line-height:1.35;overflow-wrap:anywhere;text-align:center;}
@@ -531,6 +703,12 @@ transition: visibility 0s linear 1s, opacity 0.3s linear 1s; /* 1s delay before 
 #video_info table {
     table-layout: auto !important;
 }
+#video_info .selected-media-prompt {
+    display: block;
+    max-height: 20lh;
+    overflow-y: auto;
+    overflow-wrap: anywhere;
+}
 .copy-swap {
 display: block;
 max-width: 100%;
@@ -565,14 +743,18 @@ overflow-wrap: anywhere;
 user-select: text;
 }
 .compact_text {padding: calc(1px * var(--wangp-ui-scale))}
-/* Keep the compact settings label beside the prompt without shrinking the drop target. */
+/* Compact file inputs (settings file, custom guide): the label stays beside the drop target instead of under its placeholder. */
 .wangp-settings-upload > button[aria-dropeffect] {
     padding-left: 50%;
 }
-.wangp-settings-upload > button[aria-dropeffect] > .wrap {
-    margin-inline: 0;
-    max-width: 100%;
-    white-space: nowrap;
+/* The native 240px placeholder leaks part of its upload icon from a 41px field. */
+.wangp-settings-upload > button[aria-dropeffect] > .wrap { display: none; }
+.wangp-settings-upload > button[aria-dropeffect]::after {
+    content: attr(aria-label);
+    padding-inline: 4px;
+    font-size: var(--text-md);
+    white-space: normal;
+    line-height: 1.3;
 }
 .wangp-settings-upload > label.float {
     display: block;
@@ -672,3 +854,78 @@ user-select: text;
 .toast-wrap .toast-text, .toast-wrap .toast-text *, .gradio-container [role="alert"] * { overflow-wrap: anywhere !important; word-break: break-word !important; }
 .toast-wrap .toast-text, .gradio-container [role="alert"] .toast-text { white-space: pre-wrap !important; }
 .toast-wrap .toast-close, .gradio-container [role="alert"] button { position: sticky !important; top: 0 !important; align-self: flex-start !important; flex: 0 0 auto !important; }
+.resolution-picker-row { gap: 2px !important; align-items: center !important; padding-left: 4px !important; background: var(--block-background-fill); border-radius: var(--block-radius); overflow: visible !important; }
+.resolution-picker-toggle { position: relative; flex: 0 0 24px !important; width: 24px !important; min-width: 24px !important; height: 28px !important; padding: 3px !important; font-size: 0 !important; background: transparent !important; border: 0 !important; outline: none !important; box-shadow: none !important; color: #175a79 !important; overflow: visible !important; }
+.resolution-picker-toggle::before { content: ""; display: block; width: 18px; height: 18px; background: currentColor; mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 7h16m-4-4 4 4-4 4M20 17H4m4-4-4 4 4 4'/%3E%3C/svg%3E") center / contain no-repeat; }
+.resolution-picker-toggle:hover, .resolution-picker-toggle:focus-visible { background: var(--background-fill-secondary) !important; }
+.resolution-picker-toggle::after { content: "Switch between Presets and Megapixels"; position: absolute; left: 0; top: calc(100% + 6px); z-index: 100; padding: 6px 9px; border-radius: 4px; background: var(--body-text-color); color: var(--background-fill-primary); font-size: var(--text-sm); font-weight: normal; white-space: nowrap; pointer-events: none; opacity: 0; visibility: hidden; }
+.resolution-picker-toggle:hover::after, .resolution-picker-toggle:focus-visible::after { opacity: 1; visibility: visible; transition: opacity 0.15s 2s, visibility 0s 2s; }
+
+.wangp-reset-settings { position: relative; flex: 0 0 36px !important; width: 36px !important; min-width: 36px !important; height: 36px !important; padding: 0 !important; font-size: 0 !important; column-gap: 0 !important; overflow: visible !important; }
+.wangp-reset-settings::before { width: 18px !important; height: 18px !important; flex-basis: 18px !important; }
+.wangp-reset-settings::after { content: "Reset Settings"; position: absolute; right: 0; bottom: calc(100% + 6px); z-index: 100; padding: 6px 9px; border-radius: 4px; background: var(--body-text-color); color: var(--background-fill-primary); font-size: var(--text-sm); font-weight: normal; white-space: nowrap; pointer-events: none; opacity: 0; visibility: hidden; }
+.wangp-reset-settings:hover::after, .wangp-reset-settings:focus-visible::after { opacity: 1; visibility: visible; transition: opacity 0.15s 2s, visibility 0s 2s; }
+
+.gr-group:has(> .styler > .wangp-input-mode-row), .styler:has(> .wangp-input-mode-row) { overflow: visible !important; }
+.wangp-input-mode-row > .form { flex-wrap: nowrap !important; align-items: center; gap: 10px !important; min-width: 0 !important; padding: 8px; background: var(--studio-surface, var(--block-background-fill)) !important; border-radius: 8px; overflow: visible !important; }
+.wangp-input-modes { position: relative; flex: 1 1 0 !important; min-width: 0 !important; padding: 0 !important; border: 0 !important; background: transparent !important; overflow: visible !important; }
+.wangp-input-modes > .wrap:has(input[type="radio"]) { display: flex; flex-wrap: nowrap !important; gap: 0 !important; width: max-content; min-width: 100%; border: 1px solid var(--border-color-primary); border-radius: 6px; }
+.wangp-input-modes label { position: relative; flex: 1 0 auto; justify-content: center; padding: 6px 10px !important; margin: 0 !important; border: 0 !important; border-radius: 0 !important; box-shadow: none !important; white-space: nowrap; }
+.wangp-input-modes label:first-child { border-radius: 5px 0 0 5px !important; }
+.wangp-input-modes label:last-child { border-radius: 0 5px 5px 0 !important; }
+.wangp-input-modes label:only-child { border-radius: 5px !important; }
+.wangp-input-modes label span { margin-left: 0 !important; }
+.wangp-mode-short, .is-short .wangp-mode-full { position: absolute; visibility: hidden; }
+.is-short .wangp-mode-short { position: static; visibility: inherit; }
+.wangp-input-modes input[type="radio"] { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.wangp-input-modes label:has(input:focus-visible) { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+.wangp-input-modes.is-compact > .wrap:has(input[type="radio"]) { position: absolute; visibility: hidden; opacity: 0; pointer-events: none; }
+.wangp-input-dropdown { position: relative; display: none; }
+.wangp-input-modes.is-compact .wangp-input-dropdown { display: block; }
+.wangp-input-trigger { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%; min-width: 0; height: 34px; padding: 5px 11px; border: 1px solid var(--studio-border, var(--input-border-color)); border-radius: 7px; background: var(--studio-surface, var(--block-background-fill)); color: var(--studio-label, var(--body-text-color)); font: inherit; font-weight: 600; cursor: pointer; }
+.wangp-input-trigger::before { content: ""; order: 1; width: 6px; height: 6px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(45deg) translateY(-2px); }
+.wangp-input-trigger:hover, .wangp-input-trigger[aria-expanded="true"] { background: var(--studio-soft, var(--background-fill-secondary)); border-color: var(--studio-accent, var(--color-accent)); }
+.wangp-input-trigger:focus-visible, .wangp-input-menu button:focus-visible { outline: 2px solid var(--studio-accent, var(--color-accent)); outline-offset: 2px; }
+.wangp-input-menu { position: absolute; z-index: 100; top: calc(100% + 6px); left: 0; width: 100%; padding: 5px; border: 1px solid var(--studio-border, var(--input-border-color)); border-radius: 9px; background: var(--studio-surface, var(--block-background-fill)); box-shadow: 0 6px 20px #163d6424; }
+.wangp-input-menu[hidden] { display: none; }
+.wangp-input-menu button { display: flex; align-items: center; justify-content: space-between; width: 100%; padding: 7px 10px; border: 0; border-radius: 5px; background: transparent; color: var(--body-text-color); font: inherit; text-align: left; cursor: pointer; }
+.wangp-input-menu button:hover, .wangp-input-menu button:focus { background: var(--studio-soft, var(--background-fill-secondary)); }
+.wangp-input-menu button[aria-selected="true"] { background: var(--studio-soft, var(--background-fill-secondary)); color: var(--studio-label, var(--body-text-color)); font-weight: 600; }
+.wangp-input-menu button[aria-selected="true"]::after { content: ""; width: 5px; height: 9px; border-right: 2px solid currentColor; border-bottom: 2px solid currentColor; transform: rotate(45deg); margin-right: 2px; }
+.wangp-input-menu button:disabled { opacity: .5; cursor: default; }
+.wangp-input-end { flex: 0 0 auto !important; width: max-content; min-width: 0 !important; margin-right: 4px !important; padding: 0 !important; border: 0 !important; background: transparent !important; overflow: visible !important; }
+.wangp-input-end label { position: relative; white-space: nowrap; margin: 0 !important; }
+[data-wangp-input-tooltip]::after, .wangp-input-end label::after { content: attr(data-wangp-input-tooltip); position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 100; width: max-content; padding: 6px 9px; border-radius: 4px; background: var(--body-text-color); color: var(--background-fill-primary); font-size: var(--text-sm); font-weight: normal; line-height: 1.3; pointer-events: none; opacity: 0; visibility: hidden; }
+.wangp-input-end label::after { content: "Use End Image(s)"; left: auto; right: 0; }
+[data-wangp-input-tooltip]:hover::after, [data-wangp-input-tooltip]:focus-visible::after, [data-wangp-input-tooltip]:has(input:focus-visible)::after, .wangp-input-end label:hover::after, .wangp-input-end label:has(input:focus-visible)::after { opacity: 1; visibility: visible; transition: opacity 0.15s 2s, visibility 0s 2s; }
+.wangp-input-trigger[aria-expanded="true"]::after { visibility: hidden; opacity: 0; transition: none; }
+
+.wangp-settings-tools { container-type: inline-size; }
+.wangp-settings-file-actions { align-items: center; flex-wrap: nowrap !important; gap: clamp(4px, .8cqw, 8px) !important; }
+.wangp-settings-file-actions > button:not(.wangp-reset-settings), .wangp-lora-download-row > button {
+    padding: var(--button-small-padding) !important;
+    min-height: 0 !important;
+    border-radius: var(--button-small-radius);
+    font-size: var(--button-small-text-size) !important;
+    font-weight: var(--button-small-text-weight);
+    column-gap: 6px;
+    white-space: nowrap;
+}
+.wangp-settings-file-actions > .wangp-reset-settings { flex: 0 0 auto !important; width: auto !important; min-width: 0 !important; height: auto !important; padding: var(--button-small-padding) !important; }
+.wangp-settings-file-actions > .wangp-reset-settings::before { width: 12px !important; height: 1lh !important; flex-basis: 12px !important; font-size: var(--button-small-text-size); }
+.wangp-settings-file-actions > .wangp-settings-include-media { flex: 0 0 auto !important; width: max-content !important; }
+.wangp-settings-include-media label { white-space: nowrap; }
+.wangp-settings-file-actions.is-compact > :is(.wangp-settings-default, .wangp-settings-export) { font-size: 0 !important; }
+.wangp-settings-file-actions.is-compact > .wangp-settings-default::after { content: "Set Default"; font-size: var(--button-small-text-size); }
+.wangp-settings-file-actions.is-compact > .wangp-settings-export::after { content: "Export"; font-size: var(--button-small-text-size); }
+.wangp-lora-download-row { flex-wrap: nowrap !important; align-items: center; gap: 8px !important; }
+.wangp-lora-download-row > .form { flex: 1 1 0 !important; min-width: 0 !important; }
+.wangp-lora-download-row .compact_text { padding: 0 !important; }
+.wangp-lora-download-row textarea { padding: var(--button-small-padding) !important; font-size: var(--button-small-text-size) !important; line-height: var(--line-md); }
+.wangp-lora-download-row > button { flex: 0 0 auto !important; font-size: 0 !important; }
+/* Keep this action's literal caption instead of Gradio's translated label. */
+.wangp-lora-download-row > button::after { content: "Download"; font-size: var(--button-small-text-size); }
+
+.wangp-prompt-enhancer-row, .wangp-prompt-enhancer-row > .form { flex-wrap: nowrap !important; }
+.wangp-prompt-enhancer-row > .form { flex: 1 1 0 !important; min-width: 0 !important; }
+.wangp-prompt-enhancer-row > .btn_centered, .wangp-prompt-enhancer-row > .form > :is(.cbx_centered, .cbx_bottom) { flex: 0 0 auto !important; min-width: 0 !important; }

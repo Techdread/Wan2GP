@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 import ast
 import json
 import os
@@ -18,10 +19,14 @@ try:
     from bitsandbytes.autograd._functions import matmul_4bit as _bnb_matmul_4bit
     from bitsandbytes.functional import dequantize_4bit as _bnb_dequantize_4bit
     from bitsandbytes.functional import QuantState as _BNBQuantState
+    from bitsandbytes import cextension as _bnb_cextension
 except Exception:  # pragma: no cover
     _bnb_matmul_4bit = None
     _bnb_dequantize_4bit = None
     _BNBQuantState = None
+    _bnb_cextension = None
+# bitsandbytes 4-bit CUDA ops need its native GPU library, which it replaces with an error-raising mock when it cannot load one
+_BNB_GPU_LIBRARY = _bnb_cextension is not None and isinstance(_bnb_cextension.lib, _bnb_cextension.CudaBNBNativeLibrary)
 
 
 HANDLER_NAME = "bnb_nf4"
@@ -48,7 +53,6 @@ _BNB_NF4_SPLIT_FIELDS = {
 _BNB_NF4_SHARE_FIELDS = ("weight.quant_map",)
 
 _BNB_NF4_KERNEL_LOGGED = False
-_BNB_NF4_KERNEL_FAILED_LOGGED = False
 _BNB_NF4_FALLBACK_LOGGED = False
 _BNB_NF4_DEQUANT_FALLBACK_LOGGED = False
 
@@ -76,13 +80,6 @@ def _note_kernel():
     if not _BNB_NF4_KERNEL_LOGGED:
         print("BNB NF4: using bitsandbytes 4-bit kernels.")
         _BNB_NF4_KERNEL_LOGGED = True
-
-
-def _note_kernel_failed(exc):
-    global _BNB_NF4_KERNEL_FAILED_LOGGED
-    if not _BNB_NF4_KERNEL_FAILED_LOGGED:
-        print(f"BNB NF4: bitsandbytes kernel unavailable ({type(exc).__name__}: {exc}); using fallback.")
-        _BNB_NF4_KERNEL_FAILED_LOGGED = True
 
 
 def _state_from_tensor(tensor):
@@ -285,7 +282,7 @@ def _dequantize_bnb_nf4_weight(weight_u8, absmax, quant_map, shape, blocksize, d
 def _bnb_nf4_linear(input, weight, bias=None):
     if torch.is_tensor(input) and _is_fake_tensor(input):
         return input.new_empty((*input.shape[:-1], weight.size(0)))
-    if torch.is_tensor(input) and _bnb_matmul_4bit is not None:
+    if torch.is_tensor(input) and _bnb_matmul_4bit is not None and (input.device.type != "cuda" or _BNB_GPU_LIBRARY):
         bias_arg = bias
         if bias_arg is not None and torch.is_tensor(bias_arg):
             if bias_arg.device != input.device or bias_arg.dtype != input.dtype:
@@ -293,11 +290,8 @@ def _bnb_nf4_linear(input, weight, bias=None):
         quant_state = weight.bnb_quant_state(input.device)
         packed_weight = weight._data if weight._data.device == input.device else weight._data.to(input.device)
         if input.device.type == "cuda" and input.numel() == input.shape[-1] and input.shape[-1] % weight._blocksize == 0:
-            try:
-                _note_kernel()
-                return _bnb_matmul_4bit(input, packed_weight.t(), quant_state=quant_state, bias=bias_arg)
-            except Exception as exc:
-                _note_kernel_failed(exc)
+            _note_kernel()
+            return _bnb_matmul_4bit(input, packed_weight.t(), quant_state=quant_state, bias=bias_arg)
         if _bnb_dequantize_4bit is not None:
             _note_bnb_dequant_fallback()
             qweight = _bnb_dequantize_4bit(packed_weight, quant_state).to(input.dtype)
@@ -315,11 +309,12 @@ def _bnb_nf4_linear(input, weight, bias=None):
 
 class BNBNF4WeightTensor(QTensor):
     @staticmethod
-    def create(weight_u8, absmax, quant_map, quant_state, size, stride, dtype, device=None, requires_grad=False):
-        state = _state_from_tensor(quant_state)
-        shape = _state_shape(state) or tuple(size)
-        blocksize = int(state.get("blocksize", 64) or 64)
-        qdtype = _dtype_from_state(state.get("dtype", dtype), dtype)
+    def create(weight_u8, absmax, quant_map, quant_state, size, stride, dtype, device=None, requires_grad=False, parsed=None):
+        # parsed: (shape, blocksize, quant dtype) of a weight copied or moved, whose quant state is not decoded again (a device sync on the GPU)
+        if parsed is None:
+            state = _state_from_tensor(quant_state)
+            parsed = (_state_shape(state) or tuple(size), int(state.get("blocksize", 64) or 64), _dtype_from_state(state.get("dtype", dtype), dtype))
+        shape, blocksize, qdtype = parsed
         if dtype is None:
             dtype = qdtype
         device = weight_u8.device if device is None else device
@@ -344,10 +339,11 @@ class BNBNF4WeightTensor(QTensor):
             blocksize=blocksize,
             dtype=dtype,
             requires_grad=requires_grad,
+            quant_dtype=qdtype,
         )
 
     @staticmethod
-    def __new__(cls, qtype, axis, size, stride, weight_u8, absmax, quant_map, quant_state, original_shape, blocksize, dtype, requires_grad=False):
+    def __new__(cls, qtype, axis, size, stride, weight_u8, absmax, quant_map, quant_state, original_shape, blocksize, dtype, requires_grad=False, quant_dtype=None):
         return torch.Tensor._make_wrapper_subclass(
             cls,
             size,
@@ -357,7 +353,7 @@ class BNBNF4WeightTensor(QTensor):
             requires_grad=requires_grad,
         )
 
-    def __init__(self, qtype, axis, size, stride, weight_u8, absmax, quant_map, quant_state, original_shape, blocksize, dtype, requires_grad=False):
+    def __init__(self, qtype, axis, size, stride, weight_u8, absmax, quant_map, quant_state, original_shape, blocksize, dtype, requires_grad=False, quant_dtype=None):
         super().__init__(qtype, axis)
         self._data = weight_u8
         self._absmax = absmax
@@ -365,6 +361,7 @@ class BNBNF4WeightTensor(QTensor):
         self._quant_state = quant_state
         self._original_shape = tuple(original_shape)
         self._blocksize = int(blocksize)
+        self._quant_dtype = dtype if quant_dtype is None else quant_dtype  # the dtype of bitsandbytes' quant state, decoded once
 
     def __repr__(self):
         return f"BNBNF4WeightTensor(shape={tuple(self.shape)}, dtype={self.dtype}, device={self.device})"
@@ -392,15 +389,13 @@ class BNBNF4WeightTensor(QTensor):
         device = torch.device(device)
         absmax = self._absmax if self._absmax.device == device else self._absmax.to(device)
         quant_map = self._quant_map if self._quant_map.device == device else self._quant_map.to(device)
-        state = _state_from_tensor(self._quant_state)
-        qdtype = _dtype_from_state(state.get("dtype", self.dtype), self.dtype)
         return _BNBQuantState(
             absmax=absmax,
             shape=torch.Size(self._original_shape),
             code=quant_map,
             blocksize=self._blocksize,
             quant_type="nf4",
-            dtype=qdtype,
+            dtype=self._quant_dtype,
         )
 
     def get_quantized_subtensors(self):
@@ -424,6 +419,7 @@ class BNBNF4WeightTensor(QTensor):
             state = _state_from_tensor(self._quant_state)
             self._original_shape = _state_shape(state) or self._original_shape
             self._blocksize = int(state.get("blocksize", self._blocksize) or self._blocksize)
+            self._quant_dtype = _dtype_from_state(state.get("dtype", self.dtype), self.dtype)
 
     def __tensor_flatten__(self):
         inner_tensors = ["_data", "_absmax", "_quant_map", "_quant_state"]
@@ -435,6 +431,7 @@ class BNBNF4WeightTensor(QTensor):
             "dtype": str(self.dtype),
             "original_shape": str(list(self._original_shape)),
             "blocksize": str(self._blocksize),
+            "quant_dtype": str(self._quant_dtype),
         }
         return inner_tensors, meta
 
@@ -448,6 +445,7 @@ class BNBNF4WeightTensor(QTensor):
         dtype = getattr(torch, dtype_name, torch.bfloat16)
         original_shape = ast.literal_eval(meta.get("original_shape", str(size)))
         blocksize = int(meta.get("blocksize", "64"))
+        quant_dtype = getattr(torch, meta.get("quant_dtype", str(dtype)).removeprefix("torch."), dtype)
         return BNBNF4WeightTensor(
             qtype=qtype,
             axis=axis,
@@ -460,6 +458,7 @@ class BNBNF4WeightTensor(QTensor):
             original_shape=original_shape,
             blocksize=blocksize,
             dtype=dtype,
+            quant_dtype=quant_dtype,
         )
 
     @classmethod
@@ -495,6 +494,7 @@ class BNBNF4WeightTensor(QTensor):
                 dtype=t.dtype,
                 device=t.device,
                 requires_grad=t.requires_grad,
+                parsed=(t._original_shape, t._blocksize, t._quant_dtype),
             )
         if op in (torch.ops.aten._to_copy, torch.ops.aten.to):
             t = args[0]
@@ -512,8 +512,36 @@ class BNBNF4WeightTensor(QTensor):
                 dtype=t.dtype,
                 device=device,
                 requires_grad=t.requires_grad,
+                parsed=(t._original_shape, t._blocksize, t._quant_dtype),
             )
         return _bnb_nf4_qfallback(op, *args, **(kwargs or {}))
+
+
+class _NF4RowProjection:
+    @staticmethod
+    def supports(module, x):
+        weight = getattr(module, "weight", None)
+        return isinstance(weight, BNBNF4WeightTensor) and weight.shape[1] % weight._blocksize == 0 and not _is_fake_tensor(x)
+
+    @staticmethod
+    def key(module):
+        return None
+
+    @staticmethod
+    def rows(module, x, start, stop):
+        source = module.weight
+        k, count = source.shape[1], stop - start
+        data = source._data.reshape(-1)[start * k // 2:stop * k // 2].view(-1, 1)
+        absmax = source._absmax.reshape(-1)[start * k // source._blocksize:stop * k // source._blocksize]
+        weight = BNBNF4WeightTensor.create(data, absmax, source._quant_map, source._quant_state, (count, k), (k, 1), source.dtype,
+                                           parsed=((count, k), source._blocksize, source._quant_dtype))
+        return _bnb_nf4_linear(x, weight, None if module.bias is None else module.bias[start:stop])
+
+
+from mmgp import offload
+
+_NF4_ROW_PROJECTION = _NF4RowProjection()
+offload.register_row_projection(_NF4_ROW_PROJECTION)
 
 
 class QLinearBNBNF4(QModuleMixin, torch.nn.Linear):

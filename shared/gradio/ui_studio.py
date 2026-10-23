@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """WanGP's shared visual styling, preserving component and event definitions."""
 import re
 from pathlib import Path
@@ -14,7 +15,7 @@ THEME_HUES = {'default': AZURE, 'emerald': 'emerald', 'amethyst': 'violet', 'ros
 def create_theme(name, **sizes):
     if name == 'gradio':
         return None
-    theme = gr.themes.Soft(font=['Verdana'], primary_hue=THEME_HUES[name], secondary_hue=AZURE if name == 'default' else 'indigo', neutral_hue='slate', **sizes)
+    theme = gr.themes.Soft(font=[gr.themes.Font('Verdana')], primary_hue=THEME_HUES[name], secondary_hue=AZURE if name == 'default' else 'indigo', neutral_hue='slate', **sizes)
     if name == 'default':
         theme.set(background_fill_primary='*neutral_50', slider_color_dark='*primary_400', checkbox_label_background_fill_selected='*primary_600')
     if name != 'default':
@@ -30,12 +31,12 @@ icons = {
     'Generate': '<path d="m8 4 12 8-12 8Z"/>',
     'Set Settings as Default': '<path d="m5 12 4 4L19 6"/>',
     'Export Settings to File': '<path d="M10 3H4v18h15v-7M14 3h7v7M11 13 21 3"/>',
-    'Reset Settings': '<path d="M3 4v6h6M3 10a9 9 0 1 1 1 9"/>',
+    'Reset Settings': '<path d="M4 8a9 9 0 1 1-1 7M4 3v5h5M9 11h7M9 16h7M11 9v4M14 14v4"/>',
     'Enhance Prompt': '<path d="m15 4 1.8 5.2L22 11l-5.2 1.8L15 18l-1.8-5.2L8 11l5.2-1.8ZM5 2v6M2 5h6M5 16v6M2 19h6"/>',
     'Go Ahead Save it !': '<path d="m5 12 4 4L19 6"/>',
     'Go Ahead Delete it !': '<path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7"/>',
     "Don't do it !": '<path d="m6 6 12 12M6 18 18 6"/>',
-    'Download Lora': '<path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/>',
+    'Download': '<path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/>',
     'Exit': '<path d="M9 4H4v16h5M8 12h13m-5-5 5 5-5 5"/>',
     'Abort': '<rect x="5" y="5" width="14" height="14" rx="2"/>',
     'One More': '<rect x="3" y="3" width="12" height="14" rx="2"/><path d="M7 21h10a2 2 0 0 0 2-2v-4M9 7v6M6 10h6"/>',
@@ -61,8 +62,8 @@ def style_config(config, theme):
     visit(config['layout'])
     scope = config['layout']['id']
     navigation = {next(node for node in reversed(paths[c['id']]) if components[node]['type'] == 'row') for c in components.values() if c['props'].get('elem_id') == 'family_list'}
-    kinds = {kind: 'field' for kind in ('textbox', 'dropdown', 'slider', 'number', 'checkbox', 'checkboxgroup', 'radio', 'hierarchyselector', 'rangeslider', 'file', 'image', 'video', 'audio')}
-    kinds.update(button='button', uploadbutton='button', downloadbutton='button', accordion='accordion', tabs='tabs', gallery='gallery')
+    kinds = {kind: 'field' for kind in ('textbox', 'dropdown', 'slider', 'number', 'checkbox', 'checkboxgroup', 'radio', 'hierarchyselector', 'rangeslider', 'file', 'image', 'audio')}
+    kinds.update(button='button', uploadbutton='button', downloadbutton='button', accordion='accordion', tabs='tabs', gallery='gallery', video='gallery')
     selectors = {'wangp-studio-scope': [f'#component-{scope}'], 'wangp-studio-dropdown': []}
     for component_id, component in components.items():
         if component_id not in paths or scope not in paths[component_id]:

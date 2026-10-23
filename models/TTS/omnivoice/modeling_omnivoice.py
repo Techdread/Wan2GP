@@ -14,6 +14,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified for WanGP.
 
 """Core OmniVoice model implementation.
 
@@ -38,6 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
+from mmgp import runtime
 
 from transformers import (
     PretrainedConfig,
@@ -557,7 +559,7 @@ class OmniVoice(PreTrainedModel):
         clip_size = int(ref_wav.shape[-1] % chunk_size)
         ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
         # numpy â†’ torch at tokenizer boundary
-        tokenizer_device = _module_execution_device(self.audio_tokenizer)
+        tokenizer_device = runtime.execution_device(self.audio_tokenizer)
         tokenizer_dtype = _module_floating_dtype(self.audio_tokenizer)
         ref_wav_tensor = torch.from_numpy(ref_wav).to(device=tokenizer_device, dtype=tokenizer_dtype)
         ref_audio_tokens = self.audio_tokenizer.encode(
@@ -590,7 +592,7 @@ class OmniVoice(PreTrainedModel):
         Returns:
             Decoded and post-processed audio array of shape (T,).
         """
-        tokenizer_device = _module_execution_device(self.audio_tokenizer)
+        tokenizer_device = runtime.execution_device(self.audio_tokenizer)
         if isinstance(tokens, list):
             chunk_audios = [
                 self.audio_tokenizer.decode(t.to(tokenizer_device).unsqueeze(0))
@@ -957,7 +959,7 @@ class OmniVoice(PreTrainedModel):
             denoise: Whether to include the <|denoise|> token.
         """
 
-        device = _module_execution_device(self)
+        device = runtime.execution_device(self)
 
         # Build style tokens: <|denoise|> + <|lang_start|>...<|lang_end|>
         #                      + <|instruct_start|>...<|instruct_end|>
@@ -1030,7 +1032,7 @@ class OmniVoice(PreTrainedModel):
         """
 
         B = task.batch_size
-        device = _module_execution_device(self)
+        device = runtime.execution_device(self)
 
         for i in range(B):
             logger.debug(
@@ -1074,6 +1076,7 @@ class OmniVoice(PreTrainedModel):
             t_end=1.0,
             num_step=gen_config.num_step,
             t_shift=gen_config.t_shift,
+            device=device,
         ).tolist()
         schedules = []
         for t_len in task.target_lens:
@@ -1171,19 +1174,6 @@ class OmniVoice(PreTrainedModel):
 # ---------------------------------------------------------------------------
 # Standalone helpers
 # ---------------------------------------------------------------------------
-
-
-def _module_execution_device(module: nn.Module) -> torch.device:
-    forced = getattr(module, "_force_device", None)
-    if forced is not None:
-        return torch.device(forced)
-    if torch.cuda.is_available():
-        mmgp_attrs = ("_mm_id", "_mm_model_id")
-        module_is_hooked = any(hasattr(module, attr) for attr in mmgp_attrs)
-        child_is_hooked = any(any(hasattr(child, attr) for attr in mmgp_attrs) for child in module.modules())
-        if module_is_hooked or child_is_hooked:
-            return torch.device("cuda")
-    return module.device
 
 
 def _module_floating_dtype(module: nn.Module) -> torch.dtype:
@@ -1370,7 +1360,7 @@ def _get_time_steps(
     t_shift: float = 1.0,
     device: torch.device = torch.device("cpu"),
 ) -> torch.Tensor:
-    timesteps = torch.linspace(t_start, t_end, num_step + 1).to(device)
+    timesteps = torch.linspace(t_start, t_end, num_step + 1, device=device)
     timesteps = t_shift * timesteps / (1 + (t_shift - 1) * timesteps)
     return timesteps
 
@@ -1418,7 +1408,7 @@ def _tokenize_with_nonverbal_tags(text: str, tokenizer) -> torch.Tensor:
         combined = []
         for p in parts:
             combined.extend(p)
-        result = torch.tensor([combined], dtype=torch.long)
+        result = torch.tensor([combined], dtype=torch.long, device="cpu")
     return result
 
 

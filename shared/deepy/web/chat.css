@@ -1,3 +1,4 @@
+/* Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt) */
 
 #assistant_chat_dock {
     --dock-gap: 14px;
@@ -145,6 +146,7 @@
 #assistant_chat_panel.has-fixed-composer-layout {
     display: flex !important;
     flex-direction: column !important;
+    gap: 0 !important;
     min-height: 0 !important;
     max-height: calc(100vh - 36px);
 }
@@ -965,6 +967,10 @@
     flex-direction: column;
     gap: 16px;
     padding: 22px 18px calc(var(--chat-status-offset) + var(--chat-status-reserved-height) + var(--chat-status-gap));
+}
+
+.chat__transcript:empty {
+    display: none;
 }
 
 #assistant_chat_html > .chat.is-replaying *,
@@ -2038,18 +2044,27 @@
     min-width: 0 !important;
 }
 
-#assistant_chat_settings_panel .chat__template-tool-row > .form,
-#assistant_chat_settings_panel .chat__template-tool-dropdown,
-#assistant_chat_settings_panel .chat__template-tool-dropdown .wrap {
+#assistant_chat_settings_panel .form,
+#assistant_chat_settings_panel .block:has(ul.options[role="listbox"]),
+#assistant_chat_settings_panel .wrap:has(> ul.options[role="listbox"]) {
     overflow: visible !important;
 }
 
-#assistant_chat_settings_panel .chat__template-tool-dropdown .wrap > ul.options[role="listbox"] {
+/* Gradio's viewport coordinates are invalid inside the transformed dock. */
+#assistant_chat_settings_panel .wrap > ul.options[role="listbox"] {
     position: absolute !important;
-    inset: calc(100% - 8px) auto auto 0 !important;
+    inset: var(--chat-options-top, 100%) auto var(--chat-options-bottom, auto) 0 !important;
     width: 100% !important;
-    max-height: min(280px, 40vh) !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    max-height: var(--chat-options-height, min(280px, 40vh)) !important;
+    box-sizing: border-box;
     z-index: 2147483647 !important;
+}
+
+#assistant_chat_settings_panel ul.options[role="listbox"] > li {
+    width: 100% !important;
+    box-sizing: border-box;
 }
 
 #assistant_chat_settings_panel .chat__template-tool-actions {
@@ -2519,24 +2534,23 @@
 
 @media (max-width: 900px) {
     #assistant_chat_dock {
+        --dock-launcher-width: 24px;
         top: auto;
         bottom: 18px;
-        width: 36px;
         transform: none;
     }
 
     #assistant_chat_toggle {
         min-height: 152px;
-        width: 36px;
-        min-width: 36px;
-        padding: 14px 5px;
-        border-radius: 0 18px 18px 0;
+        padding: 14px 2px;
+        border-radius: 0 12px 12px 0;
+        transform: translateX(-2px);
     }
 
     #assistant_chat_panel {
         top: auto;
         bottom: 0;
-        left: calc(36px + var(--dock-gap));
+        left: calc(var(--dock-launcher-width) + var(--dock-gap));
         width: min(360px, calc(100vw - 72px));
         padding: 12px;
         transform: translateX(-20px) scale(0.98);

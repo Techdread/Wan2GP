@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified for WanGP.
 
 """MiniMax H3 audio autoencoder.
 
@@ -54,6 +55,8 @@ from diffusers.utils.torch_utils import randn_tensor
 from shared.attention import pay_attention
 
 from ..interrupt import GenerationInterrupted
+
+from shared.kernels import vae_ops
 
 
 class MiniMaxH3AudioDiagonalGaussianDistribution:
@@ -221,11 +224,11 @@ class MiniMaxH3AudioActivation1d(nn.Module):
         self.act = activation
         self.upsample = MiniMaxH3AudioUpSample1d(ratio, kernel_size)
         self.downsample = MiniMaxH3AudioDownSample1d(ratio, kernel_size)
+        self.fusable = isinstance(activation, MiniMaxH3AudioSnakeBeta) and ratio == 2 and kernel_size == 12
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.upsample(hidden_states)
-        hidden_states = self.act(hidden_states)
-        return self.downsample(hidden_states)
+        x_list, hidden_states = [hidden_states], None
+        return vae_ops.snake_beta_aa(x_list, self.act, self.upsample, self.downsample, fusable=self.fusable)
 
 
 class MiniMaxH3AudioResidualUnit(nn.Module):

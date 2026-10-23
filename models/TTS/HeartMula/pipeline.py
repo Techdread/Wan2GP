@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from tokenizers import Tokenizer
 from tqdm import tqdm
+from mmgp import runtime
 from shared.utils import files_locator as fl
 
 from .heartcodec.configuration_heartcodec import HeartCodecConfig
@@ -102,7 +103,8 @@ class HeartMuLaPipeline:
         codec_guidance_scale: float = 1.25,
         codec_version: str = "",
         VAE_dtype = torch.float32,
-        lm_decoder_engine=None,
+        cuda_graphs=False,
+        flash_attention=False,
     ):
         self.device = device or torch.device("cpu")
         self.mula_device = self.device
@@ -118,7 +120,8 @@ class HeartMuLaPipeline:
         self.codec_version = codec_version
         self.heartmula_weights_path = heartmula_weights_path
         self.VAE_dtype = VAE_dtype
-        self.lm_decoder_engine = str(lm_decoder_engine or "legacy").strip().lower()
+        self.cuda_graphs = bool(cuda_graphs)
+        self.flash_attention = bool(flash_attention)
 
         self.ckpt_root = Path(ckpt_root) if ckpt_root is not None else Path(
             fl.get_download_location()
@@ -131,8 +134,7 @@ class HeartMuLaPipeline:
         self._muq_dim = 512
 
         self._load_models()
-        engine = "cg" if self.lm_decoder_engine == "cg" else "legacy"
-        print(f"[HeartMuLa] LM Engine='{engine}', flash2={'on' if getattr(self.mula.backbone.layers[0].attn, '_flash_attn', None) is not None else 'off'}")
+        print(f"[HeartMuLa] CUDA graphs: {'on' if self.cuda_graphs else 'off'}")
 
     def _load_models(self):
         (
@@ -168,7 +170,8 @@ class HeartMuLaPipeline:
         self.mula.decoder = [decoder]
 
         self.mula._interrupt_check = self._abort_requested
-        self.mula.set_lm_decoder_engine(self.lm_decoder_engine)
+        self.mula.set_cuda_graphs(self.cuda_graphs)
+        self.mula.set_flash_attention(self.flash_attention)
         self.model = self.mula
         self.mula.eval()
         first_param = next(self.mula.parameters(), None)
@@ -228,15 +231,6 @@ class HeartMuLaPipeline:
         first_param = next(self.mula.parameters(), None)
         return first_param.device if first_param is not None else self.device
 
-    def _ensure_mula_loaded(self) -> None:
-        if self.mula is None:
-            return
-        mm_manager = getattr(self.mula, "_mm_manager", None)
-        mm_id = getattr(self.mula, "_mm_id", None)
-        if mm_manager is None or mm_id is None:
-            return
-        mm_manager.ensure_model_loaded(mm_id)
-
     def _move_model_inputs(
         self, model_inputs: Dict[str, Any], device: torch.device
     ) -> Dict[str, Any]:
@@ -278,7 +272,7 @@ class HeartMuLaPipeline:
         if tags_ids[-1] != self.gen_config.text_eos_id:
             tags_ids = tags_ids + [self.gen_config.text_eos_id]
 
-        muq_embed = torch.zeros([self._muq_dim], dtype=self.mula_dtype)
+        muq_embed = torch.zeros([self._muq_dim], dtype=self.mula_dtype, device="cpu")
         muq_idx = len(tags_ids)
 
         lyrics = lyrics.lower()
@@ -290,15 +284,15 @@ class HeartMuLaPipeline:
 
         prompt_len = len(tags_ids) + 1 + len(lyrics_ids)
 
-        tokens = torch.zeros([prompt_len, self._parallel_number], dtype=torch.long)
-        tokens[: len(tags_ids), -1] = torch.tensor(tags_ids)
-        tokens[len(tags_ids) + 1 :, -1] = torch.tensor(lyrics_ids)
+        tokens = torch.zeros([prompt_len, self._parallel_number], dtype=torch.long, device="cpu")
+        tokens[: len(tags_ids), -1] = torch.tensor(tags_ids, device="cpu")
+        tokens[len(tags_ids) + 1 :, -1] = torch.tensor(lyrics_ids, device="cpu")
 
         tokens_mask = torch.zeros_like(tokens, dtype=torch.bool)
         tokens_mask[:, -1] = True
 
         bs_size = 2 if cfg_scale != 1.0 else 1
-        muq_idx_tensor = torch.full((bs_size,), muq_idx, dtype=torch.long)
+        muq_idx_tensor = torch.full((bs_size,), muq_idx, dtype=torch.long, device="cpu")
 
         def _cfg_cat(tensor: torch.Tensor, cfg_scale: float):
             tensor = tensor.unsqueeze(0)
@@ -311,7 +305,7 @@ class HeartMuLaPipeline:
             "tokens_mask": _cfg_cat(tokens_mask, cfg_scale),
             "muq_embed": _cfg_cat(muq_embed, cfg_scale),
             "muq_idx": muq_idx_tensor,
-            "pos": _cfg_cat(torch.arange(prompt_len, dtype=torch.long), cfg_scale),
+            "pos": _cfg_cat(torch.arange(prompt_len, dtype=torch.long, device="cpu"), cfg_scale),
         }
 
     def _forward(
@@ -531,7 +525,7 @@ class HeartMuLaPipeline:
         callback = kwargs.get("callback")
 
         model_inputs = self._build_model_inputs(lyrics, tags, cfg_scale=cfg_scale)
-        self._ensure_mula_loaded()
+        runtime.ensure_loaded(self.mula)
         target_device = self._get_mula_device()
         if target_device.type != "cuda" and torch.cuda.is_available():
             target_device = torch.device("cuda")

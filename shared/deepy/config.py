@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
 import json
@@ -69,17 +70,17 @@ _DEEPY_PRIME_GUIDANCE_OLD_DEFAULT = "When several models can satisfy the request
 DEEPY_COMPACTION_TYPE_DISCARD = "discard"
 DEEPY_COMPACTION_TYPE_SUMMARIZE = "summarize"
 DEEPY_COMPACTION_CHOICE_THINKING = "summarize_thinking"
-DEEPY_DEFAULT_GEN_IMAGE = "Krea 2 Turbo (8 Steps)"
-DEEPY_DEFAULT_EDIT_IMAGE = "Flux Klein 9B"
-DEEPY_DEFAULT_GEN_VIDEO = "LTX-2 2.5 Distilled"
-DEEPY_DEFAULT_GEN_VIDEO_WITH_SPEECH = "LTX-2.5 Distilled With Sound"
+DEEPY_DEFAULT_GEN_IMAGE = "Qwen Image 2.1 Turbo 8 Steps"
+DEEPY_DEFAULT_EDIT_IMAGE = "Qwen Image 2.1 Turbo 8 Steps"
+DEEPY_DEFAULT_GEN_VIDEO = "MiniMax H3 FL2VA Pruned PDD 8 Steps"
+DEEPY_DEFAULT_GEN_VIDEO_WITH_SPEECH = "MiniMax H3 FL2VA Pruned PDD 8 Steps With Sound"
 DEEPY_DEFAULT_GEN_SONG = "ACE-Step 1.5 Turbo LM 1.7B"
-DEEPY_DEFAULT_GEN_VIDEO_WITH_REFS = "MiniMax H3 Ref2VA Pruned Turbo Lightx2v 8 Steps"
+DEEPY_DEFAULT_GEN_VIDEO_WITH_REFS = "MiniMax H3 Ref2VA Pruned PDD 8 Steps"
 DEEPY_DEFAULT_GEN_SPEECH_FROM_DESCRIPTION = "Qwen3 1.7B"
 DEEPY_DEFAULT_GEN_SPEECH_FROM_SAMPLE = "Index TTS 2"
-DEEPY_CONTEXT_TOKENS_MIN = 8192
+DEEPY_CONTEXT_TOKENS_MIN = 20480  # Deepy Zero's system prompt and tools alone take about 12k tokens
 DEEPY_CONTEXT_TOKENS_MAX = 256000
-DEEPY_CONTEXT_TOKENS_DEFAULT = 16386
+DEEPY_CONTEXT_TOKENS_DEFAULT = 20480
 DEEPY_COMPACTION_SUMMARIZE_MIN_TOKENS = 32000
 DEEPY_COMPACTION_THINKING_MIN_TOKENS = 48000
 DEEPY_COMPACTION_TYPE_DEFAULT = DEEPY_COMPACTION_TYPE_DISCARD
@@ -304,7 +305,7 @@ def validate_deepy_version_config(deepy_type: Any, compaction_type: Any, context
         enhancer_no = 0
     if normalized_type == DEEPY_TYPE_PRIME:
         if enhancer_no not in (5, 6):
-            raise ValueError("Deepy Prime requires a Qwen3.8 VL model (9B or 27B).")
+            raise ValueError("Deepy Prime requires a Qwen3.8 VL model.")
         if normalized_compaction != DEEPY_COMPACTION_TYPE_SUMMARIZE:
             raise ValueError("Deepy Prime requires Summarize compaction.")
     validate_deepy_compaction_config(compaction_type, normalized_tokens, compaction_thinking=compaction_thinking)

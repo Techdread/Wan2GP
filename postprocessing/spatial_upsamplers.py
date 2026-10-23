@@ -1,3 +1,4 @@
+# Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """Spatial upsampler plugin API.
 
 Every spatial upsampler (built-in or extension) class is listed in
@@ -86,6 +87,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 import hashlib
 import importlib
+import inspect
 import sys
 from typing import Any
 
@@ -113,7 +115,8 @@ UPSAMPLER_CONFIG_KEY = "spatial_upsamplers"
 PERSISTENCE_CONFIG_KEY = "persistence"
 PERSIST_UNLOAD = 1
 PERSIST_RAM = 2
-PERSISTENCE_CHOICES = [("Unload after use", PERSIST_UNLOAD), ("Persistent in RAM", PERSIST_RAM)]
+PERSIST_AUTO = 3 # stays loaded with memory profile 0 (its RAM pinned only while it runs, shared with the other models) and the current model's VRAM Preload
+PERSISTENCE_CHOICES = [("Auto", PERSIST_AUTO), ("Unload after use", PERSIST_UNLOAD), ("Persistent in RAM", PERSIST_RAM)]
 _SHARED_PERSISTENCE_BINDING_KEY = "__shared_persistence__"
 MULTIPLIER_SEPARATOR = "*"
 
@@ -127,6 +130,7 @@ spatial_upsampler_handlers = [
     "postprocessing.chain_of_zoom.wgp_bridge.ChainOfZoomBridge",
     "postprocessing.ltx2_upsampler.wgp_bridge.LTXVideoUpsamplerBridge",
     "postprocessing.spatial_upsamplers.WanVaeUpsampler",
+    "models.minimax_h3.vae_upsampler.MiniMaxH3VaeUpsampler",
 ]
 _upsampler_handlers: list[Any] = []
 _registered_upsampler_handler_paths: set[str] = set()
@@ -201,7 +205,7 @@ def _config_key_from_handler_def(handler_def: dict[str, Any], fallback_name: str
 
 
 def default_config_sections(handler_modules: list[str] | None = None) -> dict[str, Any]:
-    sections = {PERSISTENCE_CONFIG_KEY: PERSIST_UNLOAD}
+    sections = {PERSISTENCE_CONFIG_KEY: PERSIST_AUTO}
     for path in spatial_upsampler_handlers if handler_modules is None else handler_modules:
         handler_cls = _load_upsampler_class(str(path or "").strip())
         if not hasattr(handler_cls, "default_config"):
@@ -454,14 +458,34 @@ def query_download_defs(enabled_only: bool = True) -> list[dict[str, Any]]:
 
 
 def download_for_value(spatial_upsampling, process_files, **kwargs):
-    handler = find_postprocessing_upsampler(spatial_upsampling)
+    handler = find_upsampler(spatial_upsampling)
     if handler is None or not hasattr(handler, "download"):
         return False
     kwargs.setdefault("status_text", f"Downloading {_handler_def(handler)['name']} Model Files")
     return handler.download(process_files, spatial_upsampling=spatial_upsampling, **kwargs)
 
 
+_progress_compat_warnings = set()
+
+
+def _unit_compatible_progress(progress_callback):
+    """Adapt plugin wrappers written for the older progress_callback(phase, current, total) by dropping the optional unit."""
+    try:
+        inspect.signature(progress_callback).bind(None, None, None, None)
+        return progress_callback
+    except TypeError:
+        pass
+    parts = (inspect.getsourcefile(progress_callback) or "unknown").replace("\\", "/").split("/")
+    owner = next((f"Plugin '{parts[i + 1]}'" for i, part in enumerate(parts[:-1]) if part.lower() == "plugins"), "/".join(parts))
+    if owner not in _progress_compat_warnings:
+        _progress_compat_warnings.add(owner)
+        print(f"[Upsamplers] Warning: {owner} wraps the post-processing progress callback without its optional 'unit' argument; progress units will not be shown. Please update it.")
+    return lambda phase, current=None, total=None, unit=None: progress_callback(phase, current, total)
+
+
 def upscale_postprocessing(handler, sample, spatial_upsampling, *, main_offloadobj=None, loaded_model_context=None, **kwargs):
+    if kwargs.get("progress_callback") is not None:
+        kwargs["progress_callback"] = _unit_compatible_progress(kwargs["progress_callback"])
     _activate_upsampler(handler)
     persistent = persistent_models()
     name = _handler_def(handler)["name"]
@@ -560,6 +584,17 @@ def post_model_process_vae_upsampling(sample, spatial_upsampling):
 def has_post_model_process_vae_upsampling(spatial_upsampling) -> bool:
     handler = find_vae_upsampler(spatial_upsampling)
     return handler is not None and hasattr(handler, "post_model_process_vae_upsampling")
+
+
+def resize_x2_vae_output(sample, scale):
+    """Brings the output of a VAE decoder that always upsamples x2 to the selected multiplier."""
+    if scale == 2.0:
+        return sample
+    from PIL import Image
+    from postprocessing.lanczos import resize_lanczos_spatial
+
+    height, width = sample.shape[-2:]
+    return resize_lanczos_spatial(sample, None, size=(round(height * scale / 2), round(width * scale / 2)), method=Image.Resampling.BICUBIC)
 
 
 def prepare_vae_upsampler(handler, spatial_upsampling, **kwargs):
@@ -968,18 +1003,23 @@ def normalize_persistence(value) -> int:
         value = int(value)
     except (TypeError, ValueError):
         value = PERSIST_UNLOAD
-    return value if value in (PERSIST_UNLOAD, PERSIST_RAM) else PERSIST_UNLOAD
+    return value if value in (PERSIST_UNLOAD, PERSIST_RAM, PERSIST_AUTO) else PERSIST_UNLOAD
 
 
 def persistence(server_config: dict[str, Any] | None = None) -> int:
     config = _upsampler_server_config if server_config is None else server_config
     if config is None:
         raise RuntimeError("Spatial upsamplers are not registered")
-    return normalize_persistence(_nested_configs(config).get(PERSISTENCE_CONFIG_KEY, PERSIST_UNLOAD))
+    return normalize_persistence(_nested_configs(config).get(PERSISTENCE_CONFIG_KEY, PERSIST_AUTO))
 
 
 def persistent_models(server_config: dict[str, Any] | None = None) -> bool:
-    return persistence(server_config) == PERSIST_RAM
+    return persistence(server_config) in (PERSIST_RAM, PERSIST_AUTO)
+
+
+def automatic_memory(server_config: dict[str, Any] | None = None) -> bool:
+    """Auto: the models stay loaded and use memory profile 0 with the current model's VRAM Preload mode."""
+    return persistence(server_config) == PERSIST_AUTO
 
 
 def write_persistence(server_config: dict[str, Any], value) -> int:
@@ -1184,7 +1224,7 @@ class WanVaeUpsampler(SimpleScaleSuffixMixin):
             "method_pos": {"vae": 30},
             "methods": [],
             "vae_methods": [("VAE Upscaling", "vae")],
-            "multipliers": {"vae": (1.0, 2.0)},
+            "multipliers": {"vae": (1.0, 1.5, 2.0)},
             "default_spatial_upsampling": "vae*2",
             "postprocessing_category": POSTPROCESSING_CATEGORY_UPSAMPLER,
             "description": "Runs through the compatible generation model's existing VAE path, so it adds no separate decoded-media pass and has little extra VRAM impact. It can create more detail than Lanczos.",
@@ -1192,7 +1232,7 @@ class WanVaeUpsampler(SimpleScaleSuffixMixin):
 
     def validate_upsampling(self, spatial_upsampling, image_mode: int) -> str:
         split = self.split_value(spatial_upsampling)
-        return "" if split is not None and split[1] in self.query_upsampler_def()["multipliers"]["vae"] else "VAE Spatial Upsampling only supports x1.0 and x2.0"
+        return "" if split is not None and split[1] in self.query_upsampler_def()["multipliers"]["vae"] else "VAE Spatial Upsampling only supports x1, x1.5 and x2"
 
     def supports_model_vae_method(self, method, model_type, model_def, image_mode: int) -> bool:
         return method == "vae" and image_mode in model_def.get("vae_upsampler", [])
@@ -1213,10 +1253,4 @@ class WanVaeUpsampler(SimpleScaleSuffixMixin):
         return {"VAE_upsampling": spatial_upsampling}
 
     def post_model_process_vae_upsampling(self, sample, spatial_upsampling):
-        split = self.split_value(spatial_upsampling)
-        if split is not None and split[1] == 1.0:
-            from PIL import Image
-            from postprocessing.lanczos import resize_lanczos_spatial
-
-            return resize_lanczos_spatial(sample, 0.5, method=Image.Resampling.BICUBIC)
-        return sample
+        return resize_x2_vae_output(sample, self.split_value(spatial_upsampling)[1])
