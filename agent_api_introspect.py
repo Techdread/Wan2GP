@@ -51,25 +51,40 @@ _SCHEMA_CACHE: list[dict[str, Any]] | None = None
 # ---------------------------------------------------------------------------
 
 def _extract_family_handlers_from_wgp() -> list[str]:
-    """AST-parse wgp.py for the ``family_handlers = [...]`` literal.
+    """Read static family registrations without executing the runtime.
 
     Avoids importing wgp. Stays in sync with new architectures automatically.
     Returns an empty list on parse failure (caller should treat as fatal).
     """
     src = (WANGP_ROOT / "wgp.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if isinstance(target, ast.Name) and target.id == "family_handlers":
-                if isinstance(node.value, ast.List):
-                    out = []
-                    for elt in node.value.elts:
-                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
-                            out.append(elt.value)
-                    return out
-    return []
+    return _extract_family_handlers_from_source(src)
+
+
+def _extract_family_handlers_from_source(src: str) -> list[str]:
+    """Include v18's top-level append/extend calls, not dynamic plugin code."""
+    handlers: list[str] = []
+    for node in ast.parse(src).body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "family_handlers"
+            for target in node.targets
+        ):
+            if isinstance(node.value, (ast.List, ast.Tuple)):
+                handlers = [elt.value for elt in node.value.elts
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, str)]
+        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+            call = node.value
+            method = call.func
+            if not (isinstance(method, ast.Attribute)
+                    and isinstance(method.value, ast.Name)
+                    and method.value.id == "family_handlers" and len(call.args) == 1):
+                continue
+            arg = call.args[0]
+            if method.attr == "append" and isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                handlers.append(arg.value)
+            elif method.attr == "extend" and isinstance(arg, (ast.List, ast.Tuple)):
+                handlers.extend(elt.value for elt in arg.elts
+                                if isinstance(elt, ast.Constant) and isinstance(elt.value, str))
+    return list(dict.fromkeys(handlers))
 
 
 def _install_wgp_stub() -> None:
@@ -101,20 +116,11 @@ def _load_handlers() -> tuple[dict[str, Any], list[dict[str, Any]]]:
         try:
             mod = importlib.import_module(path)
             handler = mod.family_handler
-            try:
+            # Static lists avoid runtime-only bookkeeping such as LTX's
+            # LoRA migration. Dynamic registrations still use the handler.
+            supported = _ast_extract_supported_types(path)
+            if not supported:
                 supported = handler.query_supported_types() or []
-            except Exception as exc:
-                # Some handlers (e.g. ltx2) do bookkeeping in this method.
-                # Fall back to AST-extracting the literal list from the
-                # handler source — pure introspection, no side effects.
-                supported = _ast_extract_supported_types(path) or []
-                if not supported:
-                    raise
-                errors.append({
-                    "handler": path,
-                    "error": f"query_supported_types raised: {exc}; using AST fallback",
-                    "level": "warn",
-                })
             for arch in supported:
                 arch_to_handler[arch] = handler
         except Exception as exc:  # noqa: BLE001
@@ -248,6 +254,8 @@ def _param_count_b(name: str, description: str = "") -> float | None:
 
 def _capability_from_def(model_def: dict[str, Any], arch: str) -> str:
     """Derive coarse capability from feature flags + arch heuristics."""
+    if model_def.get("mesh_outputs"):
+        return "3d-generation"
     if model_def.get("image_outputs"):
         return "image-generation"
     if model_def.get("audio_only"):

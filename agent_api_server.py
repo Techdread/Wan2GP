@@ -60,7 +60,7 @@ from typing import Any
 
 
 WANGP_ROOT = Path(__file__).resolve().parent
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.7.1"
 
 
 def _wangp_version() -> str | None:

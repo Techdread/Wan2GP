@@ -8,6 +8,12 @@ The server lives in `agent_api_server.py` (delegated to from
 `agent_api.py serve`). Hardening details — async jobs, auth, observability —
 are tracked in the companion file `Wan2GP-API-HARDENING.md`.
 
+API v0.7.1 is aligned with WanGP 18.21 and its bundled MMGP 4.2.0 runtime.
+Discovery includes upstream's appended family registrations, and labels mesh
+models as `3d-generation` instead of mixing them into image generation.
+Model catalog entries do not imply that weights have been downloaded. The
+separate Modly 3D service is not connected or changed by this upgrade.
+
 ---
 
 ## Endpoints
@@ -77,8 +83,8 @@ curl http://192.168.1.199:8100/api/health
 ```json
 {
   "status": "ok",
-  "version": "0.7.0",
-  "wangp_version": "13.141",
+  "version": "0.7.1",
+  "wangp_version": "18.21",
   "uptime_seconds": 1234,
   "queue": {"running": 0, "queued": 0},
   "current_job_id": null,
