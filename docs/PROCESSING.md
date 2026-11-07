@@ -37,6 +37,10 @@ Control Video processing tells the model what structure, motion, or area to foll
 
 If a Video Mask is provided, the selected process can apply only to the masked area or only to the non-masked area. This lets you keep a subject while changing the background, replace one person among several people, or combine different effects inside and outside the mask.
 
+A Control Video keeps its timing. At a rate within 0.1 frames per second of the model's, such as 23.976 for a 24 fps model, WanGP reads every frame without repeating or dropping any, and it records the result and places the sound on the video's real rate, so they stay together however long the video is.
+
+A part of a video named without encoding it (a view, or a path ending in `|start_frame=...,end_frame=...`) can be any length, even one the model cannot render. WanGP fills the render by playing the part's last frames backwards, then trims the output back, so you get exactly its frames. Asking for clearly more than the part holds still extends it by temporal outpainting.
+
 WanGP previews processed Control Video and Video Mask thumbnails before generation. Use `--save-masks` when you need to inspect the full generated control media.
 
 ### Masks
@@ -179,6 +183,32 @@ Common postprocessing jobs:
 SeedVC voice replacement, also used by Scenema Audio for reference voices, is distributed separately under the GPL-3.0 license. WanGP downloads it automatically from https://github.com/deepbeepmeep/WanGP-SeedVC the first time you use it, so that first use needs internet access.
 
 Late postprocessing is useful when you want to improve existing media without regenerating the original scene.
+
+### Face Refinement
+
+Face refiners find and follow up to five faces, restore each one and paste it back: the rest of the picture and the video's resolution do not change. Set *Faces to Refine* to `0` to let WanGP pick the relevant faces.
+
+- **H3 Face Refiner** restores faces with the H3 model, a text description and the soundtrack, which the model hears as it does when generating. Mouths stay closer to the source's, and it reuses H3 when H3 is already loaded.
+- **TaoMate-FVSR Face Refiner** restores speaking and singing faces from the soundtrack: lips and teeth come out sharp and follow the audio, with more skin and eye detail. It takes no prompt and pushes the mouth toward the audio much harder than H3 Face Refiner, so it is the one to try when a mouth looks wrong, and the mouth can differ more from the source.
+
+| | H3 Face Refiner | TaoMate-FVSR Face Refiner |
+|---|---|---|
+| **Choose it for** | Keeping the source's mouth movements; small or distant faces | Close-ups; a mouth that looks wrong |
+| **Detail** | Less skin, eye and teeth detail on close-ups | Sharpest lips and teeth, most skin and eye detail on close-ups |
+| **Mouth** | Stays close to the source; does little to correct a wrong mouth | Pushed toward the soundtrack: closed lips may open, and a face following the soundtrack mouths its words even if that person is only listening |
+| **Rest of the face** | Expressions and the upper face can change | On close-ups the upper face and identity stay close to the source; on small or distant faces, mouths open wider and the face is less faithful than with H3 |
+| **Control** | Accepts a prompt (Late Post Processing) | No prompt; you choose which faces follow the soundtrack |
+| **Speed and memory** | Faster with several faces, a little less VRAM; reuses H3 when it is already loaded | Faster on a single close-up; faces large in the frame take several times longer; SeedVR2 downloads with it |
+
+TaoMate-FVSR choices:
+
+- **Faces Following the Soundtrack:** a face following the soundtrack mouths its words even if that person is only listening. *Largest Face* (the default) suits one speaker with others around; use *All Faces* when everyone sings or speaks together, and *No Face* to restore detail from the picture alone. A video without audio is always restored from the picture alone.
+- **Face Refinement Strength** blends the result over the source. Below 1 the original mouth can show through the new one, so keep it at 1 unless you see a change you dislike.
+- **Optional Face Reference Images** (Late Post Processing) work as for H3 Face Refiner: each picture is matched to the person it shows, and gives the model the clean detail of that face. Without one, the images the video was generated from are used when its file holds them. A person left without a picture uses the best frame of their own track: the largest, sharpest and most frontal. If that frame is damaged too, some of the damage can remain: supply a clean picture of that person.
+- **Reference Restorer** (in *Configuration / Extensions*) restores that frame, or a small supplied picture, before the model uses it. SeedVR2 is the default and downloads with the refiner; with *None* faces stay softer.
+- **Working Size** (in *Configuration / Extensions*): *Auto* works at 512 and moves to 1024 for faces large in the frame. 1024 takes several times longer and more VRAM.
+
+Limitations: new facial detail is an estimate, not the person's true appearance, and the mouth may differ from the source because it follows the audio. Video frame rates near 25 fps match its training best, and clear speech gives the most reliable lips; music and very fast cuts are less predictable.
 
 ### Detail Refinement Up To 8K
 

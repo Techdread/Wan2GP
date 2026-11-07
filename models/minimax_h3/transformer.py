@@ -23,12 +23,14 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from shared import attention_kit
 from shared.attention import pay_attention
 
 from .interrupt import GenerationInterrupted
 from shared.kernels import ops as kernels
+from shared.utils.lora_mapping import convert_lora_keys
 from .pdd import MiniMaxH3ParallelHead
 from .sol_attention import MiniMaxH3SolAttention
 from mmgp import cuda_graphs
@@ -500,6 +502,24 @@ def _prepared_references(refs):
 
 class MiniMaxH3Model(nn.Module):
     def preprocess_loras(self, model_type, state_dict):
+        from .lora_tables import pop_source_tag
+
+        source_package = pop_source_tag(state_dict)
+        attention = self.blocks[0].attn
+        split_map = get_linear_split_map(self.attention_inner_size, attention.heads, attention.head_dim)
+        modules = dict(self.named_modules())
+        state_dict = convert_lora_keys(state_dict, modules,
+                                      fused_split_map=split_map, split_linear_modules_map=split_map)
+        state_dict = {key.removeprefix("diffusion_model."): value for key, value in state_dict.items()}
+        # ComfyUI bundles per-layer backend preferences as uint8 JSON tensors.
+        # Keep WanGP's attention selection and leave other unknown keys for MMGP to reject.
+        config_suffix = ".comfy_attention.config"
+        ignored_configs = [key for key in state_dict if key.endswith(config_suffix)
+                           and isinstance(modules.get(key[:-len(config_suffix)]), Attention)]
+        for key in ignored_configs:
+            state_dict.pop(key)
+        if ignored_configs:
+            tqdm.write(f"MiniMax H3 LoRA: ignored {len(ignored_configs)} ComfyUI attention configurations; using WanGP's selected attention backend.")
         diffusers_format = any(key.startswith(("transformer_blocks.", "token_refiner.refiner_blocks.",
                                                "time_embedder.linear_", "audio_proj_in.", "proj_in.",
                                                "context_embedder.", "norm_out.", "audio_proj_out.", "proj_out."))
@@ -543,7 +563,7 @@ class MiniMaxH3Model(nn.Module):
             for wrapper in ("", "diffusion_model.", "transformer."):
                 for head in ("final_layer.video_out.", "final_layer.audio_out."):
                     prefix = wrapper + head
-                    for key in [key for key in converted if key.startswith(prefix)]:
+                    for key in [key for key in converted if key.startswith(prefix) and not key.startswith(prefix + "linear.")]:
                         converted[prefix + "linear." + key[len(prefix):]] = converted.pop(key)
         from .lora_affine import convert_adaln_loras
 
@@ -552,17 +572,19 @@ class MiniMaxH3Model(nn.Module):
             for key in ignored:
                 converted.pop(key)
             if ignored:
-                print("MiniMax H3 LoRA: ignored unsupported pruned timestep tensors: " + ", ".join(ignored))
+                tqdm.write("MiniMax H3 LoRA: ignored unsupported pruned timestep tensors: " + ", ".join(ignored))
 
         start = time.perf_counter()
         count, architecture, source_width, target_width = convert_adaln_loras(
             model_type, converted, self.adaln_t_table if self.use_adaln_curves else None,
-            self.hybrid_ref2va_blocks, self.ref2va_adaln_t_table if self.hybrid_ref2va_blocks is not None else None)
+            self.hybrid_ref2va_blocks, self.ref2va_adaln_t_table if self.hybrid_ref2va_blocks is not None else None,
+            source_package=source_package, target_package=self.h3_lora_affine_package, checkpoint_checked=self.h3_lora_map_checked)
         if count:
-            source = f"full AdaLN width {source_width}" if source_width == 2688 else f"{architecture.upper()} pruned AdaLN width {source_width}"
-            target_architecture = "hybrid FL2VA/REF2VA" if self.hybrid_ref2va_blocks is not None else architecture.upper()
+            source_architecture = source_package.name if source_package is not None else architecture.upper()
+            source = f"full AdaLN width {source_width}" if source_width == 2688 else f"{source_architecture} pruned AdaLN width {source_width}"
+            target_architecture = "hybrid FL2VA/REF2VA" if self.hybrid_ref2va_blocks is not None else (self.h3_lora_affine_package.name if self.h3_lora_affine_package is not None else architecture.upper())
             target = f"full AdaLN width {target_width}" if target_width == 2688 else f"{target_architecture} pruned AdaLN width {target_width}"
-            print(f"MiniMax H3 LoRA: converted {count} AdaLN adapters from {source} to {target} in {time.perf_counter() - start:.2f}s")
+            tqdm.write(f"MiniMax H3 LoRA: converted {count} AdaLN adapters from {source} to {target} in {time.perf_counter() - start:.2f}s")
         if hasattr(self.blocks[0].attn, "q_proj"):
             return converted
         for down_suffix, up_suffix in (("lora_A.weight", "lora_B.weight"), ("lora_down.weight", "lora_up.weight"),
@@ -581,7 +603,11 @@ class MiniMaxH3Model(nn.Module):
                     alpha = converted.pop(prefix + projection + ".alpha", None)
                     scales.append(1.0 if alpha is None else float(alpha) / down[-1].shape[0])
                 converted[prefix + "qkv_proj." + down_suffix] = torch.cat(down)
-                converted[prefix + "qkv_proj." + up_suffix] = torch.block_diag(*(weight * scale for weight, scale in zip(up, scales)))
+                up = torch.block_diag(*(weight * scale for weight, scale in zip(up, scales)))
+                attention = self.get_submodule(prefix.rstrip("."))
+                if attention.qkv_interleaved:
+                    up = up.reshape(3, attention.heads, attention.head_dim, -1).permute(1, 0, 2, 3).reshape(3 * self.attention_inner_size, -1).contiguous()
+                converted[prefix + "qkv_proj." + up_suffix] = up
         return converted
 
     def __init__(self, hidden_size=5376, num_layers=50, token_refiner_num_layers=2,
@@ -603,6 +629,8 @@ class MiniMaxH3Model(nn.Module):
         self.latents_dim = latents_dim
         self.audio_latents_dim = audio_latents_dim
         self.use_adaln_curves = adaln_curve_grid is not None
+        self.h3_lora_affine_package = None
+        self.h3_lora_map_checked = False
         self.hybrid_ref2va_blocks = hybrid_ref2va_blocks
         self.pdd_num_steps = pdd_num_steps
         self.pdd_block_size = pdd_block_size
@@ -752,10 +780,8 @@ class MiniMaxH3Model(nn.Module):
         sigma_video = sigma_video.flatten()
         if sigma_video.numel() not in (1, latent_t):
             raise ValueError(f"MiniMax H3 received {sigma_video.numel()} video sigmas for {latent_t} latent frames")
-        if not self.control_layers and sigma_video.numel() > 1 and not bool((sigma_video == sigma_video[0]).all()):
-            raise ValueError("MiniMax H3 requires one uniform video sigma")
-        # A clean first-frame ControlNet anchor must not set the text/audio prefix's noise level.
-        base_video_sigma = sigma_video.max() if self.control_layers else sigma_video[0]
+        # A nearly clean anchor (known frames of a ControlNet or a Remake window) must not set the text/audio prefix's noise level.
+        base_video_sigma = sigma_video.max()
         audio_t = audio_x.shape[-1]
         text_tags = payload["text_token_tags"].view(-1).cpu()
         layout = self._layout(text_tags, latent_t, latent_h, latent_w, audio_t, payload)
@@ -784,7 +810,7 @@ class MiniMaxH3Model(nn.Module):
                 timestep, timestep_indices, video_row, _ = _grouped_video_timestep_rows(
                     timestep, timestep_indices, video_start, target_video_rows,
                     target_video_fixed_rows, target_video_mask_active)
-            if self.control_layers and target_video_order is None and sigma_video.numel() > 1:
+            if target_video_order is None and sigma_video.numel() > 1:
                 timestep, timestep_indices, video_row, _ = _frame_video_timestep_rows(timestep, timestep_indices, sigma_video, target_video_rows)
             temb = self._time_embedding(timestep)
             audio_row = int(timestep_indices[audio_start + min(layout.num_target_condition_audio_latents,
