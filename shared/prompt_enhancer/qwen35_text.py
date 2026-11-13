@@ -16,14 +16,14 @@ from mmgp import offload, runtime
 from tqdm.auto import tqdm
 
 from shared.llm_io import known_token_ids, llm_io_enabled, log_llm_io
-from shared.deepy.config import DEEPY_CONTEXT_TOKENS_KEY, DEEPY_REPETITION_PENALTY_DEFAULT, DEEPY_REPETITION_PENALTY_KEY, get_deepy_config_value, normalize_deepy_context_tokens, normalize_deepy_repetition_penalty
+from shared.deepy.config import DEEPY_CONTEXT_TOKENS_KEY, DEEPY_FAST_CONTEXT_READING_KEY, DEEPY_REPETITION_PENALTY_DEFAULT, DEEPY_REPETITION_PENALTY_KEY, get_deepy_config_value, normalize_deepy_context_tokens, normalize_deepy_repetition_penalty
 from shared.utils import files_locator as fl
 from shared.llm_engines.lmgp import SamplingParams
 from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM, clear_qwen35_runtime_caches
 from shared.llm_engines.lmgp.layers.attention import reset_attention_backend_logs
 from shared.llm_engines.lmgp.utils.context import reset_context
 from shared.llm_engines.lmgp.vllm_support import TextEngine, resolve_prompt_enhancer_lm_features
-from shared.qtypes.gguf import GGUFFirstRowsLinear, GGUFWeightTensor, materialize_module_source_tensors
+from shared.qtypes.gguf import GGUFCandidateRowsLinear, GGUFFirstRowsLinear, GGUFWeightTensor, draft_candidates_supported, materialize_module_source_tensors
 try:
     from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 except Exception:  # pragma: no cover
@@ -69,6 +69,7 @@ QWEN35_PROMPT_SUPPRESS_LOGITS_BIAS = -1e4
 QWEN35_PROMPT_ENABLE_THINKING = False
 QWEN35_PROMPT_THINKING_EXTRA_TOKENS = 3000
 QWEN35_PROMPT_THINKING_MAX_TOKENS = 2000
+QWEN35_PROMPT_THINKING_CEILING = 4000  # an enhancement thinks up to this when its prompt and answer leave the room under QWEN35_PROMPT_MIN_MODEL_LEN
 # Applied only to variants that ship a native MTP block.
 QWEN35_PROMPT_ENABLE_SPECULATIVE_DECODING = False
 QWEN35_PROMPT_SPECULATIVE_TOKENS = 2
@@ -202,7 +203,7 @@ def _map_qwen35_token_table(model) -> None:
     raw = lambda tensor: tensor._data if hasattr(tensor, "_data") else tensor
     if raw(model.output.weight).data_ptr() == raw(model.token_embd.weight).data_ptr():
         return
-    runtime.map_in_ram(model.token_embd, *([] if model.mtp is None else [model.mtp.embed_tokens]))
+    runtime.map_in_ram(model.token_embd, *([] if model.mtp is None or model._block_draft else [model.mtp.embed_tokens]))  # block drafters read the target's table
 
 
 def _load_text_config(config_path: str) -> Qwen3_5TextConfig:
@@ -386,6 +387,17 @@ def _resolve_prompt_runtime_extra_tokens(model, thinking_enabled: bool | None = 
         return max(0, int(extra_tokens))
     except Exception:
         return 0
+
+
+def _prompt_thinking_budget(model, prompt_len: int, max_new_tokens: int) -> tuple[int, int]:
+    """(thinking cap, generation budget) of one enhancement that thinks. The thinking takes the room its prompt and answer leave under the
+    cache's floor (QWEN35_PROMPT_MIN_MODEL_LEN), between the usual cap and QWEN35_PROMPT_THINKING_CEILING: a longer think costs no VRAM, and
+    a prompt gets the same cap whatever ran before (the engine's cache only grows). The answer keeps its margin beyond max_new_tokens, the
+    extra tokens beyond the usual cap."""
+    minimum = model._prompt_enhancer_thinking_max_tokens
+    margin = model._prompt_enhancer_thinking_extra_tokens - minimum
+    cap = min(QWEN35_PROMPT_THINKING_CEILING, max(minimum, QWEN35_PROMPT_MIN_MODEL_LEN - prompt_len - max_new_tokens - margin))
+    return cap, max_new_tokens + cap + margin
 
 
 def _print_thinking_process(message_index: int, total_messages: int, thinking_text: str) -> None:
@@ -853,12 +865,8 @@ def _generate_messages_vllm(
     outputs = []
     apply_repetition_penalty = normalize_deepy_repetition_penalty(get_deepy_config_value(DEEPY_REPETITION_PENALTY_KEY, DEEPY_REPETITION_PENALTY_DEFAULT))
     thinking_enabled = _prompt_enhancer_thinking_enabled(self, thinking_enabled=thinking_enabled)
-    runtime_extra_tokens = _resolve_prompt_runtime_extra_tokens(self, thinking_enabled=thinking_enabled)
     progress_desc = "Qwen3.5 prompt enhancement"
     for idx, message in enumerate(tqdm(messages, total=len(messages), desc=progress_desc, dynamic_ncols=True, leave=False)):
-        if enhancement_progress is not None:
-            enhancement_progress.prompt(idx, len(messages), int(max_new_tokens) + runtime_extra_tokens)
-            stream_callback = enhancement_progress.tokens
         prompt = _build_chat_prompt(tokenizer, message, enable_thinking=thinking_enabled)
         try:
             prompt_token_ids = [int(token_id) for token_id in tokenizer.encode(prompt)]
@@ -866,7 +874,10 @@ def _generate_messages_vllm(
         except Exception:
             prompt_token_ids = []
             prompt_len = 0
-        generation_max_tokens = int(max_new_tokens) + runtime_extra_tokens
+        thinking_tokens, generation_max_tokens = _prompt_thinking_budget(self, prompt_len, int(max_new_tokens)) if thinking_enabled else (0, int(max_new_tokens))
+        if enhancement_progress is not None:
+            enhancement_progress.prompt(idx, len(messages), generation_max_tokens)
+            stream_callback = enhancement_progress.tokens
         if beside and not engine._llm.can_aside(prompt_len + generation_max_tokens):
             engine.save_context()  # no room beside it: its owner saves it to RAM (restored at its next use), the prompts run as alone
             beside = False
@@ -885,7 +896,7 @@ def _generate_messages_vllm(
         )
         logits_bias = _build_suppressed_token_logits_bias(self, thinking_enabled=thinking_enabled)
         sample_seed = None if seed is None else int(seed) + idx
-        logits_processor, logits_processor_update_state = _build_prompt_logits_processor(self, thinking_enabled=thinking_enabled)
+        logits_processor, logits_processor_update_state = _build_prompt_logits_processor(self, thinking_enabled=thinking_enabled, max_thinking_tokens_override=thinking_tokens)
         sampling_params = SamplingParams(
             temperature=temp,
             max_tokens=generation_max_tokens,
@@ -908,7 +919,7 @@ def _generate_messages_vllm(
                 "messages": message,
                 "input_token_ids": prompt_token_ids,
                 "known_token_ids": known_token_ids(tokenizer),
-                "generation": {"max_new_tokens": generation_max_tokens, "temperature": temp, "top_p": normalized_top_p, "top_k": normalized_top_k, "seed": sample_seed, "thinking_enabled": thinking_enabled},
+                "generation": {"max_new_tokens": generation_max_tokens, "temperature": temp, "top_p": normalized_top_p, "top_k": normalized_top_k, "seed": sample_seed, "thinking_enabled": thinking_enabled, "max_thinking_tokens": thinking_tokens},
             }, prompt_number=idx + 1)
 
         try:
@@ -919,7 +930,7 @@ def _generate_messages_vllm(
                     sampling_params=sampling_params,
                     stop_token_ids=self._prompt_enhancer_stop_token_ids,
                     close_think_token_id=self._prompt_enhancer_close_think_token_id if thinking_enabled else None,
-                    max_thinking_tokens=self._prompt_enhancer_thinking_max_tokens,
+                    max_thinking_tokens=thinking_tokens,
                     stop_requested=stop_requested,
                     stream_callback=stream_callback,
                 )
@@ -930,14 +941,17 @@ def _generate_messages_vllm(
             thinking_open = thinking_enabled
             for marker in re.finditer(r"</?think>", raw_text, flags=re.IGNORECASE):
                 thinking_open = marker.group().lower() == "<think>"
-            if thinking_open:
-                raise RuntimeError("Prompt Enhancement Ended With Unfinished Thinking. Please Try Again.")
-            if response["stop_reason"] != "stop_token":
-                raise RuntimeError(f"Prompt Enhancement Did Not Finish ({response['stop_reason']}). Please Try Again.")
             thinking_text, answer_text = _split_generated_text(raw_text)
-            if not answer_text.strip():
-                raise RuntimeError("Prompt Enhancement Returned No Final Prompt. Please Try Again.")
-            engine._last_failure_reason = ""
+            # A generation that ends without a final prompt is no error: its caller keeps the original prompt of this slot and tells the user why
+            failure = (f"ran out of its {thinking_tokens} thinking tokens before writing a prompt" if thinking_open else
+                       f"stopped before finishing its prompt ({response['stop_reason']})" if response["stop_reason"] != "stop_token" else
+                       "returned no prompt" if not answer_text.strip() else "")
+            if failure:
+                tqdm.write(f"[Prompt Enhancer] The enhancer {failure}: the enhanced prompt {idx + 1} is not usable.")
+                if enhancement_progress is not None:
+                    enhancement_progress.failures.append(failure)
+                answer_text = ""
+            engine._last_failure_reason = failure
         except BaseException as exc:
             engine._last_failure_reason = str(exc)
             # Discard failed/cancelled runtime state before another enhancement (beside a live context, aside() already discarded the
@@ -1358,7 +1372,7 @@ def load_qwen35_text_prompt_enhancer(
     from .config import BLOCK_DRAFT_METHODS
     block_draft_method = speculative_decoding if speculative_decoding in BLOCK_DRAFT_METHODS else None
     if block_draft_method is not None and (variant != "27b" or not (features["triton"] and features["flash"])):
-        raise ValueError("DSpark and DFlash2 require Qwen3.8/Bonsai 27B, Triton and FlashAttention 2.")
+        raise ValueError("DSpark, DFlash2 and DSpine require Qwen3.8/Bonsai 27B, Triton and FlashAttention 2.")
     enable_mtp = bool(speculative_decoding and block_draft_method is None and spec.get("supports_mtp", False))
     mtp_filename = _qwen35_mtp_filename(spec, backend, model_path, prism_metadata) if enable_mtp else None
     mtp_modules = [_resolve_qwen35_checkpoint_file(assets_dir, mtp_filename, variant=variant)] if mtp_filename else None
@@ -1447,6 +1461,8 @@ def load_qwen35_text_prompt_enhancer(
         if prism_metadata:
             from shared.qtypes.prism import PrismFirstRowsLinear
             model.mtp.lm_head = PrismFirstRowsLinear(model.mtp.lm_head, mtp_draft_vocab_size)
+        elif draft_candidates_supported(model.mtp.lm_head, mtp_draft_vocab_size):
+            model.mtp.lm_head = GGUFCandidateRowsLinear(model.mtp.lm_head, mtp_draft_vocab_size)
         else:
             model.mtp.lm_head = GGUFFirstRowsLinear(model.mtp.lm_head, mtp_draft_vocab_size)
         model.mtp.draft_vocab_size = mtp_draft_vocab_size
@@ -1493,6 +1509,9 @@ def load_qwen35_text_prompt_enhancer(
     model._prompt_enhancer_speculative_sampling_tokens = spec.get("mtp_speculative_sampling_tokens", QWEN35_PROMPT_SPECULATIVE_SAMPLING_TOKENS)
     model._prompt_enhancer_speculative_confidence = spec.get("mtp_speculative_confidence", 0.30)
     model._prompt_enhancer_speculative_sampling_confidence = spec.get("mtp_speculative_sampling_confidence", 0.0)
+    model._prompt_enhancer_speculative_long_tokens = 0  # Auto sets it (shared.prompt_enhancer.config.mtp_auto_long_drafts)
+    model._prompt_enhancer_long_chain_key = ""  # of this machine's verdict on the long chain (lmgp chain_verdicts), set with it
+    model._prompt_enhancer_dense_prefill = bool(get_deepy_config_value(DEEPY_FAST_CONTEXT_READING_KEY, False))  # the attention layers' opt-in dense prefill
     if block_draft_method is not None:
         from .block_draft import install_block_draft
         install_block_draft(model, block_draft_method, bonsai=bool(prism_metadata))

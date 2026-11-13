@@ -35,6 +35,7 @@ DEEPY_TOOL_EDIT_VIDEO_KEY = "deepy_tool_edit_video"
 DEEPY_CONTEXT_TOKENS_KEY = "deepy_context_tokens"
 DEEPY_KV_CACHE_QUANTIZATION_KEY = "deepy_kv_cache_quantization"
 DEEPY_KEPT_KV_CACHES_KEY = "deepy_kept_kv_caches"
+DEEPY_FAST_CONTEXT_READING_KEY = "deepy_fast_context_reading"  # local Qwen with a quantized KV cache: contexts are read through dense FP16 keys and values (faster, more VRAM while reading)
 DEEPY_ROUTE_TAIL_SKIP_KEY = "deepy_route_tail_skip"  # Qwen3.8 Flash-Next: low-ranked experts missing from VRAM are left out of decoding (faster, slightly less precise)
 DEEPY_COMPACTION_TYPE_KEY = "deepy_compaction_type"
 DEEPY_COMPACTION_THINKING_KEY = "deepy_compaction_thinking"
@@ -61,11 +62,11 @@ DEEPY_TEMPLATE_CONFIG_MIGRATIONS = {
         "Qwen Image 2.1 Viggle Turbo 8 Steps": "Qwen Image 2.1 Viggle Turbo v0.2.1 6 Steps",
     },
     DEEPY_TOOL_GEN_VIDEO_KEY: {
-        "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps": "MiniMax H3 FL2VA Pruned Turbo Lightx2v 8 Steps",
+        "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps": "MiniMax H3 FL2VA Pruned Lightx2v 8 Steps",
         "Pika H3 Flex FL2VA 6 Steps": "Pika H3 Flex FL2VA Pruned 6 Steps",  # Pika templates moved to the pruned models (2026-10-31)
     },
     DEEPY_TOOL_GEN_VIDEO_WITH_SPEECH_KEY: {
-        "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps With Sound": "MiniMax H3 FL2VA Pruned Turbo Lightx2v 8 Steps With Sound",
+        "MiniMax H3 FL2VA Turbo Lightx2v 8 Steps With Sound": "MiniMax H3 FL2VA Pruned Lightx2v 8 Steps With Sound",
         "Pika H3 Flex Ref2VA 6 Steps With Audio References": "Pika H3 Flex Ref2VA Pruned 6 Steps With Audio References",
     },
     DEEPY_TOOL_GEN_VIDEO_WITH_REFS_KEY: {
@@ -352,6 +353,22 @@ def get_gguf_kernels_version() -> str:
         return version("llamacpp-gguf-cuda")
     except PackageNotFoundError:
         return ""
+
+
+GGUF_KERNELS_VERSION = "1.0.30"  # the GGUF kernels of this WanGP release (docs/INSTALLATION.md), never looked up online
+GGUF_KERNELS_RELEASE_URL = f"https://github.com/deepbeepmeep/kernels/releases/tag/gguf-v{GGUF_KERNELS_VERSION}"
+
+
+def gguf_kernels_warning() -> str:
+    """The Qwen models of Deepy and the prompt enhancer run their fast paths on this release's GGUF kernels: what to tell when they are missing or older."""
+    installed = get_gguf_kernels_version()
+    try:
+        if installed and Version(installed) >= Version(GGUF_KERNELS_VERSION):
+            return ""
+    except InvalidVersion:
+        pass
+    state = f"GGUF kernels {installed.split('+')[0]} are outdated" if installed else "GGUF kernels are missing"
+    return f"{state}: Deepy and the Prompt Enhancer will not reach their optimal performance. Install GGUF kernels {GGUF_KERNELS_VERSION} from {GGUF_KERNELS_RELEASE_URL}"
 
 
 @lru_cache(maxsize=1)
@@ -734,6 +751,7 @@ def get_deepy_default_runtime_config() -> dict[str, Any]:
         DEEPY_REPETITION_PENALTY_KEY: DEEPY_REPETITION_PENALTY_DEFAULT,
         DEEPY_KEPT_KV_CACHES_KEY: DEEPY_KEPT_KV_CACHES_DEFAULT,
         DEEPY_ROUTE_TAIL_SKIP_KEY: False,
+        DEEPY_FAST_CONTEXT_READING_KEY: False,
         DEEPY_ZERO_CUSTOM_SYSTEM_PROMPT_KEY: "",
         DEEPY_PRIME_CUSTOM_SYSTEM_PROMPT_KEY: DEEPY_PRIME_GUIDANCE_DEFAULT,
         DEEPY_MODEL_SPEED_KEY: "fast",

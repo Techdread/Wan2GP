@@ -35,6 +35,12 @@ GUIDE = """Read wangp://skills/showrunner/directing before directing a productio
 - A shot's settings hold only what the shot changes (prompt, media): its template brings the model, LoRAs and steps, the brief the resolution, its duration_s the length. `plan` validates them and returns what they will render at.
 - Paths are given as you can use them in settings."""
 FULL_DOCUMENT_CHARACTERS = 28000  # what Deepy can read of one call
+SHOT_ROLES = ("cast_shots", "shots_without_cast", "cast_shots_lip_synced", "lip_synced_without_cast", "people_edits", "scene_edits", "pages", "pages_with_cast")  # template_advice's templates for shots
+# How plan and add_shots name what render sends with each shot, beside the prompt format of its model.
+PICTURE_ORDER = ("Write each shot's prompt in the format its template's model has in prompt_guides. reference_pictures: the cast members whose "
+                 "picture render gives each shot, in this order, as reference images (a model that numbers images counts a start or end image "
+                 "first): bind each to its picture in the prompt. A song slice or recorded line render keeps as the shot's soundtrack is no audio "
+                 "reference: ask for the singer's or speaker's lips moving in sync instead.")
 
 
 def mistyped_words(doc: dict[str, Any], texts: list[str]) -> list[str]:
@@ -105,6 +111,8 @@ class ShowrunnerToolbox:
         plugin.register_deepy_action(self.verdict, uses_gpu=False, summary="Record your inspection of a take: ok or not, a short note and the measured values.")
         plugin.register_deepy_action(self.edit, paths={"song": "read"}, uses_gpu=False,
                                      summary="Set the edit's sound and subtitles: soundtrack mode, the production's song, narration or score tracks, SRT files.")
+        plugin.register_deepy_action(self.change_singer_voice, paths={"voices": "read"},
+                                     summary="Only when the user asks: the production's song sung in a cast member's voice or a voice sample (two for a duet), its music kept (SeedVC).")
         plugin.register_deepy_action(self.check_song, summary="Listen to the production's song: which lines of the lyrics it really sings, and when (the subtitles follow it).")
         plugin.register_deepy_action(self.deep_review, summary="Measure the last version against its script: words, subtitles, voices, lips, sound and picture, with the findings recorded on the version.")
         plugin.register_deepy_action(self.assemble, uses_gpu=False, summary="Render the edit (chosen takes in order, trims, transitions, soundtrack) as the production's deliverable.")
@@ -254,8 +262,8 @@ class ShowrunnerToolbox:
         song = target.snapshot()["brief"].get("song")
         if song and shot.get("audio_slice") and not settings.get("audio_guide") and entry is not None and (entry["audio"] or entry["soundtrack"]):  # a slice is of the song: render cuts it
             settings["audio_guide"] = ctx.virtualize(str(target.resolve(song)))
-        if entry is not None and entry["soundtrack"] and not entry["audio"] and settings.get("audio_guide") and not settings.get("audio_prompt_type"):
-            settings["audio_prompt_type"] = "AS"  # the driving audio as a kept soundtrack the picture follows, not a voice reference
+        if letters := templates.soundtrack_letters(shot, entry, settings):
+            settings["audio_prompt_type"] = letters  # the driving audio as a kept soundtrack the picture follows, not a voice reference
         if entry is not None and entry.get("video_edit") and settings.get("video_mask"):
             settings["video_prompt_type"] = settings.get("video_prompt_type", "IVU").replace("U", "A")  # WanGP ignores a mask beside U
         return settings
@@ -295,6 +303,7 @@ class ShowrunnerToolbox:
             errors = [item for item in validation.get("diagnostics", []) if item.get("severity") == "error"]
             errors += [{"message": validation.get("error")}] if validation.get("status") == "error" else []
             for task in validation.get("tasks", []):
+                task = {**validation.get("every_task", {}), **task}  # a batch states once what every shot shares
                 size = (task.get("resolution_assessment") or {}).get("aligned")
                 seconds = (task.get("window_plan") or {}).get("total_seconds") or (task.get("requested_video") or {}).get("duration_seconds")
                 if size:
@@ -340,7 +349,9 @@ class ShowrunnerToolbox:
             result["cast"] = [{**member, "images": full["images"], "voice": full["voice"], **({"voice_description": full["voice_description"]} if full["voice_description"] else {})}
                               for member, full in zip(result["cast"], doc["cast"])]
             catalog = self._catalog(doc)
-            result["template_advice"] = templates.advice(doc, catalog, self.showrunner.host.settings()["any_shot_length"])
+            result["template_advice"] = templates.advice(doc, catalog, self.showrunner.host.settings()["any_shot_length"], self.showrunner.host.prompt_rules())
+            if not doc["shots"] and (guides := self._guides(catalog, [result["template_advice"][key] for key in SHOT_ROLES if key in result["template_advice"]])):
+                result["template_advice"]["prompt_guides"] = guides  # read before the first prompt is written; plan and add_shots repeat them
             warnings = templates.lint(doc, catalog) + templates.places_missing(doc, catalog) + model.cut_lines(doc) + model.singing_without_song(doc) + model.song_drift(doc) + model.song_words(doc) + self._length_warning(doc)
             if warnings:
                 result["warnings"] = warnings
@@ -348,8 +359,12 @@ class ShowrunnerToolbox:
                 analysis = doc["audio"]["analysis"]
                 result["song_analysis"] = {key: analysis.get(key) for key in ("duration_s", "bpm", "sections")} | {"bars": analysis.get("bars", [])[:200]}
             return result
-        if section == "shot":
-            return {"revision": doc["revision"], "shot": model.find(doc["shots"], shot, "shot")}
+        if section == "shot":  # read before a reshoot or a new prompt: the user's rules for its template go with it
+            result = {"revision": doc["revision"], "shot": model.find(doc["shots"], shot, "shot")}
+            rules = self.showrunner.host.prompt_rules()
+            if rules and (entry := templates.shot_entry(doc, result["shot"], self._catalog(doc))) and (text := rules.get(name := templates.entry_name(entry))):
+                result.update(user_prompt_rules={name: text}, user_prompt_rules_note=templates.PROMPT_RULES_NOTE)
+            return result
         if section == "timeline":  # before assembling: what assemble would warn about, while it costs no version
             warnings = self._music_warnings(target, target.snapshot(), model.cut_length(doc)) + model.cut_lines(doc) + model.singing_without_song(doc) + model.song_drift(doc) + model.song_words(doc) + model.missing_ends(doc) + self._length_warning(doc)
             return {"revision": doc["revision"], "total_s": model.cut_length(doc), "timeline": model.timeline(doc), **({"warnings": warnings} if warnings else {})}
@@ -467,14 +482,37 @@ class ShowrunnerToolbox:
                 response["warnings"] = response.get("warnings", []) + problems
             if renders:
                 response["renders"] = renders
-        target.apply([{"op": "stage", "stage": "review" if target.doc["stage"] in ("brief", "planning") else target.doc["stage"]}], by="system", record=False)
+        response.update(self._prompt_guides(target, added if shots is not None else [] if cast or style or outline else [shot["id"] for shot in target.snapshot()["shots"]]))
+        if target.doc["stage"] in ("brief", "planning"):  # a plan() that only reads leaves the revision as it was
+            target.apply([{"op": "stage", "stage": "review"}], by="system", record=False)
+            response["revision"] = target.doc["revision"]
         return response
+
+    def _prompt_guides(self, target, shot_ids: list[str]) -> dict[str, Any]:
+        """The prompt format of each model these shots use, and who the reference pictures render gives each shot are: a plain description leaves
+        out what such models are trained on (which reference to keep, the lip sync they are asked for)."""
+        doc = target.snapshot()
+        catalog = self._catalog(doc)
+        names, pictures = [], {}
+        for shot in doc["shots"]:
+            if shot["id"] not in shot_ids or (entry := templates.shot_entry(doc, shot, catalog)) is None:
+                continue
+            names.append(templates.entry_name(entry))
+            if entry["refs"] and entry["task"] not in templates.EDIT_TASKS and not shot["generation"].get("settings", {}).get("image_refs") and (shown := self._pictured_cast(doc, shot)):
+                pictures[shot["id"]] = [member["name"] for member, _ in shown]  # as _generation sends them
+        guides = self._guides(catalog, names)
+        return {"prompt_guides": guides, **({"reference_pictures": pictures, "reference_pictures_note": PICTURE_ORDER} if pictures else {})} if guides else {}
+
+    def _guides(self, catalog: list[dict[str, Any]], names: list[str]) -> dict[str, str]:
+        """{template: its model's prompt format} for these templates, those whose model has one."""
+        entries = {name: entry for name in dict.fromkeys(names) if (entry := templates.resolve(catalog, name)) is not None and entry["model_type"]}
+        return {name: guide for name, entry in entries.items() if (guide := self.showrunner.host.prompt_guide(entry["model_type"]))}
 
     def update_shot(self, ctx, production: str, shot: str, fields: dict[str, Any], revision: int | None = None) -> dict[str, Any]:
         """fields: any of title, section, intent, camera, cast, dialogue, duration_s, audio_slice, generation (settings are merged; null removes one), status, included, chosen_take,
         trim [start_s, end_s], speed (0.25 to 4, how fast the take plays in the edit; trim stays in seconds of the take), sound (false: the take plays silent),
-        transition {type: cut|crossfade|fade_black|fade_white, duration_s}, notes. revision: the one you read, which guards
-        against the user's edits since your read (your own writes never conflict). Changed settings or cast are validated again."""
+        transition {type: cut|crossfade|fade_black|fade_white, duration_s}, notes. revision: the one you last read, which guards
+        against the user's edits since then, never against your own or the system's writes: one revision serves a batch of calls. Changed settings or cast are validated again."""
         target = self._production(ctx, production)
         self._only_the_fix(ctx, target, [shot])
         if isinstance(fields.get("generation"), dict) and isinstance(fields["generation"].get("settings"), dict):
@@ -494,7 +532,7 @@ class ShowrunnerToolbox:
             target.apply([{"op": "director", "fields": {"shots": [*fixing, *result[0]["shots"]]}}], by="system", record=False)
         problems, renders = self._validate(ctx, target, result[0]["shots"])
         warnings = self._warnings(target, result[0]["shots"]) + problems + ([] if target.snapshot()["deliverables"] else self._script_warnings(ctx, target))  # a shot added to a finished film is about that shot
-        return {"revision": target.doc["revision"], **result[0], **({"warnings": warnings} if warnings else {}), **({"renders": renders} if renders else {})}
+        return {"revision": target.doc["revision"], **result[0], **({"warnings": warnings} if warnings else {}), **({"renders": renders} if renders else {}), **self._prompt_guides(target, result[0]["shots"])}
 
     def remove_shot(self, ctx, production: str, shot: str, revision: int | None = None) -> dict[str, Any]:
         target = self._production(ctx, production)
@@ -903,14 +941,15 @@ class ShowrunnerToolbox:
 
     @staticmethod
     def _resolve_settings(ctx, target, settings: dict[str, Any]) -> dict[str, Any]:
-        """Media paths in settings become the caller's names for them (tools refuse absolute paths without Read Everywhere)."""
+        """Media paths in settings become the caller's names for them (tools refuse absolute paths without Read Everywhere). Only the media
+        settings: a prompt is text, and a long one is no valid file name (Errno 36)."""
         def resolve(value):
             if isinstance(value, str) and value and ":" not in value[:12].replace(":\\", "").replace(":/", "") and target.resolve(value).is_file():
                 return ctx.virtualize(str(target.resolve(value)))
             if isinstance(value, list):
                 return [resolve(item) for item in value]
             return value
-        return {key: resolve(value) for key, value in settings.items()}
+        return {key: resolve(value) if key in MEDIA_SETTINGS else value for key, value in settings.items()}
 
     @staticmethod
     def _real_paths(ctx, settings: dict[str, Any]) -> dict[str, Any]:
@@ -1045,7 +1084,9 @@ class ShowrunnerToolbox:
         doc = self._usable(ctx, target, target.snapshot())
         typed = [str(text) for item in overlays or [] for text in (item.get("text"), item.get("subtitle")) if text]
         misspelled = mistyped_words(doc, typed)
-        return {**({"check_spelling": misspelled} if misspelled else {}), **voices, "revision": doc["revision"], "edit": doc["edit"], "song": doc["brief"]["song"]}
+        sung = {"next": f"The brief asks the song sung by {model.song_singers(doc)}: call change_singer_voice(cast_ids={doc['brief']['song_voices']}) now, then check_song."
+                } if song and doc["brief"]["song_voices"] else {}
+        return {**({"check_spelling": misspelled} if misspelled else {}), **voices, **sung, "revision": doc["revision"], "edit": doc["edit"], "song": doc["brief"]["song"]}
 
     @staticmethod
     def _track(ctx, target, track: dict[str, Any]) -> dict[str, Any]:
@@ -1068,6 +1109,25 @@ class ShowrunnerToolbox:
             start = next((item["start_s"] for item in model.timeline(doc) if item["shot"] == shot["id"]), 0.0)
         return {"path": line["audio"], "start_s": float(start), "gain_db": gain, **cut}
 
+    def change_singer_voice(self, ctx, production: str, cast_ids: list[str] | None = None, voices: list[str] | None = None) -> dict[str, Any]:
+        """Only when the user asks: the song sung in other voices by WanGP's SeedVC, its music, words and timing as they are, so takes already shot
+        keep their lip sync. Who sings, in the order their voices are first heard in the song, one or two for a duet (SeedVC tells two voices
+        apart, not more): cast_ids (their voice sample, made from their voice description when they have none) or voices, voice samples (media id
+        or path). Requires SeedVC v1.0 Singing in Configuration > Extensions. The new version becomes the production's song, the former one goes to the bin."""
+        target = self._production(ctx, production)
+        self._only_the_fix(ctx, target, what="the song")
+        if unavailable := self.showrunner.host.singer_voice_unavailable():
+            raise ValueError(f"{unavailable} Tell the user.")
+        if bool(cast_ids) == bool(voices):
+            raise ValueError("Give cast_ids (the cast members who sing) or voices (voice samples), one of them.")
+        doc = target.snapshot()
+        members = [model.find(doc["cast"], cast_id, "cast") for cast_id in cast_ids or []]
+        self.showrunner.singers(doc, members or [None] * len(voices))
+        catalog = self._catalog(doc)
+        samples = [target.resolve(self._voice(ctx, target, member, catalog, templates.effective(doc, catalog))[0]) for member in members] or [ctx.resolve(voice) for voice in voices]
+        ctx.progress(text="Changing the singer's voice")
+        return self.showrunner.change_singer_voice(target, samples, by="deepy")
+
     def _song_stem(self, ctx, song: Path) -> Path | None:
         """The song's voice alone, isolated the first time."""
         stem = song.with_name(f"{song.stem}_post.wav")
@@ -1079,8 +1139,8 @@ class ShowrunnerToolbox:
 
     def check_song(self, ctx, production: str, lyrics: str | None = None) -> dict[str, Any]:
         """Listen to the production's song and compare it with the lyrics of the brief: which lines it really sings, and when. Run it on every new song, before shooting on it: a
-        transcript that cannot read a line while it reads the others means the line is not sung as written. Subtitles of a cut that plays the song follow these times, and lines
-        that are not sung get none. lyrics: the words the song was made from, when you wrote them yourself: they become the production's script, as written, section markers included."""
+        transcript that cannot read a line while it reads the others means the line is not sung as written. Subtitles of a cut that plays the song follow these times; lines
+        that are not sung get none, unless they are sung unclearly where they belong. lyrics: the words the song was made from, when you wrote them yourself: they become the production's script, as written, section markers included."""
         target = self._production(ctx, production)
         if lyrics:
             self._apply(target, [{"op": "brief", "fields": {"script": lyrics}}])
@@ -1090,13 +1150,14 @@ class ShowrunnerToolbox:
             raise ValueError("The production has no song: make one with edit(song=...).")
         if not lines:
             raise ValueError("The production has no lyrics to compare the song with: call check_song again with lyrics, the words the song was made from.")
+        stem = self._song_stem(ctx, song)  # the voice alone: a pitch means nothing on a full mix, and a transcript of the mix stretches words over the music between lines
         ctx.progress(text="Listening to the song")
-        measured = model.sung_lines(lines, self.showrunner.host.song_words(song, str(doc["brief"].get("language") or "") or None))
-        stem = self._song_stem(ctx, song)  # the voice alone: a pitch means nothing on a full mix
+        measured = model.sung_lines(lines, self.showrunner.host.song_words(stem or song, str(doc["brief"].get("language") or "") or None))
         voice_hz = self.showrunner.host.voice_pitch(stem) if stem else None
         self._apply(target, [{"op": "lyrics", "lyrics": {"song": song.name, "lines": measured, "voice_hz": voice_hz}}])
         missing = [line["line"] for line in measured if not line["sung"]]
-        return {"lines": len(measured), "sung": len(measured) - len(missing), "lead_voice_hz": voice_hz, **({"not_sung": missing} if missing else {}), "times": [f"{line['start_s']:.1f}-{line['end_s']:.1f} {line['line']}" for line in measured if line["sung"]],
+        return {"lines": len(measured), "sung": len(measured) - len(missing), "lead_voice_hz": voice_hz, **({"not_sung": missing} if missing else {}),
+                "times": [f"{line['start_s']:.1f}-{line['end_s']:.1f} {line['line']}" + (" (sung unclearly)" if line.get("unclear") else "") for line in measured if line["start_s"] is not None],
                 **({"warnings": warned} if (warned := model.song_words(target.snapshot())) else {})}
 
     def deep_review(self, ctx, production: str, add: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -1163,7 +1224,10 @@ class ShowrunnerToolbox:
         to assemble)."""
         target = self._production(ctx, production)
         doc = target.snapshot()
-        asked = self._own(ctx) is not None and doc["director"].get("task") == "assemble"
+        own = self._own(ctx) is not None
+        if own and doc["director"].get("new_version") is False:
+            raise ValueError("The user asked for no new version in this task: do not assemble. Stop here and say how the new takes came out; the user assembles the edit when they are ready.")
+        asked = own and doc["director"].get("task") == "assemble"
         waiting = model.awaiting_approval(doc) if doc["brief"]["review_before_edit"] and not asked else []
         if waiting:
             raise ValueError(f"The user reviews every take before the edit (the brief's review_before_edit): do not assemble on your own. Stop here and ask the user to "
@@ -1275,7 +1339,7 @@ class ShowrunnerToolbox:
         return re.search(r"\bback of\b|from behind", str(person.get("where") or ""), re.IGNORECASE) is not None
 
     @classmethod
-    def _swap_request(cls, people: list[dict[str, Any]], named: dict[str, tuple[dict[str, Any], str]], note: str | None = None, clothes: str = "sheet") -> tuple[str, list[str]]:
+    def _swap_request(cls, people: list[dict[str, Any]], named: dict[str, tuple[dict[str, Any], str]], note: str | None = None, clothes: str = "sheet", declared: dict[str, str] | None = None) -> tuple[str, list[str]]:
         """What the painter reads to replace people, and the cast pictures it gets after the frame. Each person is found by `who`, their clothes and place in
         this frame, and becomes a cast member: the face and hair from the member's photo (their sheet when they have none, or for a look of the shot's own,
         or when the frame shows their back) with the looks of their card, the build and clothes of their sheet (clothes="frame": the frame's clothes, fitted
@@ -1284,9 +1348,23 @@ class ShowrunnerToolbox:
         an outfit written out in words drew a whole figure into close shots, and without a word on the build the original's body stayed under the new head.
         A member with a sheet alone takes the original's place: told that the original "becomes" them, the painter kept a robot behind its clown, put a bear's
         head on a man's body and left people in their own clothes (better in 7 of 11 frames of 7 remakes, the same in 3).
-        named: each member by name, with the shot's picture of them."""
+        named: each member by name, with the shot's picture of them. declared: the sentences the painter's model was trained on (its character_swap_prompt),
+        filled instead, with the frame as image 1 and each member's character sheet after it: such a model takes their outfit from the sheet whatever `clothes` says."""
         replaced = sorted((person for person in people if person.get("becomes")), key=cls._from_behind)
         keys = list(dict.fromkeys(str(person["becomes"]).casefold() for person in replaced))
+        if declared:
+            if str(note or "").strip():
+                raise ValueError("This Frame Painter takes only the sentences its model was trained on: paint without `instruction`, or ask the user to pick another Frame Painter in the brief's Models. Nothing was painted.")
+            pictures = []
+            for key in keys:
+                member, path = named[key]
+                sheet = member.get("master") if path in (member.get("images") or [])[:1] else path  # the sheet, or the shot's own look of them
+                if not sheet:
+                    raise ValueError(f"{member['name']} has no character sheet, which this Frame Painter needs: make_sheet first. Nothing was painted.")
+                pictures.append(sheet)
+            stays = sum(1 for person in people if not person.get("becomes"))
+            end = declared["end_others"].format(others="other person" if stays == 1 else "other people") if stays else declared["end"]
+            return " ".join([*(declared["person"].format(who=person["who"], image=keys.index(str(person["becomes"]).casefold()) + 2) for person in replaced), end]), pictures
         pictures, lines, numbers = [], ["Picture 1 is a frame from a video."], {}
         for key in keys:
             member, path = named[key]
@@ -1330,9 +1408,9 @@ class ShowrunnerToolbox:
                                       "Everything else stays exactly as in Picture 1: the framing, background, light, sharpness and the other people."])), pictures
 
     def _paint_people(self, ctx, target, template: str, frame_path: Path, people: list[dict[str, Any]], named: dict[str, tuple[dict[str, Any], str]], note: str | None, size: str,
-                      clothes: str = "sheet") -> Path | None:
+                      clothes: str = "sheet", declared: dict[str, str] | None = None) -> Path | None:
         """The frame with everyone replaced in one draw (_swap_request). A draw that leaves a large person as they were is drawn again. Returns the picture, or None when nothing changed."""
-        prompt, pictures = self._swap_request(people, named, note, clothes)
+        prompt, pictures = self._swap_request(people, named, note, clothes, declared)
         settings = {"template": template, "prompt": prompt, "resolution": size,  # a picture is made once, at the target: a draft and its final use the same one
                     "image_refs": [ctx.virtualize(str(path)) for path in (frame_path, *(target.resolve(picture) for picture in pictures))]}
         heads = [int(value) for person in people for match in re.findall(HEAD_SHARE, str(person.get("where") or "")) for value in match if value]
@@ -1426,7 +1504,7 @@ class ShowrunnerToolbox:
         """A remake: a frame of the shot's source, numbered as in the source, changed by the image editor. When people are replaced: look_at_frame first, then `people`, one entry per person it listed: who (the woman), where (the
         inspector's words for them), becomes (a cast member's name, or null for someone who stays as they are); for someone replaced, `who` names them by their clothes and place in this frame only, never
         their hair, face or glasses, which the painter would keep; clothes: the cast member's own outfit from their sheet, or `frame` when the brief keeps the
-        person's costume. `instruction` then adds what is special in this frame. For any other change: `instruction`, with `references`. Or
+        person's costume (a Frame Painter trained on swaps, such as Viggle Image Swap, always takes the sheet's outfit and no `instruction`: give the card that costume). `instruction` then adds what is special in this frame. For any other change: `instruction`, with `references`. Or
         your own finished `picture`, or the source frame as it is (`unchanged`, for a camera setup the change does not touch, to hold it in the shot). It becomes one of the shot's painted frames, in source order; painting the same
         frame again replaces it, and each try draws differently; `replaces`: another painted frame of the shot that this one takes the place of. pin: the take passes through that picture at that moment (all frames of a shot are pinned or none); keep it on when people are replaced. Returns the source frame and the picture; when people are
         replaced `before` and `after`, what the inspector sees in each, `faults` measured from them, and `verify`; otherwise `comparison`: read them before you go on."""
@@ -1463,7 +1541,7 @@ class ShowrunnerToolbox:
             if not pictured and references is None and (swap or templates.cast_with_pictures(doc)):
                 raise ValueError(f"Shot {shot} has no cast with a picture, so the painter would draw from words alone and the same person would look different in every frame. Give the shot its cast with update_shot first, "
                                  "or pass references=[] when nobody of the cast is in this frame. Nothing was painted.")
-            template = templates.effective(doc, catalog).get("image_edits")
+            template = templates.effective(doc, catalog).get("frame_painter" if directed else "image_edits")  # people replaced: the brief's Frame Painter
             size = self.showrunner.shot_size(target, doc, item, final=True)
             if directed:
                 if not looked:
@@ -1477,7 +1555,7 @@ class ShowrunnerToolbox:
                 if missing := list(dict.fromkeys(str(person["becomes"]) for person in people if person.get("becomes") and str(person["becomes"]).casefold() not in named)):
                     raise ValueError(f"{', '.join(missing)} is not in this shot's cast with a picture: give the shot its cast with update_shot first. Nothing was painted.")
                 for _ in range(PAINT_DRAWS):  # a close shot drawn as a full figure is drawn again: the painter does it about one draw in two, and its pin pulls the render out
-                    painted_path = self._paint_people(ctx, target, template, source_frame, people, named, instruction, size, clothes)
+                    painted_path = self._paint_people(ctx, target, template, source_frame, people, named, instruction, size, clothes, templates.resolve(catalog, template)["swap_prompt"])
                     if painted_path is None:
                         return {"shot": shot, "frame": int(frame), "error": f"The painter changed nobody in {PAINT_DRAWS} draws, so nothing was recorded. Call paint_frame again with the same people, or try another frame of this shot."}
                     ctx.progress(done=0, total=1, text=f"Checking the Painted Frame of {shot}", force=True)

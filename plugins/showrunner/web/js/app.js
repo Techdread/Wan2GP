@@ -26,7 +26,7 @@ const VIEWS = { brief: ['Brief', 'brief', mountBrief], storyboard: ['Board', 'gr
 const UNDONE = { add_take: 'a new take', update_shot: 'a shot edit', verdict: 'a verdict', add_shots: 'new shots', replace_plan: 'the plan', remove_shot: 'a deletion',
   move_shots: 'a move', reorder: 'a move', remove_take: 'a removed take', brief: 'a brief edit', add_cast: 'a new cast member', update_cast: 'a cast edit',
   remove_cast: 'a cast removal', edit: 'a sound edit', add_overlay: 'a text', update_overlay: 'a text edit', remove_overlay: 'a text deletion', style: 'a style edit',
-  outline: 'the outline', deliverable: 'an export', bin_add: 'a bin import', bin_remove: 'a bin removal', bin_to_take: 'a take from the bin', stage: 'a stage change' };
+  outline: 'the outline', deliverable: 'an export', bin_add: 'a bin import', bin_remove: 'a bin removal', bin_to_take: 'a take from the bin', bin_to_track: 'a sound from the bin',stage: 'a stage change' };
 const GUIDE_PAGES = { home: 'Quick Start', brief: 'Starting a Production', storyboard: 'Reviewing and Changing the Plan', timeline: 'The Timeline', cast: 'The Cast', deliver: 'Delivering' };
 const STAGES = [['brief', 'Brief'], ['planning', 'Plan'], ['review', 'Review'], ['shooting', 'Shoot'], ['editing', 'Edit'], ['delivered', 'Deliver']];
 // What each stage's button opens: its view, on the Board the shots of that step, and its tooltip
@@ -46,7 +46,7 @@ function applyTheme() {
   document.documentElement.dataset.theme = theme;
 }
 applyTheme();
-window.addEventListener('focus', applyTheme);
+window.addEventListener('focus', () => { applyTheme(); mounted?.refreshSingerVoice?.(); });
 
 export const actions = {
   async ops(ops, { quiet = false } = {}) {
@@ -86,9 +86,9 @@ export const actions = {
     renderSide();
     mounted?.selection?.();
   },
-  async direct(task, message = '', shots = [], { show = false } = {}) {  // show: the user just asked for it and wants to see it taken up, even with a shot open
+  async direct(task, message = '', shots = [], { show = false, newVersion = true } = {}) {  // show: the user just asked for it and wants to see it taken up, even with a shot open
     try {
-      const status = await api.direct(state.pid, task, message, shots);
+      const status = await api.direct(state.pid, task, message, shots, newVersion);
       state.directorBaseline = structuredClone(state.doc);
       state.live = { text: '', tools: [], status: null, progress: null, running: true, task, summary: null };
       if (show || !(state.side === 'inspector' && state.selection.size)) state.side = 'director';  // a shot being looked at stays in view
@@ -268,6 +268,12 @@ function eventsFor(pid) {
       else state.renders[event.shot] = event.progress ?? 0;
       drawProgress();
     },
+    song_voice: event => {  // the song sung in another voice, changed from the Brief
+      state.songVoice = event.done ? null : { progress: event.progress, status: event.status };
+      if (event.error) toast(`The singer's voice could not be changed: ${event.error}`, 'error', 8000);
+      else if (event.done) toast('The song is sung in its new voice. The former version is in the bin.', 'ok');
+      mounted?.songVoice?.();
+    },
     assemble: event => {
       if (!state.userAssembling) {  // an assembly the user started reports on its own button
         if (event.state === 'done') toast('The edit is assembled: watch it in Deliver.', 'ok');
@@ -281,6 +287,7 @@ function eventsFor(pid) {
 // After events were missed (the page was hidden or the connection dropped): the production, its renders and the showrunner's state now.
 async function catchUp() {
   state.renders = {};  // a render still running reports again with its next progress
+  mounted?.refreshSingerVoice?.();  // the SeedVC choice may have changed while Configuration was open
   refreshDoc();
   let changed = true;
   try {
