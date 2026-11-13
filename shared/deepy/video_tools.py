@@ -15,10 +15,13 @@ from tempfile import TemporaryDirectory
 import ffmpeg
 from PIL import Image, ImageDraw, ImageFont
 
+from shared.deepy.image_channels import upright, upright_size
 from shared.ffmpeg_setup import download_ffmpeg
-from shared.utils.audio_video import get_mp4_audio_codec_settings, get_video_audio_extra_args
+from shared.utils.audio_video import extract_audio_track_to_wav, get_mp4_audio_codec_settings, get_video_audio_extra_args
 from shared.utils.video_codecs import get_video_container_extension, get_video_encode_args, validate_video_output_settings
 from shared.utils.utils import get_video_frame, get_video_info
+from shared.utils.video_decode import picture_duration, probe_video_stream_metadata
+from shared.utils.virtual_media import parse_virtual_media_path, read_view
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".webm", ".avi"}
 _THUMB_DATA_URL_CACHE: OrderedDict[str, str] = OrderedDict()
 _THUMB_CACHE_MAX = 64
@@ -33,7 +36,7 @@ def _get_ffmpeg_path() -> str:
 
 
 def _run_ffmpeg(args: list[str]) -> None:
-    result = subprocess.run([_get_ffmpeg_path(), "-y", "-v", "error", *args], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    result = subprocess.run([_get_ffmpeg_path(), "-y", "-v", "error", *args], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise RuntimeError((result.stderr or result.stdout or "ffmpeg command failed").strip())
 
@@ -131,6 +134,7 @@ def get_video_thumbnail_data_url(video_path: str) -> str:
             "1",
             "-",
         ],
+        stdin=subprocess.DEVNULL,
         capture_output=True,
     )
     if result.returncode != 0 or len(result.stdout) == 0:
@@ -149,7 +153,7 @@ def picture_checks(path: str, start_s: float = 0.0, end_s: float | None = None, 
     0.1 and close to its neighbours). Only non-empty entries are returned."""
     span = [] if end_s is None or not math.isfinite(end_s) else ["-t", f"{end_s - start_s:.3f}"]
     picture = f"scale=160:-2,blackdetect=d={min_black_s:g}:pix_th=0.10,select='gte(scene,0)',metadata=print:key=lavfi.scene_score"
-    process = subprocess.run([_get_ffmpeg_path(), "-v", "info", "-ss", f"{start_s:.3f}", *span, "-i", path, "-an", "-vf", picture, "-f", "null", "-"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    process = subprocess.run([_get_ffmpeg_path(), "-v", "info", "-ss", f"{start_s:.3f}", *span, "-i", path, "-an", "-vf", picture, "-f", "null", "-"], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if process.returncode:
         raise RuntimeError(process.stderr.strip()[-500:] or "ffmpeg could not decode the video.")
     times, scores = [float(time) for time in re.findall(r"pts_time:([\d.]+)", process.stderr)], [float(score) for score in re.findall(r"lavfi\.scene_score=([\d.]+)", process.stderr)]
@@ -162,7 +166,7 @@ def picture_checks(path: str, start_s: float = 0.0, end_s: float | None = None, 
 def quiet_ranges(path: str, *, threshold_db: float = -45.0, min_seconds: float = 1.0) -> list[list[float]]:
     """Stretches (seconds) where the first audio track stays below threshold_db: ffmpeg silencedetect."""
     command = [_get_ffmpeg_path(), "-v", "info", "-i", path, "-vn", "-af", f"silencedetect=n={threshold_db:g}dB:d={min_seconds:g}", "-f", "null", "-"]
-    process = subprocess.run(command, capture_output=True, text=True, errors="replace")
+    process = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace")
     if process.returncode:
         raise RuntimeError(process.stderr.strip()[-500:] or "ffmpeg could not decode the audio.")
     duration = get_media_duration(path)
@@ -237,7 +241,7 @@ MERGE_TRANSITIONS = {"cut": None, "crossfade": "fade", "fade_black": "fadeblack"
 def merge_videos(videos: list[str], output_path: str, *, transitions: str | list[str] | None = None, transition_s: float = 1.0, video_codec: str | None = None, video_container: str | None = None, audio_codec: str | None = None) -> str:
     """Join videos in order with a cut, crossfade or fade through black/white at each join (transitions: one per join, or one for all).
     Clips are fitted to the first one's size and frame rate; a transition overlaps the two clips by transition_s, and the soundtracks
-    follow the picture (silence for a clip without sound)."""
+    follow the picture: each is cut or padded with silence to its clip's picture (silence for a clip without sound)."""
     error = validate_video_output_settings(video_codec, video_container, audio_codec)
     if error is not None:
         raise ValueError(error)
@@ -253,7 +257,7 @@ def merge_videos(videos: list[str], output_path: str, *, transitions: str | list
         raise ValueError(f"transitions needs one value per join ({len(videos) - 1}) or one for all, among {', '.join(MERGE_TRANSITIONS)}.")
     first = _probe_video_stream(videos[0])
     width, height, rate = int(first["width"]), int(first["height"]), first.get("avg_frame_rate") or first["r_frame_rate"]
-    durations = [get_media_duration(path) for path in videos]
+    durations = [picture_duration(path) for path in videos]  # sound past a clip's last frame (H3's audio tail) would hold its picture at the cut and put every later clip behind its sound
     if any(not duration or duration <= 0 for duration in durations):
         raise ValueError("Every video needs a known duration.")
     with_audio = [_has_audio_stream(path) for path in videos]
@@ -353,7 +357,7 @@ def side_by_side_media(source_paths: list[str], output_path: str, layout: str | 
             sizes.append((int(stream["width"]), int(stream["height"])))
         else:
             with Image.open(path) as image:
-                sizes.append(image.size)
+                sizes.append(upright_size(image))
     tile_width, tile_height = sizes[0]
     has_legends = any(legends)
     legend_height = max(32, min(96, tile_height // 8)) if has_legends else 0
@@ -364,7 +368,7 @@ def side_by_side_media(source_paths: list[str], output_path: str, layout: str | 
         canvas = Image.new("RGB", (columns * tile_width, rows * cell_height), "black")
         for index, (path, legend) in enumerate(zip(source_paths, legends)):
             with Image.open(path) as source:
-                image = source.convert("RGB")
+                image = upright(source).convert("RGB")
                 image.thumbnail((tile_width, tile_height), Image.Resampling.LANCZOS)
                 x = index % columns * tile_width
                 y = index // columns * cell_height
@@ -432,6 +436,34 @@ def side_by_side_media(source_paths: list[str], output_path: str, layout: str | 
             cmd += ["-movflags", "+faststart"]
         cmd += [output_path]
         _run_ffmpeg(cmd)
+    return output_path
+
+
+def view_clip(view_path: str, cut_dir: str | os.PathLike | None = None) -> str:
+    """A view, or a part of a file named by a suffix (song.wav|start_s=8.7), as a real file for what reads whole files: cut once, exact to
+    the frame or the sample, and reused. A view's clip goes beside it in .cut, a suffix's in cut_dir."""
+    view = read_view(view_path)
+    if view is None:
+        spec = parse_virtual_media_path(view_path)
+        stem, extension = os.path.splitext(os.path.basename(spec.source_path))
+        name = f"{stem}-{hashlib.sha1(os.path.abspath(spec.source_path).encode() + view_path.rsplit('|', 1)[1].encode()).hexdigest()[:12]}"
+        if extension.lower() not in VIDEO_EXTENSIONS:  # an audio file, read at its seconds
+            output_path = os.path.join(cut_dir, name + ".wav")
+            if not os.path.isfile(output_path):
+                os.makedirs(cut_dir, exist_ok=True)
+                extract_audio_track_to_wav(view_path, output_path)
+            return output_path
+        metadata = probe_video_stream_metadata(view_path)  # its frames, seconds read at the file's real rate
+        view = {"source": spec.source_path, "start_frame": metadata["virtual_start_frame"], "end_frame": metadata["virtual_end_frame"]}
+        output_path = os.path.join(cut_dir, name + extension)
+    else:
+        output_path = os.path.join(os.path.dirname(view_path), ".cut", os.path.basename(view_path))
+    if not os.path.isfile(output_path):
+        fps = get_precise_video_fps(view["source"]) or float(get_video_info(view["source"])[0])
+        start_s, seconds = view["start_frame"] / fps, (view["end_frame"] - view["start_frame"] + 1) / fps
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        _run_ffmpeg(["-i", view["source"], "-vf", f"select=between(n\\,{view['start_frame']}\\,{view['end_frame']}),setpts=PTS-STARTPTS", "-frames:v", str(view["end_frame"] - view["start_frame"] + 1), "-map", "0:v:0", "-map", "0:a?",
+                     "-af", f"atrim=start={start_s:.6f}:duration={seconds:.6f},asetpts=PTS-STARTPTS", "-c:v", "libx264", "-crf", "12", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart", output_path])
     return output_path
 
 
@@ -883,7 +915,7 @@ def _gain_expression(points: list[tuple[float, float]]) -> str:
 
 def _graph_loudness(args: list[str]) -> float:
     """Integrated loudness (LUFS) of a filter graph's [measure] output, from FFmpeg's EBU R128 summary."""
-    result = subprocess.run([_get_ffmpeg_path(), "-hide_banner", "-nostats", *args, "-f", "null", "-"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+    result = subprocess.run([_get_ffmpeg_path(), "-hide_banner", "-nostats", *args, "-f", "null", "-"], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise RuntimeError((result.stderr or "ffmpeg loudness measurement failed").strip())
     loudness = float(re.findall(r"\bI:\s*(-?[\d.]+)\s*LUFS", result.stderr)[-1])
@@ -940,7 +972,7 @@ def resize_crop_image(source_path: str, output_path: str, *, width: int | None =
     if not os.path.isfile(source_path):
         raise FileNotFoundError(f"Image not found: {source_path}")
     with Image.open(source_path) as image:
-        source_width, source_height = image.size
+        source_width, source_height = upright(image).size
         left, top, cropped_width, cropped_height = _resolve_resize_crop_geometry(
             source_width,
             source_height,

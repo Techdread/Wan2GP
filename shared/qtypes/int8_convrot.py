@@ -478,7 +478,7 @@ class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
         if self.weight_qtype == _QINT8_CONVROT_QTYPE:
             if int8_backend.wgp_enabled() and self._convrot_group_size in (16, 64, 256) and int8_backend._wgp_supports(input, qweight):
                 return int8_backend.wgp_linear(input, qweight, self.bias, group=self._convrot_group_size)
-            if (int8_backend.kitchen_enabled() and self._convrot_group_size == 256
+            if (int8_backend.kitchen_enabled() and self._convrot_group_size == 256 and qweight._data.shape[0] % 4 == 0  # the kitchen GEMM rejects other widths
                     and input.is_cuda and input.dtype in (torch.bfloat16, torch.float16, torch.float32)):
                 # This direct kernel bypasses F.linear's autocast (LayerNorm can supply FP32 even in a BF16 encoder).
                 if torch.is_autocast_enabled("cuda"):
@@ -489,6 +489,8 @@ class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
                     and input.is_cuda and input.dtype == torch.bfloat16
                     and input.numel() // input.shape[-1] <= 4 and not quanto_int8_inject._prefer_native_quanto_path(input)):
                 return quanto_int8_inject.fused_convrot_linear(input, qweight, self.bias)
+            if int8_backend.rotated_triton_supported(input, qweight, self._convrot_group_size):
+                return int8_backend.rotated_triton_linear(input, qweight, self.bias, self._convrot_group_size)
             input = _rotate_activation(input, self._convrot_group_size)
         _debug_forward_dtype(self, original_input, input, qweight)
         return torch.nn.functional.linear(input, qweight, bias=self.bias)
@@ -511,3 +513,25 @@ class QLinearInt8ConvRot(QModuleMixin, torch.nn.Linear):
         if wrapped is not self.weight:
             self.weight = torch.nn.Parameter(wrapped, requires_grad=self.weight.requires_grad)
         return result
+
+from shared.kernels.cpu_experts import INT8_ROWS, NativeExpertFormat
+
+
+class Int8RowsExperts(NativeExpertFormat):
+    """Routed experts in INT8 with a float32 scale per row (w13 = gate then up rows, or up rows only without a gate), optionally quantized
+    after a ConvRot rotation of groups of input columns (the bank's convrot_group_size tensor)."""
+    name, native = "int8_rows", INT8_ROWS
+
+    def tensors(self, experts, hidden, intermediate, gated=True, blocks=None):
+        rows = (2 if gated else 1) * intermediate
+        return {"w13_weight": ((experts, rows, hidden), torch.int8), "w2_weight": ((experts, hidden, intermediate), torch.int8),
+                "w13_scales": ((experts, rows, 1), torch.float32), "w2_scales": ((experts, hidden, 1), torch.float32)}
+
+    def matches(self, tensors):
+        return tensors["w13_weight"].dtype == torch.int8 and tensors["w13_scales"].dtype == torch.float32
+
+    def dequantize_matrix(self, weight, scale, block):
+        return weight.float() * scale.float()
+
+
+EXPERT_FORMATS = (Int8RowsExperts(),)

@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from shared.utils.phase_progress import vae_encoding_progress
 from shared.utils.utils import guide_to_float
 
-from .components.video_autoencoder import AutoencoderKLMiniMaxH3, get_linear_split_map as get_video_vae_linear_split_map
+from .components.video_autoencoder import AutoencoderKLMiniMaxH3, get_linear_split_map as get_video_vae_linear_split_map, group_qkv_rows
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -44,9 +44,13 @@ LATENTS_STD = (
 )
 
 
+IMAGE_DECODER = {"decoder_num_layers": 24, "decoder_num_attention_heads": 16, "decoder_rope_dim_ratio": 0.5, "decoder_patch_size_t": 1, "decoder_rope_axes": 2}  # MiniMax-H3-Image's 2D ViT decoder
+
+
 class MiniMaxH3VideoVAE(AutoencoderKLMiniMaxH3):
-    def __init__(self, upsampling=False, decoder_num_layers=36):
-        super().__init__(out_channels=12 if upsampling else 3, decoder_num_layers=decoder_num_layers, latents_mean=LATENTS_MEAN, latents_std=LATENTS_STD)
+    def __init__(self, upsampling=False, decoder_num_layers=36, single_frame=False, image_decoder=False):
+        decoder = IMAGE_DECODER if image_decoder else {"decoder_num_layers": decoder_num_layers, "decoder_patch_size_t": 1 if single_frame else None}
+        super().__init__(out_channels=12 if upsampling else 3, **decoder, latents_mean=LATENTS_MEAN, latents_std=LATENTS_STD)
         self.upsampling = upsampling
         self.register_buffer("_latents_mean", torch.tensor(LATENTS_MEAN, dtype=torch.float32, device="cpu"), persistent=upsampling)
         self.register_buffer("_latents_std", torch.tensor(LATENTS_STD, dtype=torch.float32, device="cpu"), persistent=upsampling)
@@ -148,5 +152,5 @@ class MiniMaxH3VideoVAE(AutoencoderKLMiniMaxH3):
         return decoded
 
 
-__all__ = ["IMAGENET_MEAN", "IMAGENET_STD", "LATENTS_MEAN", "LATENTS_STD", "MiniMaxH3VideoVAE",
-           "get_video_vae_linear_split_map"]
+__all__ = ["IMAGENET_MEAN", "IMAGENET_STD", "IMAGE_DECODER", "LATENTS_MEAN", "LATENTS_STD", "MiniMaxH3VideoVAE",
+           "get_video_vae_linear_split_map", "group_qkv_rows"]

@@ -1,5 +1,5 @@
 from shared.utils.phase_progress import generation_progress
-from mmgp import offload
+from mmgp import offload, runtime
 import argparse
 import os
 import random
@@ -196,6 +196,8 @@ class LTXV:
         transformer._model_dtype = dtype
         if mixed_precision_transformer:
             transformer._lock_dtype = torch.float
+        # holds no weights itself: its FP32 lock keeps MMGP from rounding the float32 timestep (x1000) to BF16 before its sinusoid
+        transformer.adaln_single._lock_dtype = torch.float32
 
 
         scheduler = RectifiedFlowScheduler.from_pretrained(fl.locate_file("ltxv_scheduler.json"))
@@ -217,6 +219,7 @@ class LTXV:
         # offload.save_model(text_encoder, "T5_xxl_1.1_enc_quanto_bf16_int8.safetensors", do_quantize= True, config_file_path="T5_config.json")
 
         text_encoder = offload.fast_load_transformers_model(text_encoder_filepath, writable_tensors=False)
+        runtime.lookup_on_cpu(text_encoder.get_input_embeddings())  # the token table stays in RAM: mmgp looks up the prompt's rows on the CPU
         patchifier = SymmetricPatchifier(patch_size=1)
         text_encoder_folder = self.model_def.get("text_encoder_folder")
         if text_encoder_folder:

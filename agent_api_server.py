@@ -20,6 +20,9 @@ Async-job HTTP layer in front of the in-process WanGP runtime. Provides:
   - GET    /api/file              — download (constrained to outputs root)
   - POST   /api/transcribe        — submit audio for Whisper transcription (multipart)
   - GET    /api/transcribe/models — list whisper model ids + supported formats
+  - GET    /api/finetune          — fine-tunable bases, defaults, memory estimates, past fine-tunes
+                                    (a fine-tune is a job: POST /api/jobs {"model_type": "finetune-qwen3.5-4b", ...};
+                                    see Wan2GP-FINETUNING.md)
   - POST   /api/generate          — DEPRECATED back-compat (sync wrap of /api/jobs)
   - POST   /api/batch             — DEPRECATED back-compat (sync, single batch task)
 
@@ -32,6 +35,10 @@ Configuration (env vars):
   WAN2GP_JOB_HISTORY    — number of jobs to retain in DB (default: 200).
   WAN2GP_UPLOAD_MAX_BYTES — maximum input upload size (default: 1 GB).
   WHISPER_BIN           — path to the whisper CLI (default: "whisper").
+  WAN2GP_FINETUNE_CACHE — where fine-tuning keeps base models + the GGUF converter
+                          (default: <first checkpoints path>/finetune).
+  WAN2GP_LMSTUDIO_MODELS_DIR — LM Studio models folder for finished fine-tunes
+                          (default: LM Studio's own setting, else ~/.lmstudio/models).
 """
 
 from __future__ import annotations
@@ -68,7 +75,7 @@ from studio_media_tools import (
 
 
 WANGP_ROOT = Path(__file__).resolve().parent
-SERVER_VERSION = "0.7.1"
+SERVER_VERSION = "0.8.0"
 
 
 def _wangp_version() -> str | None:
@@ -105,6 +112,8 @@ def _content_type_for_path(path: Path) -> str:
 # stays focused on HTTP plumbing.
 import agent_api_introspect
 import agent_api_sizes
+from finetune import job as finetune_job
+from finetune import spec as finetune_spec
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +209,7 @@ UPLOAD_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif",
     ".mp4", ".mov", ".mkv", ".webm", ".avi",
     ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac",
+    ".jsonl",  # fine-tuning datasets
 }
 EDIT_MODE_CAPABILITIES = {
     "edit_postprocessing": "media-postprocessing",
@@ -263,6 +273,8 @@ def capability_for_model_type(model_type: str) -> str:
     """
     if is_transcription_model_type(model_type):
         return TRANSCRIPTION_CAPABILITY
+    if finetune_spec.is_finetune_model_type(model_type):
+        return finetune_spec.FINETUNE_CAPABILITY
     try:
         entry = agent_api_introspect.get_model_entry(model_type)
         if entry is not None:
@@ -295,6 +307,8 @@ def validate_job_request(request: Any) -> str | None:
         model_type = request.get("model_type")
         if not isinstance(model_type, str) or not model_type.strip():
             return "request must include model_type or a supported edit mode"
+        if finetune_spec.is_finetune_model_type(model_type):
+            return finetune_spec.normalize_request(request, uploads_root=_outputs_root() / "uploads")[1]
         return agent_api_introspect.validate_request(model_type, request)
 
     if mode not in EDIT_MODE_CAPABILITIES:
@@ -616,6 +630,8 @@ class JobWorker:
                     self._run_media(rec)
                 elif rec.capability == TRANSCRIPTION_CAPABILITY:
                     self._run_transcription(rec)
+                elif rec.capability == finetune_spec.FINETUNE_CAPABILITY:
+                    self._run_finetune(rec)
                 else:
                     self._run_one(rec)
             except Exception as exc:
@@ -687,6 +703,34 @@ class JobWorker:
             with self._lock:
                 self._current_job_id = None
                 self._current_session_job = None
+
+    def _run_finetune(self, rec: JobRecord) -> None:
+        """Run the LoRA trainer as its own process (see finetune/job.py).
+
+        It holds the GPU for hours, so it takes the serial queue like any other
+        job: image/video jobs submitted meanwhile wait until it finishes.
+        """
+        with self._lock:
+            self._current_job_id = rec.job_id
+            self._current_session_job = None
+        self._store.assign_queue_positions()
+        log_event("job_started", job_id=rec.job_id, request_id=rec.request_id,
+                  capability=rec.capability, model_type=rec.model_type)
+
+        def get_status() -> str | None:
+            now = self._store.get(rec.job_id)
+            return now.status if now else None
+
+        status = finetune_job.run_job(
+            job_id=rec.job_id,
+            spec=rec.request,
+            outputs_root=_outputs_root(),
+            update=lambda **fields: self._store.update(rec.job_id, **fields),
+            get_status=get_status,
+            release_vram=self._agent.release_model,
+            log_event=log_event,
+        )
+        log_event(f"job_{status}", job_id=rec.job_id, request_id=rec.request_id)
 
     def _run_transcription(self, rec: JobRecord) -> None:
         """Run a Whisper CLI subprocess for a transcription job.
@@ -1132,6 +1176,29 @@ def _safe_filename(name: str) -> str:
     return cleaned[:120] or "audio.bin"
 
 
+def _finetune_payload(store: "JobStore") -> dict[str, Any]:
+    """What a client needs to offer fine-tuning on this machine."""
+    from finetune import export as finetune_export
+    from finetune import lmstudio as finetune_lmstudio
+    lm_dir = finetune_lmstudio.models_dir()
+    jobs = [
+        {k: r.to_dict()[k] for k in ("job_id", "status", "model_type", "created_at", "completed_at",
+                                      "progress", "step", "total_steps", "error")}
+        | {"name": (r.request or {}).get("name"), "result": r.result}
+        for r in store.list(limit=200) if r.capability == finetune_spec.FINETUNE_CAPABILITY
+    ]
+    return {
+        "capability": finetune_spec.FINETUNE_CAPABILITY,
+        "bases": finetune_spec.describe_bases(),
+        "defaults": finetune_spec.DEFAULTS,
+        "gguf_types": list(finetune_spec.GGUF_TYPES),
+        "gpu": _gpu_info(),
+        "lmstudio_models_dir": str(lm_dir) if lm_dir else None,
+        "converter": finetune_export.LLAMA_CPP_TAG,
+        "jobs": jobs,
+    }
+
+
 def _transcription_models_payload() -> dict[str, Any]:
     return {
         "models": [
@@ -1410,6 +1477,9 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
             if path == "/api/transcribe/models":
                 self._json(200, _transcription_models_payload())
                 return 200
+            if path == "/api/finetune":
+                self._json(200, _finetune_payload(store))
+                return 200
             if path == "/api/settings":
                 self._json(200, agent.get_default_settings())
                 return 200
@@ -1472,6 +1542,13 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
                     self._json(400, {"error": err})
                     return 400
                 assert isinstance(body, dict)
+                if finetune_spec.is_finetune_model_type(body.get("model_type")):
+                    body, _ = finetune_spec.normalize_request(body, uploads_root=outputs_root / "uploads")
+                    if body.get("resume_from"):
+                        why = finetune_job.resume_dir_error(outputs_root, body["resume_from"])
+                        if why:
+                            self._json(400, {"error": why})
+                            return 400
                 rec = store.create(request=body, request_id=self._current_request_id)
                 worker.submit(rec.job_id)
                 log_event(

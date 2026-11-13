@@ -1,19 +1,23 @@
 # Vendored from TAEHV (https://github.com/madebyollin/taehv), Copyright (c) 2025 Ollin Boer Bohan,
 # MIT License (see shared/tinyvae/LICENSES/taehv-MIT.txt). Modified for WanGP.
 # Modifications Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""Decoder-only subset of TAEHV, vendored from madebyollin/taehv.
+"""Subset of TAEHV, vendored from madebyollin/taehv: the decoder, and optionally the encoder (world models seeding from an image).
 
 Source revision: 62f7591f59dfbb4c3c02b7a621d180a9eeaba26c
 The implementation keeps the upstream module names and state-dict layout so
 strict safetensors loading remains possible, while omitting unused streaming
-and encoder runtime helpers.
+runtime helpers.
 """
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
+
+from shared.utils.conv_bands import BAND_BYTES
 
 
 def conv(n_in, n_out, **kwargs):
@@ -82,6 +86,43 @@ def _apply(model, x, parallel, output_indices=None, abort_check=None, output_tra
     memory = [None] * len(model)
     output = []
     output_no = 0
+    # The tail: the last upsampling and the layers after it, which keep nothing from the previous frame. It holds the largest activations
+    # (full-size frames of the widest layers): above BAND_BYTES it runs by bands of its input rows, each with the halo of rows that its 3x3
+    # convolutions read, so that every output value has the same inputs as with the whole frame and no full-size activation is allocated.
+    tail = max((index for index, block in enumerate(model) if isinstance(block, nn.Upsample)), default=len(model))
+    tail = tail if not any(isinstance(block, MemBlock) for block in model[tail:]) else len(model)
+    tail_convs = [conv for block in model[tail:] for conv in block.modules() if isinstance(conv, nn.Conv2d)]
+
+    def run_tail(value):
+        """The tail on value, the frames of its input: True when it ran by bands (its frames are in output), False when it fits whole."""
+        nonlocal output_no
+        scale = int(model[tail].scale_factor)
+        frames, _, height, width = value.shape
+        rows = max(1, BAND_BYTES // (frames * max(conv.out_channels for conv in tail_convs) * scale * scale * width * value.element_size()))
+        if rows >= height:
+            return False
+        grown = frames * math.prod(block.stride for block in model[tail:] if isinstance(block, TGrow))
+        produced = range(output_no, output_no + grown)
+        output_no += grown
+        keep = None if output_indices is None else [frame - produced.start for frame in produced if frame in output_indices]
+        if keep is not None and not keep:
+            return True
+        halo = math.ceil(sum(conv.kernel_size == (3, 3) for conv in tail_convs) / scale)
+        out = None
+        for start in range(0, height, rows):
+            stop = min(height, start + rows)
+            low = max(0, start - halo)
+            band = value[:, :, low:min(height, stop + halo)]
+            for index in range(tail, len(model)):
+                band = model[index](band)
+                if index == last_temporal and keep is not None:
+                    band = band[keep]
+            if out is None:
+                out = torch.empty((band.shape[0], band.shape[1], scale * height, band.shape[-1]), dtype=band.dtype, device=band.device)
+            out[:, :, scale * start:scale * stop].copy_(band[:, :, scale * (start - low):scale * (stop - low)])
+            del band
+        output.extend((frame if output_transform is None else output_transform(frame)).unsqueeze(1) for frame in out.split(1))
+        return True
 
     def run(value, start):
         nonlocal output_no
@@ -89,6 +130,8 @@ def _apply(model, x, parallel, output_indices=None, abort_check=None, output_tra
             if value.shape[0] > 1 and value.numel() > SEQUENTIAL_PIECE_ELEMENTS:
                 for piece in value.split(max(1, SEQUENTIAL_PIECE_ELEMENTS // value[0].numel())):
                     run(piece, index)
+                return
+            if index == tail and run_tail(value):
                 return
             block = model[index]
             if isinstance(block, MemBlock):
@@ -115,11 +158,20 @@ def _apply(model, x, parallel, output_indices=None, abort_check=None, output_tra
 
 
 class TAEHV(nn.Module):
-    def __init__(self, checkpoint_path=None, encoder_time_downscale=(True, True, False), decoder_time_upscale=(False, True, True), decoder_space_upscale=(True, True, True), patch_size=1, latent_channels=16):
+    def __init__(self, checkpoint_path=None, encoder_time_downscale=(True, True, False), decoder_time_upscale=(False, True, True), decoder_space_upscale=(True, True, True), patch_size=1, latent_channels=16, encoder=False):
         super().__init__()
         self.patch_size = patch_size
         self.latent_channels = latent_channels
         self.image_channels = 3
+        if encoder:
+            self.encoder = nn.Sequential(
+                conv(self.image_channels * self.patch_size ** 2, 64), nn.ReLU(inplace=True),
+                TPool(64, 2 if encoder_time_downscale[0] else 1), conv(64, 64, stride=2, bias=False), MemBlock(64, 64), MemBlock(64, 64), MemBlock(64, 64),
+                TPool(64, 2 if encoder_time_downscale[1] else 1), conv(64, 64, stride=2, bias=False), MemBlock(64, 64), MemBlock(64, 64), MemBlock(64, 64),
+                TPool(64, 2 if encoder_time_downscale[2] else 1), conv(64, 64, stride=2, bias=False), MemBlock(64, 64), MemBlock(64, 64), MemBlock(64, 64),
+                conv(64, self.latent_channels),
+            )
+            self.t_downscale = 2 ** sum(layer.stride == 2 for layer in self.encoder if isinstance(layer, TPool))
         n_f = [256, 128, 64, 64]
         self.decoder = nn.Sequential(
             Clamp(), conv(self.latent_channels, n_f[0]), nn.ReLU(inplace=True),
@@ -139,6 +191,15 @@ class TAEHV(nn.Module):
                 if state_dict[key].shape[0] > expected[key].shape[0]:
                     state_dict[key] = state_dict[key][-expected[key].shape[0] :]
         return state_dict
+
+    def encode_video(self, x):
+        """Latents (N, T / t_downscale, C, h, w) of RGB frames (N, T, 3, H, W) in [0, 1], the last frame repeated up to a multiple of
+        t_downscale (a single image: four identical frames)."""
+        if self.patch_size > 1:
+            x = F.pixel_unshuffle(x, self.patch_size)
+        if x.shape[1] % self.t_downscale:
+            x = torch.cat([x, x[:, -1:].expand(-1, self.t_downscale - x.shape[1] % self.t_downscale, -1, -1, -1)], 1)
+        return _apply(self.encoder, x, True)
 
     def postprocess_output_frames(self, x):
         if self.patch_size > 1:
