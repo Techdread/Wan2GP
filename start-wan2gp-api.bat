@@ -40,6 +40,6 @@ cd /d "%WANGP_DIR%"
 echo Starting Wan2GP API on %HOST%:%PORT%
 echo Output root: %WAN2GP_OUTPUTS_ROOT%
 
-"%PYTHON_EXE%" agent_api.py serve --host %HOST% --port %PORT% --profile 4 --attention sage2
+"%PYTHON_EXE%" agent_api.py serve --host %HOST% --port %PORT% --profile -1 --attention sage2
 
 endlocal

@@ -15,7 +15,8 @@ Async-job HTTP layer in front of the in-process WanGP runtime. Provides:
   - GET    /api/loras             — loras for a model_type
   - GET    /api/settings          — default settings template
   - POST   /api/uploads           — upload image/video/audio inputs for jobs
-  - POST   /api/release           — release VRAM
+  - POST   /api/release           — legacy release VRAM
+  - POST   /api/release-idle      — release only when the worker and queue are idle (WGS-010)
   - GET    /api/file              — download (constrained to outputs root)
   - POST   /api/transcribe        — submit audio for Whisper transcription (multipart)
   - GET    /api/transcribe/models — list whisper model ids + supported formats
@@ -57,6 +58,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from typing import Any
+
+from studio_media_tools import (
+    MEDIA_CAPABILITY, MAX_INITIAL_PROMPT_CHARS, MAX_MEDIA_REQUEST_BYTES,
+    MediaCancelled, MediaError, media_capabilities, run_media_operation,
+    transcript_segments, transcription_options, validate_media_request,
+    whisper_option_arguments,
+)
 
 
 WANGP_ROOT = Path(__file__).resolve().parent
@@ -535,6 +543,7 @@ class JobWorker:
         self._agent = agent
         self._store = store
         self._queue: queue.Queue[str] = queue.Queue()
+        self._execution_lock = threading.Lock()  # WGS-010: release and execution share one boundary
         self._lock = threading.Lock()
         self._current_job_id: str | None = None
         self._current_session_job: Any = None
@@ -545,6 +554,22 @@ class JobWorker:
     def current_job_id(self) -> str | None:
         with self._lock:
             return self._current_job_id
+
+    def release_if_idle(self) -> bool:
+        """WGS-010: refuse busy work; serialize release with every worker execution.
+
+        A new job can be admitted during release, but cannot start until release
+        finishes. Never hold the status/cancellation lock across model work.
+        """
+        if not self._execution_lock.acquire(blocking=False):
+            return False
+        try:
+            if self._store.running_job() is not None or self._store.queued_jobs():
+                return False
+            self._agent.release_model()
+            return True
+        finally:
+            self._execution_lock.release()
 
     def submit(self, job_id: str) -> None:
         self._queue.put(job_id)
@@ -581,12 +606,15 @@ class JobWorker:
     def _run_loop(self) -> None:
         while True:
             job_id = self._queue.get()
+            self._execution_lock.acquire()
             rec = None
             try:
                 rec = self._store.get(job_id)
                 if rec is None or rec.status != "queued":
                     continue
-                if rec.capability == TRANSCRIPTION_CAPABILITY:
+                if rec.capability == MEDIA_CAPABILITY:
+                    self._run_media(rec)
+                elif rec.capability == TRANSCRIPTION_CAPABILITY:
                     self._run_transcription(rec)
                 else:
                     self._run_one(rec)
@@ -616,12 +644,49 @@ class JobWorker:
                         error=f"{type(exc).__name__}: {exc}",
                     )
             finally:
-                with self._lock:
-                    if self._current_job_id == job_id:
-                        self._current_job_id = None
-                        self._current_session_job = None
-                self._store.assign_queue_positions()
-                self._queue.task_done()
+                try:
+                    with self._lock:
+                        if self._current_job_id == job_id:
+                            self._current_job_id = None
+                            self._current_session_job = None
+                    self._store.assign_queue_positions()
+                    self._queue.task_done()
+                finally:
+                    self._execution_lock.release()
+
+    def _run_media(self, rec: JobRecord) -> None:
+        """WGS-012: CPU media jobs share the existing execution/release boundary."""
+        started = time.time()
+        with self._lock:
+            self._current_job_id = rec.job_id
+            self._current_session_job = None
+        self._store.update(rec.job_id, status="running", started_at=_now_iso(), queue_position=None)
+        self._store.assign_queue_positions()
+        log_event("job_started", job_id=rec.job_id, request_id=rec.request_id, capability=MEDIA_CAPABILITY)
+        def cancelled():
+            live = self._store.get(rec.job_id)
+            return live is None or live.status in {"cancelling", "cancelled"}
+        try:
+            body = {key: rec.request[key] for key in ("operation", "source_path", "source_model_type") if key in rec.request}
+            files, result = run_media_operation(body, outputs_root=_outputs_root(), service_root=WANGP_ROOT,
+                job_id=rec.job_id, cancelled=cancelled,
+                progress=lambda progress: self._store.update(rec.job_id, progress=progress))
+            self._store.update(rec.job_id, status="completed", completed_at=_now_iso(), progress=1.0,
+                duration_seconds=round(time.time()-started, 2), files=files, result=result)
+            log_event("job_completed", job_id=rec.job_id, request_id=rec.request_id, files=len(files))
+        except MediaCancelled:
+            self._store.update(rec.job_id, status="cancelled", completed_at=_now_iso(),
+                duration_seconds=round(time.time()-started, 2))
+            log_event("job_cancelled", job_id=rec.job_id, request_id=rec.request_id)
+        except Exception as exc:
+            code = exc.code if isinstance(exc, MediaError) else "media.processing_failed"
+            self._store.update(rec.job_id, status="failed", completed_at=_now_iso(), error=code,
+                duration_seconds=round(time.time()-started, 2))
+            log_event("job_failed", level="error", job_id=rec.job_id, request_id=rec.request_id, error=code)
+        finally:
+            with self._lock:
+                self._current_job_id = None
+                self._current_session_job = None
 
     def _run_transcription(self, rec: JobRecord) -> None:
         """Run a Whisper CLI subprocess for a transcription job.
@@ -683,6 +748,7 @@ class JobWorker:
         ]
         if language:
             cmd.extend(["--language", language])
+        cmd.extend(whisper_option_arguments(request))
 
         proc = subprocess.Popen(
             cmd,
@@ -789,12 +855,7 @@ class JobWorker:
             try:
                 data = json.loads(json_path.read_text(encoding="utf-8"))
                 text = (data.get("text") or "").strip()
-                for s in data.get("segments") or []:
-                    segments.append({
-                        "startSec": float(s.get("start") or 0),
-                        "endSec": float(s.get("end") or 0),
-                        "text": str(s.get("text") or "").strip(),
-                    })
+                segments = transcript_segments(data)
             except Exception as exc:
                 self._store.update(
                     rec.job_id,
@@ -827,6 +888,7 @@ class JobWorker:
                 "model": model_name,
                 "language": language,
                 "translate": translate,
+                "word_timestamps": bool(request.get("word_timestamps")),
                 "filename": request.get("filename") or Path(audio_path).name,
                 "owner_ref": request.get("owner_ref"),
             },
@@ -1083,6 +1145,8 @@ def _transcription_models_payload() -> dict[str, Any]:
             for m in WHISPER_MODEL_NAMES
         ],
         "formats": list(TRANSCRIPTION_FORMATS),
+        "options": {"word_timestamps": True, "initial_prompt": True,
+                    "max_initial_prompt_chars": MAX_INITIAL_PROMPT_CHARS},
     }
 
 
@@ -1337,6 +1401,9 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
                     return 404
                 self._json(200, detail)
                 return 200
+            if path == "/api/media/capabilities":
+                self._json(200, media_capabilities(str(WANGP_ROOT)))
+                return 200
             if path == "/api/loras":
                 self._json(200, agent.list_loras(qs.get("model_type", "z_image")))
                 return 200
@@ -1372,6 +1439,32 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
         # ---------- POST routes ----------
 
         def _route_post(self, path: str, qs: dict[str, str]) -> int:
+            if path == "/api/media":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < length <= MAX_MEDIA_REQUEST_BYTES:
+                        self.close_connection = True
+                        self._json(413 if length > MAX_MEDIA_REQUEST_BYTES else 400,
+                            {"error": {"code": "media.request_invalid", "params": {}}})
+                        return 413 if length > MAX_MEDIA_REQUEST_BYTES else 400
+                    body = validate_media_request(self._read_body(), outputs_root)
+                    if body["operation"] not in media_capabilities(str(WANGP_ROOT))["operations"]:
+                        self._json(501, {"error": {"code": "media.operation_unsupported", "params": {}}})
+                        return 501
+                except MediaError as exc:
+                    status = 403 if exc.code == "media.source_forbidden" else 413 if exc.code == "media.input_too_large" else 400
+                    self._json(status, {"error": {"code": exc.code, "params": exc.params}})
+                    return status
+                except (ValueError, TypeError):
+                    self._json(400, {"error": {"code": "media.request_invalid", "params": {}}})
+                    return 400
+                rec = store.create(request={**body, "model_type": body["source_model_type"]},
+                    request_id=self._current_request_id, capability=MEDIA_CAPABILITY)
+                worker.submit(rec.job_id)
+                store.assign_queue_positions()
+                log_event("job_created", job_id=rec.job_id, request_id=rec.request_id, capability=MEDIA_CAPABILITY)
+                self._json(202, store.get(rec.job_id).to_dict())
+                return 202
             if path == "/api/jobs":
                 body = self._read_body()
                 err = validate_job_request(body)
@@ -1399,6 +1492,16 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
                     self._json(200, {"valid": False, "error": err})
                     return 200
                 self._json(200, {"valid": True})
+                return 200
+            if path == "/api/release-idle":
+                if self._read_body() != {}:
+                    self._json(400, {"error": {"code": "model.release_invalid", "params": {}}})
+                    return 400
+                if not worker.release_if_idle():
+                    self._json(409, {"error": {"code": "model.release_busy", "params": {}}})
+                    return 409
+                log_event("vram_released", reason="explicit_idle")
+                self._json(200, {"ok": True})
                 return 200
             if path == "/api/release":
                 agent.release_model()
@@ -1486,7 +1589,13 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
 
             model_name = (fields.get("model") or "turbo").lower()
             if model_name not in WHISPER_MODEL_NAMES:
-                model_name = "turbo"
+                self._json(400, {"error": {"code": "transcription.model_unsupported", "params": {}}})
+                return 400
+            try:
+                extra_options = transcription_options(fields)
+            except MediaError as exc:
+                self._json(400, {"error": {"code": exc.code, "params": exc.params}})
+                return 400
             language = fields.get("language") or None
             if language == "auto" or not language:
                 language = None
@@ -1523,6 +1632,7 @@ def _build_handler(*, agent: Any, store: JobStore, worker: JobWorker, token: str
                 "language": language,
                 "translate": translate,
                 "duration_sec": duration_sec,
+                **extra_options,
                 "owner_ref": owner_ref,
             }
             rec = store.create(
